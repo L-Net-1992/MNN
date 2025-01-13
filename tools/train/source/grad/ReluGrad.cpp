@@ -10,7 +10,7 @@
 #include "core/Macro.h"
 #include <string.h>
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 class PReluGrad : public OpGrad {
 public:
@@ -19,7 +19,7 @@ public:
         std::vector<Express::VARP> result(1, nullptr);
         auto op = expr->get();
         auto input = expr->inputs()[0];
-        auto mask = _Cast<float>(_Greater(input, _Scalar(0.0f)));
+        auto mask = _Relu(_Sign(input));
         auto prelu = op->main_as_PRelu();
         if (prelu->slope()->size() == 1) {
             auto slope = prelu->slope()->data()[0];
@@ -53,7 +53,7 @@ public:
         std::vector<Express::VARP> result(1, nullptr);
         auto op = expr->get();
         auto input = expr->inputs()[0];
-        auto mask = _Cast<float>(_Greater(input, _Scalar(0.0f)));
+        auto mask = _Relu(_Sign(input));
         if (nullptr != op->main_as_Relu() && op->main_as_Relu()->slope() != 0.0f) {
             auto mask2 = _Cast<float>(_Less(input, _Scalar(0.0f)));
             result[0] = (mask + mask2 * _Scalar<float>(op->main_as_Relu()->slope())) * backwardOutput[0];
@@ -71,20 +71,28 @@ public:
     virtual std::vector<Express::VARP> onGrad(Express::EXPRP expr,
                                               const std::vector<Express::VARP>& backwardOutput) override {
         std::vector<Express::VARP> result{nullptr};
+        auto op = expr->get();
+        MNN_ASSERT(nullptr != op);
+        auto relu6 = op->main_as_Relu6();
+        MNN_ASSERT(nullptr != relu6);
         auto input = expr->inputs()[0];
-        auto mask0 = _Cast<float>(_Greater(input, _Scalar(0.0f)));
-        auto mask1 = _Cast<float>(_Less(input, _Scalar(6.0f)));
+        auto mask0 = _Cast<float>(_Greater(input, _Scalar(relu6->minValue())));
+        auto mask1 = _Cast<float>(_Less(input, _Scalar(relu6->maxValue())));
 
         result[0] = mask0 * mask1 * backwardOutput[0];
         return result;
     }
 };
-static const auto gRegister = []() {
+static void _create() {
     static ReluGrad _c;
     OpGrad::insert(OpType_ReLU, &_c);
     static Relu6Grad _d;
     OpGrad::insert(OpType_ReLU6, &_d);
     static PReluGrad _e;
     OpGrad::insert(OpType_PReLU, &_e);
-    return true;
-}();
+
+}
+
+REGISTER_GRAD(ReluGrad_cpp, _create);
+};
+

@@ -12,154 +12,218 @@
     }
 
 
-__kernel void softmax_channel(GLOBAL_SIZE_3_DIMS
+__kernel void softmax_in1_buf(GLOBAL_SIZE_3_DIMS
                               __global const FLOAT *input,
                               __global FLOAT *output,
-                              __private const int output_channels,
-                              __private const int remain_channels,
-                              __private const int4 shape) {//NCHW
+                              __private const int inside,
+                              __private const int outside,
+                              __private const int dim) {
 
-    const int channel_block_idx = get_global_id(0);
-    const int width_idx    = get_global_id(1);
-    const int batch_height_idx       = get_global_id(2);
+    const int x = get_global_id(0);
+    const int y = get_global_id(1); // inside = 1
+    const int z = get_global_id(2); // outside
+    DEAL_NON_UNIFORM_DIM3(x, y, z);
+    
+    const int offset = z * dim + y;
+    const int dim4 = (dim + 3) / 4;
+    const int loop_end = max(0, dim4 - 1);
+#if SOFTMAX_LOCAL_SIZE >= 4
+    int lid = get_local_id(0);
+    COMPUTE_FLOAT local sum[SOFTMAX_LOCAL_SIZE];
 
-    DEAL_NON_UNIFORM_DIM3(channel_block_idx, width_idx, batch_height_idx);
-    const int batch_idx = batch_height_idx / shape.z;
-    const int height_idx = batch_height_idx % shape.z;
-    const int offset = (((batch_idx*shape.y+0)*shape.z+height_idx)*shape.w+width_idx)*4;
-
-    FLOAT float_max_value = -FLT_MAX;
-    FLOAT4 input_data;
-    for (short i = 0; i < global_size_dim0 - 1; ++i) {
-        input_data      = vload4(i*shape.z*shape.w, input+offset);
-        float_max_value = max(float_max_value, input_data.x);
-        float_max_value = max(float_max_value, input_data.y);
-        float_max_value = max(float_max_value, input_data.z);
-        float_max_value = max(float_max_value, input_data.w);
+    // compute maxvalue
+    COMPUTE_FLOAT4 maxValue = (COMPUTE_FLOAT4)-FLT_MAX;
+    for (int i = lid; i < loop_end; i+=SOFTMAX_LOCAL_SIZE) {
+        maxValue = fmax(maxValue, CONVERT_COMPUTE_FLOAT4(vload4(i, input+offset)));
     }
 
-    input_data = vload4((global_size_dim0 - 1)*shape.z*shape.w, input+offset);
-    if (remain_channels == 0) {
-        float_max_value = max(float_max_value, input_data.w);
-        float_max_value = max(float_max_value, input_data.z);
-        float_max_value = max(float_max_value, input_data.y);
-        float_max_value = max(float_max_value, input_data.x);
-    } else if (remain_channels == 1) {
-        float_max_value = max(float_max_value, input_data.z);
-        float_max_value = max(float_max_value, input_data.y);
-        float_max_value = max(float_max_value, input_data.x);
-    } else if (remain_channels == 2) {
-        float_max_value = max(float_max_value, input_data.y);
-        float_max_value = max(float_max_value, input_data.x);
-    } else if (remain_channels == 3) {
-        float_max_value = max(float_max_value, input_data.x);
+    sum[lid] = fmax(fmax(fmax(maxValue.x, maxValue.y), maxValue.z), maxValue.w);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int i = SOFTMAX_LOCAL_SIZE/2; i > 0; i /= 2){
+        if (lid < i)
+            sum[lid] = fmax(sum[lid], sum[lid + i]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    maxValue.x = sum[0];
+    for(int i = loop_end << 2; i < dim; ++i){
+        maxValue.x = fmax(maxValue.x, (COMPUTE_FLOAT)(input[offset+i]));
     }
 
-    FLOAT accum_result       = 0;
-    for (short i = 0; i < global_size_dim0 - 1; ++i) {
-        input_data = vload4(i*shape.z*shape.w, input+offset);;
-        input_data = EXP(input_data - float_max_value);
-        accum_result += input_data.x;
-        accum_result += input_data.y;
-        accum_result += input_data.z;
-        accum_result += input_data.w;
+    // compute sumvalue
+    COMPUTE_FLOAT4 sumValue = (COMPUTE_FLOAT4)0;
+    for (int i = lid; i < loop_end; i+=SOFTMAX_LOCAL_SIZE) {
+        sumValue += exp(CONVERT_COMPUTE_FLOAT4(vload4(i, input+offset)) - (COMPUTE_FLOAT4)maxValue.x);
     }
-
-    input_data = vload4((global_size_dim0 - 1)*shape.z*shape.w, input+offset);
-    input_data -= float_max_value;
-    if (remain_channels == 0) {
-        accum_result += EXP(input_data.w);
-        accum_result += EXP(input_data.z);
-        accum_result += EXP(input_data.y);
-        accum_result += EXP(input_data.x);
-    } else if (remain_channels == 1) {
-        accum_result += EXP(input_data.z);
-        accum_result += EXP(input_data.y);
-        accum_result += EXP(input_data.x);
-    } else if (remain_channels == 2) {
-        accum_result += EXP(input_data.y);
-        accum_result += EXP(input_data.x);
-    } else if (remain_channels == 3) {
-        accum_result += EXP(input_data.x);
+    sum[lid] = sumValue.x + sumValue.y + sumValue.z + sumValue.w;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int i = SOFTMAX_LOCAL_SIZE/2; i > 0; i /= 2){
+        if (lid < i)
+            sum[lid] = sum[lid] + sum[lid + i];
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-
-    input_data = vload4(channel_block_idx*shape.z*shape.w, input+offset) - float_max_value;
-    const int output_remain = output_channels - mul24(channel_block_idx, 4);
-
-    if (output_remain == 1) {
-        input_data.x = EXP(input_data.x) / accum_result;
-    } else if (output_remain == 2) {
-        input_data.y = EXP(input_data.y) / accum_result;
-        input_data.x = EXP(input_data.x) / accum_result;
-    } else if (output_remain == 3) {
-        input_data.z = EXP(input_data.z) / accum_result;
-        input_data.y = EXP(input_data.y) / accum_result;
-        input_data.x = EXP(input_data.x) / accum_result;
-    } else{
-        input_data = EXP(input_data) / accum_result;
+    sumValue.x = sum[0];
+    for(int i = loop_end << 2; i < dim; ++i){
+        sumValue.x += exp((COMPUTE_FLOAT)(input[offset+i]) - maxValue.x);
     }
     
-    vstore4(input_data, channel_block_idx*shape.z*shape.w, output+offset);
+    // store result
+    for(int i = lid; i < loop_end; i+=SOFTMAX_LOCAL_SIZE){
+        vstore4(CONVERT_FLOAT4(exp(CONVERT_COMPUTE_FLOAT4(vload4(i, input+offset)) - (COMPUTE_FLOAT4)maxValue.x) / (COMPUTE_FLOAT4)sumValue.x), 0, output + offset + i * 4);
+    }
+    for(int i = loop_end << 2; i < dim; ++i){
+        output[offset + i] = (FLOAT)exp((COMPUTE_FLOAT)(input[offset + i]) - maxValue.x) / sumValue.x;
+    }
+#else
+    // compute maxvalue
+    COMPUTE_FLOAT4 maxValue = (COMPUTE_FLOAT4)-FLT_MAX;
+    for (int i = 0; i < loop_end; i++) {
+        maxValue = fmax(maxValue, CONVERT_COMPUTE_FLOAT4(vload4(i, input+offset)));
+    }
+    maxValue.x = fmax(fmax(fmax(maxValue.x, maxValue.y), maxValue.z), maxValue.w);
+    for(int i = loop_end << 2; i < dim; ++i){
+        maxValue.x = fmax(maxValue.x, (COMPUTE_FLOAT)(input[offset+i]));
+    }
+    
+    // compute sumvalue
+    COMPUTE_FLOAT4 sumValue = (COMPUTE_FLOAT4)0;
+    for (int i = 0; i < loop_end; i++) {
+        sumValue += exp(CONVERT_COMPUTE_FLOAT4(vload4(i, input+offset)) - (COMPUTE_FLOAT4)maxValue.x);
+    }
+    sumValue.x = sumValue.x + sumValue.y + sumValue.z + sumValue.w;
+    for(int i = loop_end << 2; i < dim; ++i){
+        sumValue.x += exp((COMPUTE_FLOAT)(input[offset+i]) - maxValue.x);
+    }
+    
+    // store result
+    for(int i = 0; i < loop_end; i++){
+        vstore4(CONVERT_FLOAT4(exp(CONVERT_COMPUTE_FLOAT4(vload4(i, input+offset)) - (COMPUTE_FLOAT4)maxValue.x) / (COMPUTE_FLOAT4)sumValue.x), 0, output + offset + i * 4);
+    }
+    for(int i = loop_end << 2; i < dim; ++i){
+        output[offset + i] = (FLOAT)exp((COMPUTE_FLOAT)(input[offset + i]) - maxValue.x) / sumValue.x;
+    }
+#endif
 }
 
+__kernel void softmax_buf(GLOBAL_SIZE_3_DIMS
+                              __global const FLOAT *input,
+                              __global FLOAT *output,
+                              __private const int inside,
+                              __private const int outside,
+                              __private const int dim) {
 
-__kernel void softmax_height(__global const FLOAT *input,
-                             __global FLOAT *output,
-                             __private const int4 shape // NCHW
-                             ) {
-    int wc = get_global_id(0);
-    int b = get_global_id(1);
+    const int x = get_global_id(0);
+    const int y = get_global_id(1); // inside
+    const int z = get_global_id(2); // outside
+    DEAL_NON_UNIFORM_DIM3(x, y, z);
     
-    const int c = wc / shape.w;
-    const int w = wc % shape.w;
-    const int offset = (((b*shape.y+c)*shape.z+0)*shape.w+w)*4;
-    
-    if (wc < shape.y*shape.w && b < shape.x) {
-        /*Compute Max */
-        FLOAT4 maxValue = vload4(0, input+offset);
-        for (int i=1; i<shape.z; ++i) {
-            maxValue = fmax(maxValue, vload4(i*shape.w, input+offset));
-        }
-        /*Compute Exp Sum*/
-        FLOAT4 sumValue = (FLOAT4)0;
-        for (int i=0; i<shape.z; ++i) {
-            sumValue += exp(vload4(i*shape.w, input+offset) - maxValue);
-        }
-        /*Compute Result */
-        for (int i=0; i<shape.z; ++i) {
-            FLOAT4 value = exp(vload4(i*shape.w, input+offset) - maxValue) / sumValue;
-            vstore4(value, i*shape.w, output+offset);
-        }
-    }    
+    const int offset = z * dim * inside + y;
+#if SOFTMAX_LOCAL_SIZE >= 4
+    int lid = get_local_id(0);
+    COMPUTE_FLOAT local sum[SOFTMAX_LOCAL_SIZE];
+
+    COMPUTE_FLOAT maxValue = (COMPUTE_FLOAT)-FLT_MAX;
+    for (int i = lid; i < dim; i+=SOFTMAX_LOCAL_SIZE) {
+        maxValue = fmax(maxValue, (COMPUTE_FLOAT)(input[offset+i*inside]));
+    }
+
+    sum[lid] = maxValue;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int i = SOFTMAX_LOCAL_SIZE/2; i > 0; i /= 2){
+        if (lid < i)
+            sum[lid] = fmax(sum[lid], sum[lid + i]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    maxValue = sum[0];
+
+    COMPUTE_FLOAT sumValue = (COMPUTE_FLOAT)0;
+    for (int i = lid; i < dim; i+=SOFTMAX_LOCAL_SIZE) {
+        sumValue += exp((COMPUTE_FLOAT)(input[offset+i*inside]) - maxValue);
+    }
+    sum[lid] = sumValue;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int i = SOFTMAX_LOCAL_SIZE/2; i > 0; i /= 2){
+        if (lid < i)
+            sum[lid] = sum[lid] + sum[lid + i];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    sumValue = sum[0];
+    for(int i = lid; i < dim; i+=SOFTMAX_LOCAL_SIZE){
+        output[offset + i * inside] = (FLOAT)exp((COMPUTE_FLOAT)(input[offset + i * inside]) - maxValue) / sumValue;
+    }
+#else
+    COMPUTE_FLOAT maxValue = (COMPUTE_FLOAT)-FLT_MAX;
+    for (int i = 0; i < dim; i++) {
+        maxValue = fmax(maxValue, (COMPUTE_FLOAT)(input[offset+i*inside]));
+    }
+
+    COMPUTE_FLOAT sumValue = (COMPUTE_FLOAT)0;
+    for (int i = 0; i < dim; i++) {
+        sumValue += exp((COMPUTE_FLOAT)(input[offset+i*inside]) - maxValue);
+    }
+    for(int i = 0; i < dim; i++){
+        output[offset + i * inside] = (FLOAT)exp((COMPUTE_FLOAT)(input[offset+i*inside]) - maxValue) / sumValue;
+    }
+#endif
 }
 
+__kernel void softmax_v4_buf(GLOBAL_SIZE_3_DIMS
+                              __global const FLOAT *input,
+                              __global FLOAT *output,
+                              __private const int inside,
+                              __private const int outside,
+                              __private const int dim) {
 
-__kernel void softmax_width(__global const FLOAT *input,
-                            __global FLOAT *output,
-                            __private const int4 shape // NCHW
-                            ) {
-    int c = get_global_id(0);
-    int bh = get_global_id(1);
+    const int x = get_global_id(0);
+    const int y = get_global_id(1); // inside
+    const int z = get_global_id(2); // outside
+    DEAL_NON_UNIFORM_DIM3(x, y, z);
     
-    const int b = bh / shape.z;
-    const int h = bh % shape.z;
-    const int offset = (((b*shape.y+c)*shape.z+h)*shape.w+0)*4;
-    
-    if (c < shape.y && bh < shape.x*shape.z) {
-        /*Compute Max */
-        FLOAT4 maxValue = vload4(0, input+offset);
-        for (int i=1; i<shape.w; ++i) {
-            maxValue = fmax(maxValue, vload4(i, input+offset));
-        }
-        /*Compute Exp Sum*/
-        FLOAT4 sumValue = (FLOAT4)0;
-        for (int i=0; i<shape.w; ++i) {
-            sumValue += exp(vload4(i, input+offset) - maxValue);
-        }
-        /*Compute Result */
-        for (int i=0; i<shape.w; ++i) {
-            FLOAT4 value = exp(vload4(i, input+offset) - maxValue) / sumValue;
-            vstore4(value, i, output+offset);
-        }
+    const int offset = z * dim * inside + (y << 2);
+#if SOFTMAX_LOCAL_SIZE >= 4
+    int lid = get_local_id(0);
+    COMPUTE_FLOAT4 local sum[SOFTMAX_LOCAL_SIZE];
+
+    COMPUTE_FLOAT4 maxValue = (COMPUTE_FLOAT4)-FLT_MAX;
+    for (int i = lid; i < dim; i+=SOFTMAX_LOCAL_SIZE) {
+        maxValue = fmax(maxValue, CONVERT_COMPUTE_FLOAT4(vload4(0, input+offset+i*inside)));
     }
+
+    sum[lid] = maxValue;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int i = SOFTMAX_LOCAL_SIZE/2; i > 0; i /= 2){
+        if (lid < i)
+            sum[lid] = fmax(sum[lid], sum[lid + i]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    maxValue = sum[0];
+
+    COMPUTE_FLOAT4 sumValue = (COMPUTE_FLOAT4)0;
+    for (int i = lid; i < dim; i+=SOFTMAX_LOCAL_SIZE) {
+        sumValue += exp(CONVERT_COMPUTE_FLOAT4(vload4(0, input+offset+i*inside)) - maxValue);
+    }
+    sum[lid] = sumValue;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int i = SOFTMAX_LOCAL_SIZE/2; i > 0; i /= 2){
+        if (lid < i)
+            sum[lid] = sum[lid] + sum[lid + i];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    sumValue = sum[0];
+    for(int i = lid; i < dim; i+=SOFTMAX_LOCAL_SIZE){
+        vstore4(CONVERT_FLOAT4(exp(CONVERT_COMPUTE_FLOAT4(vload4(0, input+offset+i*inside)) - maxValue) / sumValue), 0, output+offset+i*inside);
+    }
+#else
+    COMPUTE_FLOAT4 maxValue = (COMPUTE_FLOAT4)-FLT_MAX;
+    for (int i = 0; i < dim; i++) {
+        maxValue = fmax(maxValue, CONVERT_COMPUTE_FLOAT4(vload4(0, input+offset+i*inside)));
+    }
+
+    COMPUTE_FLOAT4 sumValue = (COMPUTE_FLOAT4)0;
+    for (int i = 0; i < dim; i++) {
+        sumValue += exp(CONVERT_COMPUTE_FLOAT4(vload4(0, input+offset+i*inside)) - maxValue);
+    }
+    for(int i = 0; i < dim; i++){
+        vstore4(CONVERT_FLOAT4(exp(CONVERT_COMPUTE_FLOAT4(vload4(0, input+offset+i*inside)) - maxValue) / sumValue), 0, output+offset+i*inside);
+    }
+#endif
 }

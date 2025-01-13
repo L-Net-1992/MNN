@@ -3,8 +3,11 @@
 #include <memory>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <algorithm>
 #include <MNN/HalideRuntime.h>
+#include <MNN/MNNForwardType.h>
+#include <MNN/Interpreter.hpp>
 #if defined(_MSC_VER) && PY_MAJOR_VERSION >= 3
 #include <Windows.h>
 #include <stringapiset.h>
@@ -12,10 +15,11 @@
 #include "common.h"
 
 #define PARSE(obj, default, func) ((obj) == nullptr ? (default) : func(obj))
+#define MAX_CONFIG_SIZE 5
 
 using namespace std;
 typedef vector<int> INTS;
-#define PyMNN_ERROR_LOG(x) PyErr_SetString(PyExc_TypeError, x);
+#define PyMNN_ERROR_LOG(x) PyErr_SetString(PyExc_TypeError, x);MNN_PRINT(x);
 #define PyMNN_ERROR(x) PyMNN_ERROR_LOG(x) \
     Py_RETURN_NONE
 #if PY_MAJOR_VERSION < 3
@@ -103,13 +107,24 @@ inline int64_t unpackLong(PyObject* obj) {
   }
   return (int64_t)value;
 }
+inline double unpackDoubleOrLong(PyObject* obj) {
+    if (PyLong_Check(obj)
+#if PY_MAJOR_VERSION < 3
+    || PyInt_Check(obj)
+#endif
+    ) {
+        return static_cast<float>(unpackLong(obj));
+    }
+    return unpackDouble(obj);
+}
 inline void store_scalar(void* data, int dtype, PyObject* obj) {
   switch (dtype) {
     case 4: *(uint8_t*)data = (uint8_t)unpackLong(obj); break;
     case 3: *(int32_t*)data = (int32_t)unpackLong(obj); break;
     case 9: *(int64_t*)data = unpackLong(obj); break;
-    case 1: *(float*)data = (float)unpackDouble(obj); break;
-    case 2: *(double*)data = (double)unpackDouble(obj); break;
+    case 1: *(float*)data = (float)unpackDoubleOrLong(obj); break;
+    case 2: *(double*)data = (double)unpackDoubleOrLong(obj); break;
+    case 6: *(int8_t*)data = (int8_t)unpackLong(obj); break;
     default: PyMNN_ERROR_LOG("store_scalar: invalid type");
   }
 }
@@ -199,15 +214,18 @@ DType htype2dtype(halide_type_t type) {
     if (type.code == halide_type_uint && type.bits == 8) {
         return DType_UINT8;
     }
+    if (type.code == halide_type_int && type.bits == 8) {
+        return DType_INT8;
+    }
     if (type.code == halide_type_int && type.bits == 32) {
         return DType_INT32;
     }
     if (type.code == halide_type_int && type.bits == 64) {
         return DType_INT64;
-    } 
+    }
     if (type.code == halide_type_handle) {
-	return DType_STRING; 
-    } 
+	return DType_STRING;
+    }
     return DType_FLOAT;
 }
 #define CONVERT(src, dst, f)\
@@ -317,6 +335,9 @@ static inline PyObject* toPyObj(uint8_t val) {
 static inline PyObject* toPyObj(int val) {
     return PyLong_FromLong(val);
 }
+static inline PyObject* toPyObj(size_t val) {
+    return PyLong_FromLong(val);
+}
 static inline PyObject* toPyObj(float val) {
     return PyFloat_FromDouble(val);
 }
@@ -371,13 +392,25 @@ static inline bool isFloat(PyObject* obj) {
 static inline bool isNone(PyObject* obj) {
     return (obj == Py_None);
 }
+static inline bool isPySequence(PyObject* obj) {
+    // ndarray in PySequence_Check is true;
+    // when PYMNN_NUMPY_USABLE is close will get some wrong judge
+    // use isPySequence replace PySequence_Check
+    return PyTuple_Check(obj) || PyList_Check(obj) || PyBytes_Check(obj);
+}
+static inline int PySequenceSize(PyObject* obj) {
+    if (PyTuple_Check(obj)) return PyTuple_Size(obj);
+    if (PyList_Check(obj)) return PyList_Size(obj);
+    if (PyBytes_Check(obj)) return PyBytes_Size(obj);
+    return 0;
+}
 static inline bool isVals(PyObject* obj) {
     return
 #ifdef PYMNN_NUMPY_USABLE
     PyArray_Check(obj) ||
 #endif
     PyCapsule_CheckExact(obj) ||
-    PySequence_Check(obj);
+    isPySequence(obj);
 }
 template <bool (*Func)(PyObject*)>
 static bool isVec(PyObject* obj) {
@@ -421,7 +454,7 @@ static vector<T> toVec(PyObject* obj) {
         if (total_length == 0) {
             return values;
         }
-        int item_size = getnpysize(PyArray_TYPE(obj));
+        int item_size = getnpysize(PyArray_TYPE((const PyArrayObject*)obj));
         PyArrayObject *obj_cont= PyArray_GETCONTIGUOUS((PyArrayObject*)obj);
         auto tmpBuffer = PyArray_DATA(obj_cont);
         if(NULL == tmpBuffer) {
@@ -485,7 +518,7 @@ static void* toPtr(PyObject *obj, DType dtype, int64_t& total_length, void* data
             PyMNN_ERROR_LOG("data size does not match each other");
             return data;
         }
-        int npy_type = PyArray_TYPE(obj);
+        int npy_type = PyArray_TYPE((const PyArrayObject*)obj);
         int itemsize = getitemsize(dtype, npy_type);
         PyArrayObject *obj_cont= PyArray_GETCONTIGUOUS((PyArrayObject*)obj);
         auto tmpBuffer = PyArray_DATA(obj_cont);
@@ -561,6 +594,132 @@ static void* toPtr(PyObject *obj, DType dtype, int64_t& total_length, void* data
     }
     return data;
 }
+
+namespace ec {
+    int getVectorByKey(PyObject* dict, const char *key, std::vector<std::string>& result){
+        PyObject *saveTensors = PyDict_GetItemString(dict, key);
+        int count = 0;
+        if (saveTensors) {
+            if (!PyTuple_Check(saveTensors)) {
+                PyErr_SetString(PyExc_Exception,
+                                "PyMNNInterpreter_createSession: saveTensors must be a tuple");
+                return -1;
+            }
+
+            size_t saveTensorsCount = PyTuple_Size(saveTensors);
+            for (size_t i = 0; i < saveTensorsCount; i++) {
+                PyObject *tensorNameItem = PyTuple_GetItem(saveTensors, i);
+                if (!checkString(tensorNameItem)) {
+                    PyErr_SetString(PyExc_Exception,
+                                    "PyMNNInterpreter_createSession: saveTensors's member must be string");
+                    return -1;
+                }
+
+
+                result.push_back(object2String(tensorNameItem));
+                count++;
+            }
+        }
+        return count;
+    }
+}
+
+inline bool getScheduleConfig(PyObject* dict, MNN::ScheduleConfig &config) {
+    auto backendConfig = config.backendConfig;
+    if (dict) {
+        PyObject *backend = PyDict_GetItemString(dict, "backend");
+        config.type = MNN_FORWARD_CPU;
+        if (backend && checkString(backend)) {
+            auto backend_name = object2String(backend);
+            // Avoid misusing backend not supported by the bridge and corresponding MNN library on python level,
+            // then user will ask for right version bridge library to us, same like MNN.expr.Backend.* python enum
+            std::unordered_map<std::string, MNNForwardType> backend_map = {
+                // Don't care whether MNN library support corresponding backend, all backend type are usable by user,
+                // which make MNN.whl setup.py easy
+                {"CPU", MNN_FORWARD_CPU},
+                {"OPENCL", MNN_FORWARD_OPENCL},
+                {"OPENGL", MNN_FORWARD_OPENGL},
+                {"VULKAN", MNN_FORWARD_VULKAN},
+                {"METAL", MNN_FORWARD_METAL},
+                {"TRT", MNN_FORWARD_USER_1},
+                {"CUDA", MNN_FORWARD_CUDA},
+                {"HIAI", MNN_FORWARD_USER_0},
+                {"NN", MNN_FORWARD_NN},
+                {"AUTO", MNN_FORWARD_AUTO}
+            };
+            auto iter = backend_map.find(backend_name);
+            if (iter == backend_map.end()) {
+                // backend not support, issue on python level when development
+                PyErr_SetString(PyExc_Exception,
+                                "PyMNNInterpreter_createSession: backend not support");
+                return false;
+            }
+            config.type = iter->second;
+        } else if (backend && isInt(backend)) {
+            config.type = (MNNForwardType)toInt(backend); // {'backend': 1L} for example
+        }
+        PyObject *numThread = PyDict_GetItemString(dict, "numThread");
+        if (numThread) {
+            if (!isInt(numThread)) {
+                PyErr_SetString(PyExc_Exception,
+                                "PyMNNInterpreter_createSession: numThread must be a integer");
+                return false;
+            }
+            config.numThread = (int)toInt(numThread);
+        }
+        {
+            //power
+            PyObject *obj = PyDict_GetItemString(dict, "power");
+            if (obj) {
+                if (isInt(obj)) {
+                    backendConfig->power = (MNN::BackendConfig::PowerMode)toInt(obj);
+                }
+            }
+        }
+        {
+            //memory
+            PyObject *obj = PyDict_GetItemString(dict, "memory");
+            if (obj) {
+                if (isInt(obj)) {
+                    backendConfig->memory = (MNN::BackendConfig::MemoryMode)toInt(obj);
+                }
+            }
+        }
+        {
+            //precision
+            PyObject *obj = PyDict_GetItemString(dict, "precision");
+            if (obj) {
+                if (isInt(obj)) {
+                    backendConfig->precision = (MNN::BackendConfig::PrecisionMode)toInt(obj);
+                } else {
+                    // For compability
+                    auto obj_name = object2String(obj);
+                    if (!obj_name.compare("low")) {
+                        MNN_PRINT("MNN use low precision\n");
+                        backendConfig->precision = MNN::BackendConfig::Precision_Low;
+                    }
+                    if (!obj_name.compare("Low_BF16")) {
+                        MNN_PRINT("MNN use lowBF precision\n");
+                        backendConfig->precision = MNN::BackendConfig::Precision_Low_BF16;
+                    }
+                    if (!obj_name.compare("high")) {
+                        MNN_PRINT("MNN use high precision\n");
+                        backendConfig->precision = MNN::BackendConfig::Precision_High;
+                    }
+                }
+            }
+        }
+
+        if (-1 == ec::getVectorByKey(dict, "saveTensors", config.saveTensors)
+            || -1 == ec::getVectorByKey(dict, "inputPaths", config.path.inputs)
+            || -1 == ec::getVectorByKey(dict, "outputPaths", config.path.outputs)){
+            return false;
+        }
+    }
+    return true;
+}
+
+
 //------------------------ macro_utils start -------------------------
 #define arg_half_size(...) \
          arg_half_size_(__VA_ARGS__, arg_half_rseq_n())

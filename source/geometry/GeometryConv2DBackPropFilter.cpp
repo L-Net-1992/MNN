@@ -76,7 +76,7 @@ public:
                     endDx = endDx - (endSx - iw + sw) / sw;
                     endSx = endDx * sw + kx * dw - pads.first;
                 }
-                if (startDy > endDy) {
+                if (startDy > endDy || startDx > endDx) {
                     continue;
                 }
                 auto dstOffsetKx = dstOffsetKy + startDx;
@@ -198,7 +198,10 @@ public:
         {
             // B: Input Im2Col, n, ic, ih, iw -> ic*kh*kw, n*oh*ow
             std::shared_ptr<Tensor> im2Col(new Tensor);
-            GeometryConvUtils::im2Col(im2Col.get(), input, ic, kh, kw, batch, oh, ow, ih, iw, sh, sw, dh, dw, pads);
+            std::shared_ptr<Tensor> im2ColTemp = GeometryConvUtils::im2Col(im2Col.get(), input, ic, kh, kw, batch, oh, ow, ih, iw, sh, sw, dh, dw, pads);
+            if (im2ColTemp.get() != nullptr) {
+                res.extras.emplace_back(im2ColTemp);
+            }
             B = im2Col.get();
             res.extras.emplace_back(im2Col);
         }

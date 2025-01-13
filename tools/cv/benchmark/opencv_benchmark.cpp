@@ -17,6 +17,7 @@
 #ifdef MNN_IMGCODECS
 #include "cv/imgcodecs.hpp"
 #endif
+#include <MNN/AutoTime.hpp>
 
 using namespace MNN;
 using namespace Express;
@@ -30,7 +31,7 @@ constexpr const char* path = "./imgs/cat.jpg";
 
 template <typename T>
 VARP cv2mnn(const cv::Mat& src) {
-    VARP dst = _Input({ src.rows, src.cols, src.channels() }, NHWC, halide_type_of<T>());
+    VARP dst = _Input({ 1, src.rows, src.cols, src.channels() }, NHWC, halide_type_of<T>());
     auto inputPtr = dst->writeMap<T>();
     memcpy(inputPtr, src.ptr(0), dst->getInfo()->size * sizeof(T));
     return dst;
@@ -46,12 +47,12 @@ VARP cv2mnn(const cv::Mat& src) {
 #define arg_switch(COND, CASE0, CASE1, CASE2, CASE3) arg_concat(arg_switch_, COND)(CASE0, CASE1, CASE2, CASE3)
 
 #define BENCH_IMPL(mode, func, ...)\
-    auto t1 =  std::chrono::high_resolution_clock::now();\
+arg_switch(mode, cv::func(__VA_ARGS__);, auto dst = func(__VA_ARGS__);dst->readMap<void>();, auto dst = func(__VA_ARGS__);dst[0]->readMap<void>();, func(__VA_ARGS__);)\
+    Timer l_;\
     for (int i = 0; i < LOOP; i++) {\
 arg_switch(mode, cv::func(__VA_ARGS__);, auto dst = func(__VA_ARGS__);dst->readMap<void>();, auto dst = func(__VA_ARGS__);dst[0]->readMap<void>();, func(__VA_ARGS__);)\
     }\
-    auto t2 =  std::chrono::high_resolution_clock::now();\
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / (1000. * LOOP);\
+    auto duration = (float)l_.durationInUs() / 1000.f / LOOP;\
     times.push_back(duration); \
 
 #define BENCHMARK_NAME(mode, name, func, ...) \
@@ -73,17 +74,18 @@ void color(cv::Mat cvimg, VARP mnnimg) {
     cv::Mat dst;
 #define CVTCOLOR(code)\
     BENCHMARK_NAME(0, code, cvtColor, cvimg, dst, cv::COLOR_##code)\
-    BENCHMARK_NAME(1, code, cvtColor, mnnimg, COLOR_##code)
+    BENCHMARK_NAME(3, code, cvtColor, mnnimg, COLOR_##code)
+
     CVTCOLOR(RGB2BGR)
     CVTCOLOR(RGB2GRAY)
     CVTCOLOR(RGB2RGBA)
-    CVTCOLOR(RGB2BGRA)
     CVTCOLOR(RGB2YUV)
     CVTCOLOR(RGB2XYZ)
     CVTCOLOR(RGB2HSV)
     CVTCOLOR(RGB2HSV_FULL)
     CVTCOLOR(RGB2BGR555)
     CVTCOLOR(RGB2BGR565)
+
 }
 
 void filter(cv::Mat cvimg, VARP mnnimg) {
@@ -152,13 +154,13 @@ void filter(cv::Mat cvimg, VARP mnnimg) {
 void geometric(cv::Mat cvimg, VARP mnnimg) {
     cv::Mat dst;
     // getAffineTransform
-    float points[] = { 50, 50, 200, 50, 50, 200, 10, 100, 200, 20, 100, 250 };
-    cv::Point2f cvSrc[3], cvDst[3];
-    memcpy(cvSrc, points, 6 * sizeof(float));
-    memcpy(cvDst, points + 6, 6 * sizeof(float));
-    Point mnnSrc[3], mnnDst[3];
-    memcpy(mnnSrc, points, 6 * sizeof(float));
-    memcpy(mnnDst, points + 6, 6 * sizeof(float));
+    float points[] = { 50, 50, 200, 50, 50, 200, 10, 100, 200, 20, 100, 250, 100, 20, 50, 100};
+    cv::Point2f cvSrc[4], cvDst[4];
+    memcpy(cvSrc, points, 8 * sizeof(float));
+    memcpy(cvDst, points + 8, 8 * sizeof(float));
+    Point mnnSrc[4], mnnDst[4];
+    memcpy(mnnSrc, points, 8 * sizeof(float));
+    memcpy(mnnDst, points + 8, 8 * sizeof(float));
     BENCHMARK_CV(getAffineTransform, cvSrc, cvDst);
     BENCHMARK(3, getAffineTransform, mnnSrc, mnnDst);
     // getPerspectiveTransform
@@ -193,12 +195,14 @@ void miscellaneous(cv::Mat cvimg, VARP mnnimg) {
     // blendLinear
     int weightSize = cvimg.rows * cvimg.cols;
     std::vector<float> weight1(weightSize, 0.6), weight2(weightSize, 0.7);
+    std::vector<float> mnnweight1(weightSize), mnnweight2(weightSize);
     cv::Mat cvWeight1 = cv::Mat(cvimg.rows, cvimg.cols, CV_32FC1);
     cv::Mat cvWeight2 = cv::Mat(cvimg.rows, cvimg.cols, CV_32FC1);
     memcpy(cvWeight1.data, weight1.data(), weight1.size() * sizeof(float));
     memcpy(cvWeight2.data, weight2.data(), weight2.size() * sizeof(float));
     auto mnnWeight1 = cv2mnn<float>(cvWeight1);
     auto mnnWeight2 = cv2mnn<float>(cvWeight2);
+
     BENCHMARK_CV(blendLinear, cvimg, cvimg, cvWeight1, cvWeight2, dst);
     BENCHMARK_MNN(blendLinear, mnnimg, mnnimg, mnnWeight1, mnnWeight2);
     // threshold
@@ -207,7 +211,7 @@ void miscellaneous(cv::Mat cvimg, VARP mnnimg) {
 }
 
 void structral(cv::Mat cvimg, VARP mnnimg) {
-    static std::vector<uint8_t> img = {
+    static std::vector<float> img = {
         0,0,0,0,0,0,0,0,0,0,0,0,0,
         0,0,0,0,0,0,0,0,0,0,0,0,0,
         0,0,0,1,0,0,0,0,0,0,0,0,0,

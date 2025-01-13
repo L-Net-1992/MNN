@@ -7,6 +7,7 @@
 //
 
 #include "CPUScale.hpp"
+#include "CPUScaleInt8.hpp"
 #include "CPUBackend.hpp"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
@@ -16,12 +17,9 @@
 namespace MNN {
 CPUScale::CPUScale(const Op* op, Backend* bn) : MNN::Execution(bn) {
     auto scale      = op->main_as_Scale();
-    int outputCount = scale->scaleData()->size();
     auto core = static_cast<CPUBackend*>(bn)->functions();
-    mScaleBias.reset(
-                     Tensor::createDevice<uint8_t>(
-                                           {2, UP_DIV(outputCount, core->pack) * core->pack * core->bytes}
-                                           ));
+    int outputCount = scale->scaleData()->size();
+    mScaleBias.reset(Tensor::createDevice<uint8_t>({2, UP_DIV(outputCount, core->pack) * core->pack * core->bytes}));
     auto res = bn->onAcquireBuffer(mScaleBias.get(), Backend::STATIC);
     if (!res) {
         MNN_ERROR("Error for alloc buffer for CPUScale\n");
@@ -45,10 +43,22 @@ CPUScale::CPUScale(const Op* op, Backend* bn) : MNN::Execution(bn) {
     }
 }
 CPUScale::~CPUScale() {
-    if (nullptr != mScaleBias) {
-        backend()->onReleaseBuffer(mScaleBias.get(), Backend::STATIC);
-    }
+    // Do nothing
 }
+CPUScale::CPUScale(Backend* bn) : Execution(bn) {
+    // Do nothing
+}
+
+bool CPUScale::onClone(Backend* bn, const Op* op, Execution** dst) {
+    if (nullptr == dst) {
+        return true;
+    }
+    auto scale = new CPUScale(bn);
+    scale->mScaleBias = mScaleBias;
+    *dst = scale;
+    return true;
+}
+
 ErrorCode CPUScale::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     auto input  = inputs[0];
     auto output = outputs[0];
@@ -79,6 +89,9 @@ class CPUScaleCreator : public CPUBackend::Creator {
 public:
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                 const MNN::Op* op, Backend* backend) const override {
+        if (CPUBackend::getDataType(inputs[0]) == DataType_DT_INT8 || inputs[0]->getType().bytes() == 1) {
+            return new CPUScaleInt8(op, backend);
+        }
         return new CPUScale(op, backend);
     }
 };

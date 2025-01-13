@@ -10,6 +10,8 @@
 #include "core/MNNMemoryUtils.h"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
+#include "backend/cpu/compute/CommonOptFunction.h"
+#include "backend/cpu/compute/ConvOpt.h"
 #include <cmath>
 
 #ifdef MNN_USE_NEON
@@ -113,6 +115,60 @@ void Matrix::multi(Tensor* C, const Tensor* A, const Tensor* B) {
     }
 }
 
+void Matrix::multi (float* C, float* A, float* B, int M, int K, int N, bool A_needTranspose, bool B_needTranspose) {
+    if (N == 0) {
+        // step1: dst->shape()=(M,M), src->shape()=(M,K), dst=src*src_T, dst is a symmetric matrix.
+        // step2: (E-dst)*2
+        int y = 0;
+        for (; y < M; ++y) { // C:row
+            int x = 0;
+            const auto aLineRow = B + y * K;
+            for (; x < y; ++x) { // C:column
+                // half bottom coordinate (y,x), half top (x,y)
+                int indexBottom = y * M + x;
+                int indexTop    = x * M + y;
+                const auto aLineColumn = B + x * K;
+                float sum    = 0.0f;
+                for (int i = 0; i < K; ++i) {
+                    sum += aLineRow[i] * aLineColumn[i];
+                }
+                C[indexBottom] = sum * sum;
+                C[indexTop]    = sum * sum;
+                A[indexBottom]  = -sum;
+                A[indexTop]     = -sum;
+            }
+            // diagonal
+            int index = y * M + x;
+            const auto aLineColumn = B + x * K;
+            float sum = 0.f;
+            for (int i = 0; i < K; ++i) {
+                sum += aLineRow[i] * aLineColumn[i];
+            }
+            C[index] = (1 - sum) * (1 - sum);
+            A[index]  = 1 - sum;
+        } // Finish compute src*src_T
+        return;
+    }
+    int y = 0;
+    for (; y < M; ++y) {
+        int x            = 0;
+        const auto aLine = A + y * K;
+        auto cLine       = C + y * N;
+        for (; x < N; ++x) {
+            auto bColumn = B + x;
+            float sum    = 0.0f;
+            for (int i = 0; i < K; ++i) {
+                sum += aLine[i] * bColumn[i * N];
+            }
+            cLine[x] = sum;
+        }
+    }
+}
+
+void Matrix::add (float* C, float* A, float* B, int size) {
+    MNNMatrixAddCommon(C, A, B, size, 0, 0, 0, 1);
+}
+
 void Matrix::add(Tensor* C, const Tensor* A, const Tensor* B) {
     MNN_ASSERT(NULL != C);
     MNN_ASSERT(NULL != B);
@@ -130,45 +186,8 @@ void Matrix::add(Tensor* C, const Tensor* A, const Tensor* B) {
         bOffset = 0;
         MNN_ASSERT(B->length(0) == A->length(1));
     }
-    const int size = width;
-    for (int y=0; y<height; ++y) {
-        auto a = A->host<float>() + y * A->stride(0);
-        auto b = B->host<float>() + y * bOffset;
-        auto c = C->host<float>() + y * C->stride(0);
-        int i = 0;
-#ifdef MNN_USE_NEON
-        for (; i <= size - 16; i += 16) {
-            float32x4_t a0 = vld1q_f32(a + i);
-            float32x4_t a1 = vld1q_f32(a + i + 4);
-            float32x4_t a2 = vld1q_f32(a + i + 8);
-            float32x4_t a3 = vld1q_f32(a + i + 12);
-            float32x4_t b0 = vld1q_f32(b + i);
-            float32x4_t b1 = vld1q_f32(b + i + 4);
-            float32x4_t b2 = vld1q_f32(b + i + 8);
-            float32x4_t b3 = vld1q_f32(b + i + 12);
-
-            float32x4_t sum0 = vaddq_f32(a0, b0);
-            float32x4_t sum1 = vaddq_f32(a1, b1);
-            float32x4_t sum2 = vaddq_f32(a2, b2);
-            float32x4_t sum3 = vaddq_f32(a3, b3);
-
-            vst1q_f32(c + i, sum0);
-            vst1q_f32(c + i + 4, sum1);
-            vst1q_f32(c + i + 8, sum2);
-            vst1q_f32(c + i + 12, sum3);
-        }
-
-        for (; i <= size - 4; i += 4) {
-            float32x4_t aa  = vld1q_f32(a + i);
-            float32x4_t bb  = vld1q_f32(b + i);
-            float32x4_t sum = vaddq_f32(aa, bb);
-            vst1q_f32(c + i, sum);
-        }
-#endif
-        for (; i < size; ++i) {
-            c[i] = a[i] + b[i];
-        }
-    }
+    MNNMatrixAddCommon(C->host<float>(), A->host<float>(), B->host<float>(), width, C->stride(0), A->stride(0), bOffset, height);
+    return;
 }
 
 void Matrix::sub(Tensor* C, const Tensor* A, const Tensor* B) {
@@ -188,37 +207,7 @@ void Matrix::sub(Tensor* C, const Tensor* A, const Tensor* B) {
         bOffset = 0;
         MNN_ASSERT(B->length(0) == A->length(1));
     }
-    const int size = width;
-    for (int y=0; y<height; ++y) {
-        auto a = A->host<float>() + y * A->stride(0);
-        auto b = B->host<float>() + y * bOffset;
-        auto c = C->host<float>() + y * C->stride(0);
-        int i = 0;
-#ifdef MNN_USE_NEON
-        for (; i <= size - 8; i += 8) {
-            float32x4_t a0 = vld1q_f32(a + i);
-            float32x4_t a1 = vld1q_f32(a + i + 4);
-            float32x4_t b0 = vld1q_f32(b + i);
-            float32x4_t b1 = vld1q_f32(b + i + 4);
-
-            float32x4_t sub0 = vsubq_f32(a0, b0);
-            float32x4_t sub1 = vsubq_f32(a1, b1);
-
-            vst1q_f32(c + i, sub0);
-            vst1q_f32(c + i + 4, sub1);
-        }
-
-        for (; i <= size - 4; i += 4) {
-            float32x4_t aa  = vld1q_f32(a + i);
-            float32x4_t bb  = vld1q_f32(b + i);
-            float32x4_t sub = vsubq_f32(aa, bb);
-            vst1q_f32(c + i, sub);
-        }
-#endif
-        for (; i < size; ++i) {
-            c[i] = a[i] - b[i];
-        }
-    }
+    MNNMatrixSubCommon(C->host<float>(), A->host<float>(), B->host<float>(), width, C->stride(0), A->stride(0), bOffset, height);
 }
 
 void Matrix::dot(Tensor* C, const Tensor* A, const Tensor* B) {
@@ -236,44 +225,7 @@ void Matrix::dot(Tensor* C, const Tensor* A, const Tensor* B) {
     const int aw = A->stride(0);
     const int bw = B->stride(0);
     const int cw = C->stride(0);
-
-    for(int y = 0; y < height; y++) {
-        auto a = A->host<float>() + y * aw;
-        auto b = B->host<float>() + y * bw;
-        auto c = C->host<float>() + y * cw;
-        int i = 0;
-#ifdef MNN_USE_NEON
-        for (; i <= width - 16; i += 16) {
-            float32x4_t a0 = vld1q_f32(a + i);
-            float32x4_t a1 = vld1q_f32(a + i + 4);
-            float32x4_t a2 = vld1q_f32(a + i + 8);
-            float32x4_t a3 = vld1q_f32(a + i + 12);
-            float32x4_t b0 = vld1q_f32(b + i);
-            float32x4_t b1 = vld1q_f32(b + i + 4);
-            float32x4_t b2 = vld1q_f32(b + i + 8);
-            float32x4_t b3 = vld1q_f32(b + i + 12);
-
-            float32x4_t c0 = vmulq_f32(a0, b0);
-            float32x4_t c1 = vmulq_f32(a1, b1);
-            float32x4_t c2 = vmulq_f32(a2, b2);
-            float32x4_t c3 = vmulq_f32(a3, b3);
-
-            vst1q_f32(c + i, c0);
-            vst1q_f32(c + i + 4, c1);
-            vst1q_f32(c + i + 8, c2);
-            vst1q_f32(c + i + 12, c3);
-        }
-        for (; i <= width - 4; i += 4) {
-            float32x4_t aa  = vld1q_f32(a + i);
-            float32x4_t bb  = vld1q_f32(b + i);
-            float32x4_t cc = vmulq_f32(aa, bb);
-            vst1q_f32(c + i, cc);
-        }
-#endif
-        for (; i < width; ++i) {
-            c[i] = a[i] * b[i];
-        }
-    }
+    MNNMatrixProdCommon(C->host<float>(), A->host<float>(), B->host<float>(), width, cw, aw, bw, height);
 }
 
 void Matrix::invert(Tensor* dst, const Tensor* src) {

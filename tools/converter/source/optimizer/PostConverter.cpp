@@ -10,12 +10,17 @@
 
 #include <MNN/expr/Optimizer.hpp>
 #include <set>
+#include <MNN/expr/ExecutorScope.hpp>
 #include "PostConverter.hpp"
 #include "PostTreatUtils.hpp"
 #include "Program.hpp"
 #include "SubGraphComplete.hpp"
 #include "GenerateSubGraph.hpp"
 #include "TemplateMerge.hpp"
+#include "core/Backend.hpp"
+#include "RuntimeAttr.hpp"
+
+#include <MNN/expr/ExecutorScope.hpp>
 //#define MNN_POST_CONVERTER_DEBUG
 
 namespace MNN {
@@ -42,6 +47,7 @@ SubGraphProtoT* FindSubGraphByName(const std::vector<SubGraphProtoT*>& subgraphs
 
 bool CompleteSubGraph(const std::unordered_map<std::string, VARP>& inputs, const SubGraphProtoT* subgraph) {
     auto* ctx = Global<OptimizeContext>::Get();
+    auto config = Global<modelConfig>::Get();
     MNN_ASSERT(ctx != nullptr);
     // Disable verbose for subgraph.
     bool verbose = ctx->verbose;
@@ -63,8 +69,22 @@ bool CompleteSubGraph(const std::unordered_map<std::string, VARP>& inputs, const
     subnet->tensorName = mutable_subgraph->tensors;
     subnet->sourceType = ctx->source;
     subnet->outputName = outputNames;
-
+    bool gDebug = false;
+    if (gDebug) {
+        flatbuffers::FlatBufferBuilder builder;
+        builder.Finish(MNN::Net::Pack(builder, subnet.get()));
+        std::ofstream output("temp.before_opt.mnn", std::ofstream::binary);
+        output.write((const char*)builder.GetBufferPointer(), builder.GetSize());
+    }
+    config->inSubGraph = true;
     std::unique_ptr<MNN::NetT> new_subnet = ctx->RunOptimize(subnet, inputs);
+    config->inSubGraph = false;
+    if (gDebug) {
+        flatbuffers::FlatBufferBuilder builder;
+        builder.Finish(MNN::Net::Pack(builder, new_subnet.get()));
+        std::ofstream output("temp.after_opt.mnn", std::ofstream::binary);
+        output.write((const char*)builder.GetBufferPointer(), builder.GetSize());
+    }
     mutable_subgraph->nodes               = std::move(subnet->oplists);
 
     MNN::SubGraphProtoT* new_subgraph(new MNN::SubGraphProtoT);
@@ -85,11 +105,16 @@ bool CompleteSubGraph(const std::unordered_map<std::string, VARP>& inputs, const
     new_subgraph->outputs.clear();
     outputNames = new_subnet->outputName;
     for (auto& output : outputNames) {
+        bool find = false;
         for (int i = 0; i < new_subnet->tensorName.size(); ++i) {
             if (new_subnet->tensorName[i] == output) {
+                find = true;
                 new_subgraph->outputs.emplace_back(i);
                 break;
             }
+        }
+        if (!find) {
+            MNN_ERROR("Can't find output for %s\n", output.c_str());
         }
     }
     MNN_ASSERT(new_subgraph->outputs.size() == outputNames.size());
@@ -164,7 +189,15 @@ std::unique_ptr<MNN::NetT> RunMergePass(std::unique_ptr<MNN::NetT>& originNet,
 
     std::string pass = "Merge";
     auto& merge      = MNN::Express::TemplateMerge::getInstance(pass);
-    merge.onExecute(program->outputs(), priority, boundary);
+    std::map<std::string, VARP> updateVars;
+    merge.onExecute(program->outputs(), priority, updateVars, boundary);
+
+    auto Update = [&](std::shared_ptr<Program> program, const std::vector<std::string>& tensorName) {
+        program->updateVars(updateVars, tensorName);
+    };
+
+    Update(program, originNet->tensorName);
+
     originNet->oplists.clear();
     originNet->tensorName.clear();
 
@@ -180,6 +213,11 @@ std::unique_ptr<MNN::NetT> RunMergePass(std::unique_ptr<MNN::NetT>& originNet,
 
 std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet,
                                            const std::unordered_map<std::string, VARP>& inputs) {
+    auto current = ExecutorScope::Current();
+    current->lazyEval = true;
+    current->setLazyComputeMode(Executor::LAZY_FULL);
+    current->getAttr()->externalFile = ".__convert_external_data.bin";
+
     auto* ctx = Global<OptimizeContext>::Get();
     MNN_ASSERT(ctx != nullptr);
 
@@ -214,6 +252,8 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
 
         // Turn Caffe's ShuffleChannel to compose op
         "TransformShuffleChannel",
+        
+        "MoveUnaryOpBeforeReshape",
 
     };
     if (ctx->is_training) {
@@ -234,9 +274,15 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
         // Remove Invalid Cast
         "RemoveInvalidCast"
     };
+    std::vector<std::unique_ptr<TensorDescribeT>> tensorDescribe;
+    if (originNet->extraTensorDescribe.size() > 0) {
+        tensorDescribe = std::move(originNet->extraTensorDescribe);
+    }
+    
     std::unique_ptr<MNN::NetT> newNet;
     newNet = std::move(RunExtraPass(originNet, inputs));
     RunNetPass(midOptPass, newNet);
+    newNet = std::move(RunMergePass(newNet, inputs, PASS_PRIORITY_FRONT));
     newNet = std::move(RunMergePass(newNet, inputs, PASS_PRIORITY_HIGH));
 
     std::vector<std::string> afterProgramConvert = {
@@ -260,6 +306,9 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
         // Merge Relu6 Convolution
         "MergeRelu6ToConvolution",
 
+        // Merge Relu BinaryOp
+        "MergeReluToBinaryOp",
+
     };
     if (ctx->is_training) {
         std::vector<std::string>::iterator iter = afterProgramConvert.begin();
@@ -277,6 +326,7 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
     newNet = std::move(RunMergePass(newNet, inputs, PASS_PRIORITY_MIDDLE));
 
     afterProgramConvert = {
+        "RemoveCopy",
         // Add tensor dimension format convert for NC4HW4 - NHWC / NC4HW4 - NCHW
         "AddTensorFormatConverter",
 
@@ -284,6 +334,7 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
         "TransformGroupConvolution",
         "TransformGroupConvolution3D",
 
+        "FuseDupOp",
         // Remove output tensor convert
         "RemoveOutputTensorConvert",
     };
@@ -298,6 +349,9 @@ std::unique_ptr<MNN::NetT> optimizeNetImpl(std::unique_ptr<MNN::NetT>& originNet
     newNet = std::move(RunMergePass(newNet, inputs, PASS_PRIORITY_LOW));
     newNet = std::move(RunMergePass(newNet, inputs, PASS_PRIORITY_FINAL));
 
+    if (tensorDescribe.size() > 0) {
+        newNet->extraTensorDescribe = std::move(tensorDescribe);
+    }
     RunNetPass({"ReIndexTensor"}, newNet);
     RunNetPass({"ReIndexOnnxIfAlias"}, newNet);
 
@@ -536,8 +590,23 @@ bool fuseConstIntoSubgraph(MNN::NetT* net, const std::vector<MNN::SubGraphProtoT
 
 using namespace MNN;
 using namespace MNN::Express;
-std::unique_ptr<MNN::NetT> optimizeNet(std::unique_ptr<MNN::NetT>& originNet, bool forTraining, modelConfig& config) {
+std::unique_ptr<MNN::NetT> optimizeNet(std::unique_ptr<MNN::NetT>& originNet, bool forTraining, modelConfig& config, const std::vector<std::string>& expectPasses) {
     Global<modelConfig>::Reset(&config);
+    if (!expectPasses.empty()) {
+        RunNetPass(expectPasses, originNet);
+        return std::move(originNet);
+    }
+    std::unique_ptr<std::ofstream, void(*)(std::ofstream*)> externalFile(
+        new std::ofstream(".__convert_external_data.bin", std::ios::binary),
+        [](std::ofstream* fs){
+            fs->close();
+            delete fs;
+    });
+    if (externalFile.get() && externalFile->is_open() && externalFile->good()) {
+        config.externalFile = externalFile.get();
+    } else {
+        config.externalFile = nullptr;
+    }
     if (originNet->sourceType == NetSource_TENSORFLOW) {
         GenerateSubGraph(originNet);
     }
@@ -554,7 +623,6 @@ std::unique_ptr<MNN::NetT> optimizeNet(std::unique_ptr<MNN::NetT>& originNet, bo
     ctx.RunOptimize = optimizeNetImpl;
 
     Global<OptimizeContext>::Reset(&ctx);
-    
     std::unordered_map<std::string, VARP> inputs, empty;
     // subgraph may depend on vars of outter subgraph or root net, getting vars of them need Program::create.
     // But program (create from unoptimize net) may have OpType_Extra op, causing vars can't do getInfo/readMap correctly,

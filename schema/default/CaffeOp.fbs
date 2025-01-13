@@ -37,6 +37,8 @@ table Convolution3DCommon {
     relu:bool = false;
     relu6:bool = false;
     group:int = 1;
+    outPads:[int];
+    hasOutputShape:bool = false;
 }
 
 enum SparseAlgo : byte {
@@ -63,6 +65,10 @@ table IDSTQuan {
     aMin:int;
     readType:int;
     has_scaleInt:bool;
+    shapeInt32:bool = false;
+    // For sparse
+    weightSize:uint32;
+    index:[uint32];
 }
 
 enum QuantizeAlgo : byte {
@@ -89,6 +95,8 @@ table QuantizedFloatParam{
     clampMax: byte = 127;
     // binary proto: [originKySize, originKxSize, transKySize, transKxSize, {kyStart, kxStart, unitY, unitX}, {...} ...]
     winogradAttr:[int];
+    outputDataType:DataType=DT_INT8;
+    floatzeros: [float];
 }
 
 table Convolution2D {
@@ -98,12 +106,14 @@ table Convolution2D {
     quanParameter:IDSTQuan;
     symmetricQuan:QuantizedFloatParam;
     sparseParameter:SparseCommon;
+    external:[int64]; // [offset, weight_bytes_size, bias_bytes_size]
 }
 
 table Convolution3D {
     common:Convolution3DCommon;
     weight:[float];
     bias:[float];
+    external:[int64]; // [offset, weight_bytes_size, bias_bytes_size]
 }
 
 table InnerProduct {
@@ -236,6 +246,7 @@ table Scale {
     channels:int;
     scaleData:[float];
     biasData:[float];
+    external:[int64]; // [offset, scaleData_bytes_size, biasData_bytes_size]
 }
 
 enum EltwiseType : byte {
@@ -284,6 +295,7 @@ table RoiParameters {
     samplingRatio:int = -1;
     aligned:bool = false;
     poolType:PoolType = AVEPOOL;
+    outputGrad:bool = false;
 }
 
 table Proposal {
@@ -320,7 +332,10 @@ table Interp {
     heightOffset:float;
     cubicCoeffA:float = -0.75;
     ctm:CoordinateTransformationMode = NotSet;
-}
+    depthScale:float;
+    outputDepth:int;
+    depthOffset:float;
+} 
 
 table Resize {
     xScale:float;

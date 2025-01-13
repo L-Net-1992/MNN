@@ -80,37 +80,51 @@ def MNNDataType2NumpyDataType(data_type):
     else:
         return np.float32
 
-def createTensor(tensor, file=''):
+def createTensor(tensor, file='', empty=False):
     shape = tensor.getShape()
     data_type = tensor.getDataType()
     dtype = MNNDataType2NumpyDataType(data_type)
     if file == '':
-        data = np.ones(shape, dtype=dtype)
+        if empty:
+            data = np.zeros(shape, dtype=dtype)
+        else:
+            data = np.ones(shape, dtype=dtype)
     else:
         data = loadtxt(file, shape, dtype)
-    return MNN.Tensor(shape, tensor.getDataType(), data, tensor.getDimensionType())
+    return MNN.Tensor(shape, tensor.getDataType(), data.copy(), tensor.getDimensionType())
 
-def compareTensor(tensor, file, atol=5e-2):
-    outputNumpyData = tensor.getNumpyData()
+def compareTensor(tensor, file, tolerance=5e-2):
+    outputNumpyData = tensor.getNumpyData().copy()
     expectNumpyData = loadtxt(file, tensor.getShape())
-    return np.allclose(outputNumpyData, expectNumpyData, atol=atol)
+    max_abs_dif = np.abs(outputNumpyData - expectNumpyData).max()
+    max_exp_val = np.abs(expectNumpyData).max()
+    diff_rate = max_abs_dif / max_exp_val
+    if diff_rate > tolerance:
+        print(f'# Error: max_abs_dif: {max_abs_dif}, max_exp_val: {max_exp_val}, diff_rate: {diff_rate}')
+        return False
+    return True
 
 def log_result(success, model):
     global total_num
     global wrongs
     total_num += 1
     if success:
-        print('Test %s Correct!'%model)
+        print('Test %s Correct!\n'%model)
     else:
         wrongs.append(model)
-        print('Test Failed %s!'%model)
+        print('Test Failed %s!\n'%model)
 
 def modelTest(modelPath, givenName, expectName):
-    print("Testing model %s, input: %s, output: %s\n" % (modelPath, givenName, expectName))
+    print("Testing model %s, input: %s, output: %s" % (modelPath, givenName, expectName))
 
     net = MNN.Interpreter(modelPath)
     session = net.createSession()
     allInput = net.getSessionInputAll(session)
+    # zero for all inputs
+    for name in allInput:
+        inputTensor = allInput[name] 
+        inputHost = createTensor(inputTensor, givenName, True)
+        inputTensor.copyFrom(inputHost)
     # input
     inputTensor = net.getSessionInput(session)
     inputHost = createTensor(inputTensor, givenName)
@@ -133,7 +147,7 @@ def modelTestWithConfig(config):
     givens = config['given_names']
     outputs = config['output_names']
     expects = config['expect_names']
-    print("Testing model %s, input: %s, output: %s\n" % (model, givens, expects))
+    print("Testing model %s, input: %s, output: %s" % (model, givens, expects))
     net = MNN.Interpreter(config['model_name'])
     session = net.createSession()
     all_input = net.getSessionInputAll(session)
@@ -166,6 +180,32 @@ def modelTestWithConfig(config):
     # res
     log_result(success, model)
 
+def testSessionConfig(modelPath, givenName, expectName, session_config, outputTensorName):
+    print("Testing model %s, input: %s, output: %s" % (modelPath, givenName, expectName))
+    print("with session config:", session_config)
+
+    net = MNN.Interpreter(modelPath)
+    session = net.createSession(session_config)
+    allInput = net.getSessionInputAll(session)
+    # input
+    inputTensor = net.getSessionInput(session)
+    inputHost = createTensor(inputTensor, givenName)
+    inputTensor.copyFrom(inputHost)
+    # infer
+    net.runSession(session)
+
+    allOutput = net.getSessionOutputAll(session)
+    print("output shapes:")
+    for key in allOutput.keys():
+        print(key, "shape:", allOutput[key].getShape())
+
+    outputTensor = net.getSessionOutput(session, outputTensorName)
+    outputHost = createTensor(outputTensor)
+    outputTensor.copyToHostTensor(outputHost)
+    # compare
+    success = compareTensor(outputHost, expectName)
+    log_result(success, modelPath)
+
 def testResource(model_root_dir, name):
     root_dir = os.path.join(model_root_dir, 'TestResource')
     print('root: ' + root_dir + '\n')
@@ -187,13 +227,33 @@ def testTestWithDescribe(model_root_dir):
         if config:
             modelTestWithConfig(config)
 
+def testPymnnConfig(model_root_dir):
+    root_dir = os.path.join(model_root_dir, "TestResource")
+    print("\ntest pymnn session config")
+    print('root: ' + root_dir + '\n')
+
+    name = "ocr-single"
+    modelName = os.path.join(root_dir, name, 'temp.bin')
+    inputName = os.path.join(root_dir, name, 'input_0.txt')
+    expectName = os.path.join(root_dir, name, 'output.txt')
+
+    outputTensorName = "topk"
+    session_config = {"saveTensors":("conv1", "pool1", outputTensorName)}
+
+    testSessionConfig(modelName, inputName, expectName, session_config, outputTensorName)
+
+
 if __name__ == '__main__':
     model_root_dir = sys.argv[1]
     testResource(model_root_dir, 'TestResource')
     testResource(model_root_dir, 'OpTestResource')
     testTestWithDescribe(model_root_dir)
+    testPymnnConfig(model_root_dir)
     if len(wrongs) > 0:
         print('Wrong: ', len(wrongs))
         for wrong in wrongs:
             print(wrong)
     print('TEST_NAME_PYMNN_MODEL: Pymnn模型测试\nTEST_CASE_AMOUNT_PYMNN_MODEL: {\"blocked\":0,\"failed\":%d,\"passed\":%d,\"skipped\":0}\n'%(len(wrongs), total_num - len(wrongs)))
+    print('TEST_CASE={\"name\":\"Pymnn模型测试\",\"failed\":%d,\"passed\":%d}\n'%(len(wrongs), total_num - len(wrongs)))
+    if len(wrongs) > 0:
+       exit(1)

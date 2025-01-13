@@ -31,11 +31,22 @@ public:
         Interpreter::SessionMode outputMode = Interpreter::Session_Output_Inside;
         Interpreter::SessionMode backendMode = Interpreter::Session_Backend_Fix;
         Interpreter::SessionMode resizeMode = Interpreter::Session_Resize_Direct;
+        Interpreter::SessionMode memoryUsageMode = Interpreter::Session_Memory_Collect;
+        Interpreter::SessionMode codegenMode = Interpreter::Session_Codegen_Disable;
         int maxTuningNumber = MNN_DEFAULT_TUNING_NUMBER;
+        int geometryMask = 0xFFFF;
+        bool checkNetBuffer = true;
+        RuntimeHint runtimeHint;
+        void setHint(Interpreter::HintMode hint, int magic);
+        void setMode(Interpreter::SessionMode mode);
+        void setExternalPath(std::string path, int type);
     };
     Session(Schedule::ScheduleInfo&& info, const ModeGroup& mode,
             RuntimeInfo&& runtime);
     ~Session();
+
+    Session* clone(RuntimeInfo&& runtime, std::shared_ptr<Schedule::ScheduleInfo> sharedConst);
+    static void createPipelineBackend(Schedule::PipelineInfo& iter, RuntimeInfo& runtime);
 
 public:
     /**
@@ -55,16 +66,14 @@ public:
 
     bool getInfo(Interpreter::SessionInfoCode code, void* ptr) const;
 
-    void cloneExecution(const CacheExecutionMap& cache);
-    const CacheExecutionMap& getExecution() {
-        return mOriginExecutions;
-    }
+    void openResizeCheck();
+    ErrorCode fixResizeCache();
 public:
     /**
      * @brief resize tensors and buffers responding to input changes.
      * @return result code.
      */
-    ErrorCode resize(bool isStatic = false);
+    ErrorCode resize();
 
     /**
      * @brief set if needs resize.
@@ -76,6 +85,10 @@ public:
 
     void setNeedMalloc(bool flag = true) {
         mNeedMalloc = flag;
+    }
+
+    Runtime* getCPURuntime() {
+        return mRuntime.second.get();
     }
 
 public:
@@ -122,32 +135,31 @@ public:
     ErrorCode updateToModel(Net* net) const;
 
     void waitAsyncResize();
+    bool hasAsyncWork();
     bool loadCache(const void* buffer, size_t size);
     std::pair<const void*, size_t> getCache();
 
-    RuntimeInfo& runtime() {
-        return mRuntime;
-    }
+    Tensor* getTensor(int index) const;
+    Schedule::PipelineInfo& getPipelineInfo(int index) const;
 protected:
     const std::vector<std::shared_ptr<Pipeline>>& getPipelines() const {
         return this->mPipelines;
     }
 
 private:
-    void _clearCache();
     void _setUpTensorInfo(const Schedule::ScheduleInfo& info);
 
 private:
     RuntimeInfo mRuntime;
     std::vector<std::shared_ptr<Pipeline>> mPipelines;
-    std::vector<std::shared_ptr<Tensor>> mTensors;
-    std::map<std::string, Tensor*> mInputs;
-    std::map<std::string, Tensor*> mOutputs;
     bool mNeedResize = true;
     bool mValid      = true;
     bool mNeedMalloc = true;
     Interpreter::SessionMode mCallBackMode;
-    CacheExecutionMap mOriginExecutions;
+    Interpreter::SessionMode mMemoryUsageMode;
+    Interpreter::SessionMode mCodegenMode;
+    Schedule::ScheduleInfo mInfo;
+    ModeGroup mMode;
 };
 } // namespace MNN
 

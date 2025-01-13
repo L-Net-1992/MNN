@@ -40,8 +40,9 @@ bool Arm82Backend::addArm82Creator(OpType t, Arm82Creator* ct) {
     return true;
 }
 
-Arm82Backend::Arm82Backend(const CPURuntime* runtime) : CPUBackend(runtime, BackendConfig::Precision_Low, MNN_FORWARD_CPU_EXTENSION) {
+Arm82Backend::Arm82Backend(const CPURuntime* runtime, BackendConfig::MemoryMode memory) : CPUBackend(runtime, BackendConfig::Precision_Low, memory, MNN_FORWARD_CPU_EXTENSION) {
     mCoreFunctions = Arm82Functions::get();
+    mInt8CoreFunctions = Arm82Functions::getInt8();
 }
 
 Arm82Backend::~Arm82Backend() {
@@ -60,7 +61,7 @@ Execution* Arm82Backend::onCreate(const std::vector<Tensor*>& inputs, const std:
             return nullptr;
         }
     }
-    bool originCreate = OpCommonUtils::opCompabilityForLowp(op);
+    bool originCreate = OpCommonUtils::opCompabilityForLowp(op, 2);
     if (originCreate) {
         return CPUBackend::onCreate(inputs, outputs, op);
     }
@@ -80,11 +81,11 @@ Execution* Arm82Backend::onCreate(const std::vector<Tensor*>& inputs, const std:
     return exe;
 }
 
-static int _getAliginSize(const halide_buffer_t& buffer, MNN_DATA_FORMAT format) {
+static size_t _getAliginSize(const halide_buffer_t& buffer, MNN_DATA_FORMAT format) {
     // The default data type of input tensor for arm82 backend is FLOAT32.
     // However, Arm82Backend default data type is FLOAT16, so check whether data type is FLOAT32,
     // then divide size by 2
-    int size          = sizeof(int16_t);
+    size_t size          = sizeof(int16_t);
     const int dimensions = buffer.dimensions;
     for (int i = 0; i < dimensions; i++) {
         int currentDimSize = buffer.dim[i].extent;
@@ -118,6 +119,7 @@ void Arm82Backend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor
         CPUBackend::onCopyBuffer(srcTensor, dstTensor);
         return;
     }
+    _resetDynamicMemory();
     auto source = TensorUtils::getDescribe(srcTensor)->dimensionFormat;
     auto dest   = TensorUtils::getDescribe(dstTensor)->dimensionFormat;
     auto srcType = MNN_FORWARD_CPU;
@@ -154,8 +156,9 @@ void Arm82Backend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor
             dest = source;
         }
     }
-    if (source == MNN_DATA_FORMAT_NC4HW4) {
+    if (source == MNN_DATA_FORMAT_NC4HW4 && srcTensor->dimensions() >= 2) {
         // NC4HW4 <-> NC8HW8
+        // For dimension < 2, it don't care format convert
         int area    = 1;
         int channel = srcTensor->length(1);
         for (int axis = 2; axis < ib.dimensions; ++axis) {

@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include "core/TensorUtils.hpp"
+#include "core/OpCommonUtils.hpp"
 namespace MNN {
 class CPURaster : public Execution {
 public:
@@ -27,15 +28,16 @@ public:
     void tensorConvert(Tensor* input, Tensor* output, int bytes);
 private:
     std::map<Tensor*, Tensor*> mTempInput;
-    std::vector<std::pair<void*, Tensor::InsideDescribe::Region*>> mTempInputCopy;
-    std::vector<std::pair<void*, Tensor::InsideDescribe::Region>> mFastBlit;
+    std::vector<std::pair<const Tensor*, Tensor::InsideDescribe::Region*>> mTempInputCopy;
+    std::vector<std::pair<const Tensor*, Tensor::InsideDescribe::Region>> mFastBlit;
     std::shared_ptr<Tensor> mTempOutput;
-    void* mOutputPtr;
     bool mNeedZero = false;
     bool mFast = false;
-    int mSingleConvert = 0;
-    std::vector<Tensor::InsideDescribe::Region> mCacheRegions;
+    OpCommonUtils::TensorConvertParameter mSingleConvert;
+    std::vector<std::shared_ptr<Tensor::InsideDescribe::Region>> mCacheRegions;
     int32_t mZeroPoint = 0;
+    bool mHasReduce = false;
+    bool mUseThreads = false;
 };
 }
 #endif

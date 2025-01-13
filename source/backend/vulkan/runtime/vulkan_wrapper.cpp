@@ -21,7 +21,7 @@ int InitVulkan(void) {
 #include <string>
 #include <vector>
 #include <mutex>
-#ifdef WIN32
+#ifdef _WIN32
 #include <windows.h>
 #include <libloaderapi.h>
 #define MNN_DLSYM(lib, func_name) GetProcAddress(reinterpret_cast<HMODULE>(lib), func_name)
@@ -29,19 +29,20 @@ int InitVulkan(void) {
 #include <dlfcn.h>
 #define MNN_DLSYM(lib, func_name) dlsym(lib, func_name)
 #endif
-static const std::vector<std::string> gVulkan_library_paths = {
-#ifdef WIN32
+
+int InitVulkanOnce(void) {
+    const std::vector<std::string> gVulkan_library_paths = {
+#ifdef _WIN32
     "vulkan-1.dll",
 #endif
     "libvulkan.so",
 #if defined(__APPLE__) || defined(__MACOSX)
     "/usr/local/lib/libvulkan.dylib",// For mac install vk driver
 #endif
-};
-int InitVulkanOnce(void) {
+    };
     void* libvulkan = nullptr;
     for (const auto& s : gVulkan_library_paths) {
-#ifdef WIN32
+#ifdef _WIN32
         libvulkan = LoadLibrary(s.c_str());
 #else
         libvulkan = dlopen(s.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -51,7 +52,12 @@ int InitVulkanOnce(void) {
         }
     }
     if (nullptr == libvulkan) {
+#ifdef _WIN32
         MNN_ERROR("Load vulkan library error\n");
+#else
+        auto message = dlerror();
+        MNN_ERROR("Load vulkan library error: %s\n", message);
+#endif
         return 0;
     }
     // Vulkan supported, set function addresses

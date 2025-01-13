@@ -13,8 +13,7 @@
 namespace MNN {
 namespace OpenCL {
 
-TrainableParamExecution::TrainableParamExecution(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) : CommonExecution(backend), mOp(op), mInitialized(false) {
-    mOp = op;
+TrainableParamExecution::TrainableParamExecution(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) : CommonExecution(backend, op), mInitialized(false) {
 }
 
 TrainableParamExecution::~TrainableParamExecution() {
@@ -65,7 +64,7 @@ ErrorCode TrainableParamExecution::onResize(const std::vector<Tensor *> &inputs,
     return NO_ERROR;
 }
 
-OpenCLCreatorRegister<TypedCreator<TrainableParamExecution>> __TrainParam_op(OpType_TrainableParam, IMAGE);
-
+using TrainableParamCreator = TypedCreator<TrainableParamExecution>;
+REGISTER_OPENCL_OP_CREATOR(TrainableParamCreator, OpType_TrainableParam, IMAGE);
 }
 }

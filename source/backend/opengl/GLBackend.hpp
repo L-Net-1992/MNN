@@ -35,7 +35,7 @@ public:
      @brief create backend
      @return created backend
      */
-    virtual Backend* onCreate(const BackendConfig* config) const override;
+    virtual Backend* onCreate(const BackendConfig* config, Backend* origin) const override;
 
     /**
      @brief clear unuseful resource
@@ -98,6 +98,8 @@ public:
     virtual void onExecuteBegin() const override;
 
     virtual void onExecuteEnd() const override;
+
+    virtual ErrorCode onResizeEnd() override { return NO_ERROR; }
 
     /// get execution
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,

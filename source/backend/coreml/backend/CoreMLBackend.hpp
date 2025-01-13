@@ -12,12 +12,14 @@
 #include <stdio.h>
 #include <map>
 #include <memory>
+#include <MNN/ErrorCode.hpp>
 #include <core/Backend.hpp>
 #include <core/Execution.hpp>
 #include <core/TensorUtils.hpp>
 #include "MNN_generated.h"
 #include "Model.pb-c.h"
 #include "CoreMLExecutorWrapper.h"
+#include "core/BufferAllocator.hpp"
 
 namespace MNN {
     class CoreMLRuntime : public Runtime {
@@ -25,7 +27,7 @@ namespace MNN {
         CoreMLRuntime(const Backend::Info& info);
         virtual ~CoreMLRuntime();
         virtual CompilerType onGetCompilerType() const override;
-        virtual Backend* onCreate(const BackendConfig* conf) const override;
+        virtual Backend* onCreate(const BackendConfig* conf, Backend* origin) const override;
         virtual void onGabageCollect(int level) override;
         virtual std::pair<const void*, size_t> onGetCache() override {
             return std::make_pair(mCacheBuffer, mCacheSize);
@@ -48,6 +50,8 @@ namespace MNN {
         virtual ~CoreMLBackend();
 
         virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const MNN::Op* op) override;
+        virtual void* onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* srcTensor) override;
+        virtual bool onUnmapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* dstTensor, void* mapPtr) override;
 
         virtual void onExecuteBegin() const override;
         virtual void onExecuteEnd() const override;
@@ -57,7 +61,7 @@ namespace MNN {
         virtual void onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const override;
 
         virtual void onResizeBegin() override;
-        virtual void onResizeEnd() override;
+        virtual ErrorCode onResizeEnd() override;
 
     public:
         // TODO: using memory pool instead static factory
@@ -95,7 +99,7 @@ namespace MNN {
         }
         std::string getTensorName(const Tensor* t);
         void addLayer(CoreML__Specification__NeuralNetworkLayer* layer);
-        void buildModel();
+        ErrorCode buildModel();
         void invokeModel() const;
         void setIO(CoreML__Specification__FeatureDescription** describe, const Tensor* t);
         void setLayerName(CoreML__Specification__NeuralNetworkLayer* layer, std::string&& name);
@@ -103,6 +107,7 @@ namespace MNN {
         void setLayerOutputs(CoreML__Specification__NeuralNetworkLayer* layer, std::vector<std::string>&& outputs);
         void copyName(char** ptr, std::string&& name);
         int getInOutTensorInfo(std::string modelName);
+        int getBytes(const halide_type_t& type);
 
         class Creator {
         public:
@@ -116,12 +121,12 @@ namespace MNN {
         std::vector<CoreML__Specification__NeuralNetworkLayer*> mCoreMLLayerPtrs;
 
         std::map<const Tensor*, int> mTensorIdxMap, mInputIdxMap, mOutputIdxMap;
-        std::vector<const Tensor*> mInputTensors;
         std::vector<std::string> mModelName;
         std::vector<std::unique_ptr<float>> mInputData, mOutputData;
         const CoreMLRuntime* mNPURuntime;
         BackendConfig::PrecisionMode mPrecision;
         std::unique_ptr<CoreMLExecutorWrapper> mCoreMLExecutor;
+        SingleBufferWithAllocator mInputBuffer;
     };
 
     template <class T>

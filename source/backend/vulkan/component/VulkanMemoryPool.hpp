@@ -48,8 +48,8 @@ public:
     virtual ~VulkanMemoryPool();
 
     // VulkanMemory* , offset
-    std::pair<void*, int> allocMemory(const VkMemoryRequirements& requirements, VkFlags extraMask, bool separate = false);
-    void returnMemory(std::pair<void*, int> memory);
+    MemChunk allocMemory(const VkMemoryRequirements& requirements, VkFlags extraMask, bool separate = false);
+    void returnMemory(MemChunk memory);
 
     // Free Unuseful Memory
     void clear();
@@ -68,9 +68,6 @@ public:
     VkBuffer allocBuffer(size_t size, VkBufferUsageFlags flags, VkSharingMode shared);
     void returnBuffer(VkBuffer buffer, size_t size, VkBufferUsageFlags flags, VkSharingMode shared);
 
-    // For image fast alloc
-    VkImage allocImage(const std::tuple<VkImageType, uint32_t, uint32_t, uint32_t, VkFormat>& info);
-    void returnImage(VkImage dst, std::tuple<VkImageType, uint32_t, uint32_t, uint32_t, VkFormat>&& info);
 private:
     // MemoryTypeIndex, Size, Memory
     std::vector<std::shared_ptr<BufferAllocator>> mAllocators;

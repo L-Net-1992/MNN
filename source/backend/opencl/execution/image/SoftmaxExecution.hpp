@@ -9,28 +9,23 @@
 #ifndef SoftmaxExecution_hpp
 #define SoftmaxExecution_hpp
 
-#include <vector>
-#include "core/Execution.hpp"
-#include "backend/opencl/core/OpenCLBackend.hpp"
+#include "CommonExecution.hpp"
 
 namespace MNN {
 namespace OpenCL {
 
-class SoftmaxExecution : public Execution {
+class SoftmaxExecution : public CommonExecution {
 public:
-    SoftmaxExecution(const std::vector<Tensor *> &inputs, int axis, Backend *backend);
+    SoftmaxExecution(const std::vector<Tensor *> &inputs, int axis, const MNN::Op *op, Backend *backend);
 
     virtual ~SoftmaxExecution() = default;
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual ErrorCode onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
-    bool buildSoftmaxKernel();
+    bool buildSoftmaxKernel(int localSize);
 private:
-    cl::Kernel mKernel;
+    int getLocalSize(int size, int maxGroupSize);
     uint32_t mMaxWorkGroupSize;
     OpenCLBackend *mOpenCLBackend;
-    std::vector<uint32_t> mGlobalWorkSize{1, 1, 1};
-    std::vector<uint32_t> mLocalWorkSize{1, 1, 1, 1};
     int mAxis;
 };
 } // namespace OpenCL

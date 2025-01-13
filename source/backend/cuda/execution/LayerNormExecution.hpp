@@ -10,7 +10,7 @@
 #define LayerNormExecution_hpp
 
 #include "core/Execution.hpp"
-
+#include "MNNCUDAFunction.cuh"
 #include <vector>
 #include "backend/cuda/core/CUDABackend.hpp"
 
@@ -30,11 +30,13 @@ private:
     void *mDeviceGamma = nullptr;
     void *mDeviceBeta = nullptr;
 
-    std::vector<int> mAxises;
+    int mAxises = 0;
     int mInside = 1;
     int mOutside = 1;
 
     float mEps = 0.001;
+    int mGroup = 1;
+    bool RMSNorm = false;
 
     std::unique_ptr<Tensor> mGammaTensor;
     std::unique_ptr<Tensor> mBetaTensor;

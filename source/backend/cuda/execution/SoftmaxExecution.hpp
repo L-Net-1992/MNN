@@ -11,7 +11,10 @@
 
 #include <vector>
 #include "ReductionTemplate.cuh"
+#include "MNNCUDAFunction.cuh"
 #include "backend/cuda/core/CUDABackend.hpp"
+#include <float.h>
+
 namespace MNN {
 namespace CUDA {
 
@@ -28,7 +31,7 @@ private:
     Tensor mStorage;
     bool mNeedUnpackC4;
     ReduceParam mCpuParam;
-    std::pair<void*, int> mParam;
+    MemChunk mParam;
 };
 
 } // namespace CUDA

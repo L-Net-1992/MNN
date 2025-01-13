@@ -15,7 +15,7 @@
 #include <fstream>
 #include <sstream>
 #include "MNN_generated.h"
-#include "cpp/IDSTEncoder.hpp"
+#include "core/IDSTEncoder.hpp"
 
 using namespace MNN;
 
@@ -133,7 +133,7 @@ void ConvertOp(std::unique_ptr<OpT>& op, int opIndex, NetT* net, SubGraphProtoT*
                         weightFloat.emplace_back(weight[i] * weightScale[i / ks]);
                     }
 
-                    conv2D->quanParameter = IDSTEncoder::encode(weightFloat, weightScale, ks, kn, false, weight.data(), aMin);
+                    conv2D->quanParameter = IDSTEncoder::encode(weightFloat.data(), weightScale, ks, kn, false, weight.data(), aMin);
                     conv2D->quanParameter->scaleIn = scaleIn;
                     conv2D->quanParameter->scaleOut = scaleOut;
                     conv2D->symmetricQuan->weight.clear();
@@ -175,7 +175,7 @@ void convert(std::string modelFile) {
     outputOs << input.rdbuf();
     netT = MNN::UnPackNet(outputOs.str().c_str());
     auto net = netT.get();
-    
+
     std::vector<int> netNeedEraseIndices;
     for (int i = 0; i < net->oplists.size(); i++) {
         auto& op = net->oplists[i];

@@ -9,6 +9,7 @@
 #ifndef MNN_TRTBackend_H
 #define MNN_TRTBackend_H
 
+#include <MNN/ErrorCode.hpp>
 #include <core/Backend.hpp>
 #include <core/Execution.hpp>
 
@@ -33,7 +34,7 @@ public:
     TRTRuntime(const Backend::Info& info);
     virtual ~TRTRuntime();
 
-    virtual Backend* onCreate(const BackendConfig* config) const override;
+    virtual Backend* onCreate(const BackendConfig* config, Backend* origin) const override;
     virtual void onGabageCollect(int level) override;
     // If buffer is not nullptr, try copy cache, else delete cache
     virtual bool onSetCache(const void* buffer, size_t size) override {
@@ -88,7 +89,7 @@ public:
     virtual void onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const override;
 
     virtual void onResizeBegin() override;
-    virtual void onResizeEnd() override;
+    virtual ErrorCode onResizeEnd() override;
 
     class Creator {
     public:

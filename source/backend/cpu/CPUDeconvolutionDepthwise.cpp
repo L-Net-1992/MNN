@@ -16,7 +16,7 @@
 
 namespace MNN {
 CPUDeconvolutionDepthwise::CPUDeconvolutionDepthwise(const Tensor* input, const Op* convOp, Backend* b)
-    : MNN::CPUDeconvolutionCommon(input, convOp, b) {
+    : MNN::CPUDeconvolutionCommon(input, convOp, b, false) {
     auto conv               = convOp->main_as_Convolution2D();
     auto layer              = convOp->main_as_Convolution2D()->common();
     int kw                  = layer->kernelX();
@@ -27,7 +27,7 @@ CPUDeconvolutionDepthwise::CPUDeconvolutionDepthwise(const Tensor* input, const 
     const float* tempWeight = nullptr;
     int tempWeightSize   = 0;
     std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon;
-    ConvolutionCommon::getConvParameters(&quanCommon, conv, &tempWeight, &tempWeightSize);
+    ConvolutionCommon::getConvParameters(&quanCommon, b, convOp, &tempWeight, &tempWeightSize);
 
     // Reorder weight from whc -> pwhc4
     int kernelSize = depthQuad * core->pack * kw * kh;

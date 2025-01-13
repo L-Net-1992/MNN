@@ -10,6 +10,7 @@
 #include "MNN_generated.h"
 #include "MergeHelpers.hpp"
 #include "cli.hpp"
+#include "commonKit.hpp"
 #include "MNN_compression.pb.h"
 #include <fstream>
 
@@ -37,9 +38,15 @@ auto getConv1dPostCase = [](EXPRP expr) {
     std::string compressFileName = gConverterConfig->compressionParamsFile;
     Compression::Pipeline proto;
     if (compressFileName != "") {
-        std::fstream input(compressFileName.c_str(), std::ios::in | std::ios::binary);
-        if (!proto.ParseFromIstream(&input)) {
-            MNN_ERROR("Failed to parse compression pipeline proto.\n");
+        std::string jsonSuffix = "json";
+        std::string suffix = compressFileName.substr(compressFileName.find_last_of('.') + 1);
+        if (suffix.compare(jsonSuffix) != 0) {
+            std::fstream input(compressFileName.c_str(), std::ios::in | std::ios::binary);
+            if (!proto.ParseFromIstream(&input)) {
+                MNN_ERROR("Failed to parse compression pipeline proto.\n");
+            }
+        } else {
+            CommonKit::json2protobuf(compressFileName.c_str(), nullptr, &proto);
         }
     }
 
@@ -217,7 +224,9 @@ static auto gRegister = []() {
             newBiasAddExpr->setName(expr->name());
             auto newBiasAddVar = Variable::create(newBiasAddExpr, 0);
             newBiasAddVar->setName(expr->outputName(0));
-            auto newSqueezeExpr = Expr::create(squeezeExpr->extra(), {newBiasAddVar});
+            auto squeezeExprInputs = squeezeExpr->inputs();
+            squeezeExprInputs[0] = newBiasAddVar;
+            auto newSqueezeExpr = Expr::create(squeezeExpr->extra(), std::move(squeezeExprInputs));
             newSqueezeExpr->setName(squeezeExpr->name());
             auto newSqueezeVar = Variable::create(newSqueezeExpr, 0);
             newSqueezeVar->setName(squeezeExpr->outputName(0));
@@ -245,7 +254,9 @@ static auto gRegister = []() {
             newReluExpr->setName(expr->name());
             auto newReluVar = Variable::create(newReluExpr, 0);
             newReluVar->setName(expr->outputName(0));
-            auto newSqueezeExpr = Expr::create(squeezeExpr->extra(), {newReluVar});
+            auto squeezeExprInputs = squeezeExpr->inputs();
+            squeezeExprInputs[0] = newReluVar;
+            auto newSqueezeExpr = Expr::create(squeezeExpr->extra(), std::move(squeezeExprInputs));
             newSqueezeExpr->setName(squeezeExpr->name());
             auto newSqueezeVar = Variable::create(newSqueezeExpr, 0);
             newSqueezeVar->setName(squeezeExpr->outputName(0));

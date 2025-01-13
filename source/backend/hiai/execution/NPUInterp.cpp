@@ -23,9 +23,12 @@ ErrorCode NPUInterp::onResize(const std::vector<Tensor *> &inputs, const std::ve
     auto xOp = mNpuBackend->getInputOps(mOp);
     auto resizeType = param->resizeType();
     MNN_ASSERT(resizeType <= 3);
-
+    if (resizeType > 3) {
+        MNN_ERROR("npu Interp not support type: %d", resizeType);
+        return NOT_SUPPORT;
+    }
     vector<int32_t> hw = {outputs[0]->height(),outputs[0]->width()};
-    mConstShape = ge::op::Const(opName + "_w_const");
+    mConstShape = hiai::op::Const(opName + "_w_const");
     {
         ge::TensorDesc fdesc(ge::Shape({2}), ge::FORMAT_NCHW, ge::DT_INT32); 
         ge::TensorPtr filter = std::make_shared<ge::Tensor>();
@@ -34,19 +37,19 @@ ErrorCode NPUInterp::onResize(const std::vector<Tensor *> &inputs, const std::ve
         mConstShape.set_attr_value(filter);
     }
 
-    if(resizeType == 1) {
+    if (resizeType == 1) {
         shared_ptr<hiai::op::ResizeNearestNeighbor> interp(new hiai::op::ResizeNearestNeighbor(opName));
         (*interp).set_input_x(*xOp)
                  .set_input_size(mConstShape)
                  .set_attr_align_corners(param->alignCorners());
         mNpuBackend->setOutputOps(mOp, {interp}, outputs);
-    } else if(resizeType == 2) {
+    } else if (resizeType == 2) {
         shared_ptr<hiai::op::ResizeBilinear> interp(new hiai::op::ResizeBilinear(opName));
         (*interp).set_input_x(*xOp)
                  .set_input_size(mConstShape)
                  .set_attr_align_corners(param->alignCorners());
         mNpuBackend->setOutputOps(mOp, {interp}, outputs);
-    } else if(resizeType == 3) {
+    } else if (resizeType == 3) {
         shared_ptr<hiai::op::ResizeBilinear> interp(new hiai::op::ResizeBilinear(opName));
         (*interp).set_input_x(*xOp)
                  .set_input_size(mConstShape)

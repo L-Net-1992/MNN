@@ -1,7 +1,5 @@
 IF(MNN_BUILD_CONVERTER)
   SET( CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../../)
-  option(TF_CONVERT_ORIGIN "Fall Back to Origin Model Converter" OFF)
-  option(TFMODEL_OPTIMIZE "Enable tensorflow model optimizer" OFF)
   option(MNN_BUILD_TORCH "Build Converter support TorchScript." OFF)
   IF(MNN_BUILD_PROTOBUFFER)
       SET(Protobuf_LIBRARIES libprotobuf)
@@ -35,7 +33,7 @@ IF(MNN_BUILD_CONVERTER)
     include(${CMAKE_CURRENT_LIST_DIR}/source/torch/CMakeLists.txt)
   endif()
 
-  file(GLOB COMMON_SRC ${CMAKE_CURRENT_LIST_DIR}/source/common/*.cpp)
+  file(GLOB COMMON_SRC ${CMAKE_CURRENT_LIST_DIR}/source/common/*.cpp ${CMAKE_CURRENT_LIST_DIR}/source/common/*.h ${CMAKE_CURRENT_LIST_DIR}/source/common/*.hpp)
   add_executable(MNNConvert
     ${CMAKE_CURRENT_LIST_DIR}/source/MNNConverter.cpp
   )
@@ -53,7 +51,7 @@ IF(MNN_BUILD_CONVERTER)
         target_link_libraries(MNNConvertDeps PUBLIC ${TORCH_LIBRARIES})
     endif()
     if(APPLE)
-        target_link_libraries(MNNConvert -Wl,-all_load MNNConvertDeps ${MNN_DEPS} -Wl,-noall_load)
+        target_link_libraries(MNNConvert -Wl,-all_load MNNConvertDeps ${MNN_DEPS})
     elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         # See also /path/to/MNN/CMakeLists.txt:481 when you are confused with -lpthread here.
         target_link_libraries(MNNConvert -Wl,--whole-archive MNNConvertDeps ${MNN_DEPS} -lpthread -Wl,--no-whole-archive)

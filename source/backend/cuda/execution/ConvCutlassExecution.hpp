@@ -11,16 +11,14 @@
 #include "backend/cuda/core/CUDABackend.hpp"
 #include "core/Execution.hpp"
 #include "CutlassGemmParam.hpp"
+#include "MNNCUDADefine.hpp"
+#include "MNNCUDAFunction.cuh"
+#include "cutlass_common/CutlassConvCommonExecution.hpp"
 
 namespace MNN {
 namespace CUDA {
 
-struct CutlassGemmInfo{
-    int elh[3];
-    int elhPad[3];
-};
-
-class ConvCutlassExecution : public Execution {
+class ConvCutlassExecution : public CutlassConvCommonExecution {
 public:
     struct Resource {
         Resource(Backend* bn, const MNN::Op* op);
@@ -39,43 +37,6 @@ public:
 
 private:
     std::shared_ptr<Resource> mResource;
-
-    const Op* mOp = nullptr;
-    CutlassGemmInfo mGemmInfo;
-
-    ConvolutionCommon::Im2ColParameter mIm2ColParamter;
-    std::pair<void*, int> mGpuIm2ColParam;
-
-    __half* mIm2ColBuffer;
-
-    bool mIsConv1x1S1D1P0 = false;
-    bool mNeedIm2Col = true;
-    std::pair<void*, int> mGpuKernelParam;
-    bool mIsBlock = false;
-    int mBlockNum = 1;
-
-    Gemm_F16_Linear_Sm70 mGemmF16LnSm70;
-    Gemm_F32_Linear_Sm70 mGemmF32LnSm70;
-
-    Gemm_F16_Relu_Sm70 mGemmF16ReluSm70;
-    Gemm_F32_Relu_Sm70 mGemmF32ReluSm70;
-
-    Gemm_F16_Relu6_Sm70 mGemmF16Relu6Sm70;
-    Gemm_F32_Relu6_Sm70 mGemmF32Relu6Sm70;
-
-    Gemm_F16_Linear_Sm75 mGemmF16LnSm75;
-    Gemm_F32_Linear_Sm75 mGemmF32LnSm75;
-
-    Gemm_F16_Relu_Sm75 mGemmF16ReluSm75;
-    Gemm_F32_Relu_Sm75 mGemmF32ReluSm75;
-
-    Gemm_F16_Relu6_Sm75 mGemmF16Relu6Sm75;
-    Gemm_F32_Relu6_Sm75 mGemmF32Relu6Sm75;
-
-    int mGpuComputeCap = 75;
-    int mActivationType = 0;
-    std::shared_ptr<Tensor> workspaceTensor;
-    uint8_t* mWorkspace;
 };
 
 } // namespace CUDA

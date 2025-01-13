@@ -43,7 +43,7 @@ public:
         /** string handle type */
         HANDLE_STRING = 1
     };
-    
+
     /** Tensor map type : Read or Write*/
     enum MapType {
         /** map Tensor for writing data*/
@@ -131,7 +131,7 @@ public:
      * @param deepCopy whether create new content and copy, currently only support deepCopy = false
      */
     static Tensor* clone(const Tensor* src, bool deepCopy = false);
-    
+
     /**
      * @brief delete tensor.
      * @param src     tensor
@@ -227,6 +227,7 @@ public:
      * @return bytes needed to store data
      */
     int size() const;
+    size_t usize() const;
 
     /**
      * @brief calculate number of elements needed to store data taking reordering flag into account.
@@ -274,12 +275,18 @@ public:
         mBuffer.dim[index].extent = length;
     }
 
+    /**
+     * @brief For GPU and Other Device, get memory directly, see MNNSharedContext for detail
+     * @return Success or not. If type != tensor's backend's type or type is cpu , return false
+     */
+    bool getDeviceInfo(void* dst, int forwardType) const;
+
 public:
     /**
      * @brief print tensor data. for DEBUG use only.
      */
     void print() const;
-    
+
     /**
      *@brief print tensor shape
      */
@@ -297,6 +304,10 @@ public:
      * @param finish wait for command flush or finish
      */
     int wait(MapType mtype, bool finish);
+    /**
+     * @brief set GPU tensor device ptr, and inform memory type
+     */
+    bool setDevicePtr(const void* devicePtr, int memoryType);
 private:
     halide_buffer_t mBuffer;
     struct InsideDescribe* mDescribe;

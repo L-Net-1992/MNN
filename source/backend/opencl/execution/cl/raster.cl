@@ -22,14 +22,14 @@ __constant sampler_t SAMPLER = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP |
 
 __kernel void buffer_set_zero(
                     GLOBAL_SIZE_2_DIMS
-                    __global FLOAT *output
+                    __global OUTPUT_TYPE *output
                     ) {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
     
     DEAL_NON_UNIFORM_DIM2(x, y);
     
-    output[y*global_size_dim0 + x] = (FLOAT)(0.0f);
+    output[y*global_size_dim0 + x] = (OUTPUT_TYPE)(0);
 }
 
 __kernel void image_set_zero(
@@ -41,17 +41,17 @@ __kernel void image_set_zero(
     
     DEAL_NON_UNIFORM_DIM2(x, y);
 
-    WI_F(output, (int2)(x, y), (FLOAT4)(0.0f));
+    WI_DATA(output, (int2)(x, y), (OUTPUT_TYPE_I4)(0));
 }
 
 __kernel void raster_buffer(
                     GLOBAL_SIZE_3_DIMS
-                    __global FLOAT *input,
+                    __global INPUT_TYPE *input,
                     __private const int inputOffset,
                     __private const int inputStride0,
                     __private const int inputStride1,
                     __private const int inputStride2,
-                    __global FLOAT *output,
+                    __global OUTPUT_TYPE *output,
                     __private const int outputOffset,
                     __private const int outputStride0,
                     __private const int outputStride1,
@@ -65,7 +65,36 @@ __kernel void raster_buffer(
     
     int inputIndex = inputOffset + z * inputStride0 + y * inputStride1 + x * inputStride2;
     int outputIndex = outputOffset + z * outputStride0 + y * outputStride1 + x * outputStride2;
-    output[outputIndex] = input[inputIndex];
+    output[outputIndex] = (OUTPUT_TYPE)input[inputIndex];
+}
+
+__kernel void raster_buffer_combine(
+                    GLOBAL_SIZE_3_DIMS
+                    __global INPUT_TYPE *input,
+                    __private const int inputOffset,
+                    __private const int combineSrcOffset,
+                    __private const int inputStride0,
+                    __private const int inputStride1,
+                    __private const int inputStride2,
+                    __global OUTPUT_TYPE *output,
+                    __private const int outputOffset,
+                    __private const int combineDstOffset,
+                    __private const int outputStride0,
+                    __private const int outputStride1,
+                    __private const int outputStride2,
+                    __private const int global_size0
+                    ) {
+    const int idx = get_global_id(0);
+    const int y = get_global_id(1);
+    const int z = get_global_id(2);
+    
+    DEAL_NON_UNIFORM_DIM3(idx, y, z);
+    const int x = idx % global_size0;
+    const int id = idx / global_size0;
+    
+    int inputIndex = inputOffset + id * combineSrcOffset + z * inputStride0 + y * inputStride1 + x * inputStride2;
+    int outputIndex = outputOffset + id * combineDstOffset + z * outputStride0 + y * outputStride1 + x * outputStride2;
+    output[outputIndex] = (OUTPUT_TYPE)input[inputIndex];
 }
 
 
@@ -117,6 +146,6 @@ __kernel void raster_image(
     int out_idx0 = out_idx_c4*outputWidth + out_idx_w;
     int out_idx1 = out_idx_n*outputHeight + out_idx_h;
 
-    FLOAT4 out = RI_F(input, SAMPLER, (int2)(inp_idx0, inp_idx1));
-    WI_F(output, (int2)(out_idx0, out_idx1), out);
+    INPUT_TYPE_I4 out = RI_DATA(input, SAMPLER, (int2)(inp_idx0, inp_idx1));
+    WI_DATA(output, (int2)(out_idx0, out_idx1), CONVERT_OUTPUT_I4(out));
 }
