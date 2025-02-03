@@ -33,8 +33,10 @@ public:
         enum BarrierType {
             READ_WRITE = 0,
             WRITE_WRITE,
+            WRITE_READ,
         };
         void barrierSource(VkBuffer source, size_t start, size_t end, BarrierType type = READ_WRITE) const;
+        void barrierSource(std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize>, BarrierType type = READ_WRITE) const;
     private:
         VkCommandBuffer mBuffer;
         const VulkanCommandPool* mPool;

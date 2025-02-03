@@ -18,12 +18,16 @@
 #include "math/Vec.hpp"
 #include <vector>
 #include "../CPURuntime.hpp"
-#include "common/MemoryFormater.h"
-#include "common/CommonCompute.hpp"
+#include "core/MemoryFormater.h"
 // TODO: Find better way to optimize it
 #include "../CPUBinary.hpp"
 #include "../CPUUnary.hpp"
 #include "../CPUPool.hpp"
+#define PACK 4
+#define FLOAT float
+using Vec = MNN::Math::Vec<float, 4>;
+#include "../GridSampler.hpp"
+
 #ifndef MNN_USE_SSE
 void MNNInt8ToInt16(int16_t* dest, const int8_t* source, size_t count) {
     // Should not be called
@@ -31,6 +35,311 @@ void MNNInt8ToInt16(int16_t* dest, const int8_t* source, size_t count) {
 }
 #endif
 
+#ifndef __aarch64__
+#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
+static void _MNNPackedMatMulRemain_int4(float* C, const float* A, const float* fB, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, int aStride, const float* k, const float* b) {
+    auto B = reinterpret_cast<const uint8_t*>(fB);
+    auto h = parameter[2];
+    auto l = parameter[1];
+    auto cStride = parameter[3] / sizeof(float);
+    auto hRemain = parameter[4];
+    float weightBytes = 0.5; // sizeof(int4_t)
+    auto bExtraStride = static_cast<int32_t>(parameter[5] / weightBytes);
+    auto bStride = bExtraStride + 4 * l;
+    auto hC4 = UP_DIV(h, 4);
+    float minValue = -std::numeric_limits<float>().max();
+    float maxValue = std::numeric_limits<float>().max();
+    if (nullptr != postParameters) {
+        minValue = postParameters[2];
+        maxValue = postParameters[3];
+    }
+    int blockId = parameter[6];
+
+    for (int x=0; x<eSize; ++x) {
+        auto dst = C + 4 * x;
+        auto src = A + x;
+        for (int y=0; y<hC4; ++y) {
+            auto dstY = dst + y * cStride;
+            auto weight = B + y * bStride / 2;
+            auto alpha = k + y * 4;
+            auto qbias  = b + y * 4;
+            float summer[4] = {
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+            };
+            if (blockId > 0) {
+                summer[0] = dstY[0];
+                summer[1] = dstY[1];
+                summer[2] = dstY[2];
+                summer[3] = dstY[3];
+            }
+            if (nullptr != bias && nullptr != postParameters) {
+                for (int v=0; v<4; ++v) {
+                    summer[v] += bias[4 * y + v];
+                }
+            }
+            for (int z=0; z<l; ++z) {
+                auto aZ = src + z * aStride;
+                auto i4wZ = weight + z * 2;
+                float wZ[4];
+                {
+                    auto w01    = i4wZ[0];
+                    auto w23    = i4wZ[1];
+                    int iw01    = w01;
+                    int iw23    = w23;
+                    int iw0     = iw01 / 16;
+                    int iw1     = iw01 % 16;
+                    int iw2     = iw23 / 16;
+                    int iw3     = iw23 % 16;
+                    wZ[0]       = iw0 * alpha[0] + qbias[0];
+                    wZ[1]       = iw1 * alpha[1] + qbias[1];
+                    wZ[2]       = iw2 * alpha[2] + qbias[2];
+                    wZ[3]       = iw3 * alpha[3] + qbias[3];
+                }
+                summer[0] += wZ[0] * aZ[0];
+                summer[1] += wZ[1] * aZ[0];
+                summer[2] += wZ[2] * aZ[0];
+                summer[3] += wZ[3] * aZ[0];
+            }
+            for (int v=0; v<4; ++v) {
+                auto dstValue = std::min(summer[v], maxValue);
+                dstValue = std::max(dstValue, minValue);
+                dstY[v] = dstValue;
+            }
+        }
+    }
+}
+static void _MNNPackedMatMulRemain_int8(float* C, const float* A, const float* fB, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, int aStride, const float* k, const float* b) {
+    auto B = reinterpret_cast<const int8_t*>(fB);
+    auto h = parameter[2];
+    auto l = parameter[1];
+    auto cStride = parameter[3] / sizeof(float);
+    auto hRemain = parameter[4];
+    float weightBytes = 1; // sizeof(int8_t)
+    auto bExtraStride = static_cast<int32_t>(parameter[5] / weightBytes);
+    auto bStride = bExtraStride + 4 * l;
+    auto hC4 = UP_DIV(h, 4);
+    float minValue = -std::numeric_limits<float>().max();
+    float maxValue = std::numeric_limits<float>().max();
+    if (nullptr != postParameters) {
+        minValue = postParameters[2];
+        maxValue = postParameters[3];
+    }
+    int blockId = parameter[6];
+
+    for (int x=0; x<eSize; ++x) {
+        auto dst = C + 4 * x;
+        auto src = A + x;
+        for (int y=0; y<hC4; ++y) {
+            auto dstY = dst + y * cStride;
+            auto weight = B + y * bStride;
+            auto alpha = k + y * 4;
+            auto qbias  = b + y * 4;
+            float summer[4] = {
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+            };
+            if (blockId > 0) {
+                summer[0] = dstY[0];
+                summer[1] = dstY[1];
+                summer[2] = dstY[2];
+                summer[3] = dstY[3];
+            }
+            if (nullptr != bias && nullptr != postParameters) {
+                for (int v=0; v<4; ++v) {
+                    summer[v] += bias[4 * y + v];
+                }
+            }
+            for (int z=0; z<l; ++z) {
+                auto aZ = src + z * aStride;
+                auto i8wZ = weight + z * 4;
+                float wZ[4];
+                {
+                    wZ[0]       = i8wZ[0] * alpha[0] + qbias[0];
+                    wZ[1]       = i8wZ[1] * alpha[1] + qbias[1];
+                    wZ[2]       = i8wZ[2] * alpha[2] + qbias[2];
+                    wZ[3]       = i8wZ[3] * alpha[3] + qbias[3];
+                }
+                summer[0] += wZ[0] * aZ[0];
+                summer[1] += wZ[1] * aZ[0];
+                summer[2] += wZ[2] * aZ[0];
+                summer[3] += wZ[3] * aZ[0];
+            }
+            for (int v=0; v<4; ++v) {
+                auto dstValue = std::min(summer[v], maxValue);
+                dstValue = std::max(dstValue, minValue);
+                dstY[v] = dstValue;
+            }
+        }
+    }
+}
+void MNNPackedMatMul_int4(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
+    _MNNPackedMatMulRemain_int4(C, A, B, 16, parameter, postParameters, bias, 16, k, b);
+}
+void MNNPackedMatMulRemain_int4(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
+    auto aStride = parameter[0] / sizeof(float);
+    _MNNPackedMatMulRemain_int4(C, A, B, eSize, parameter, postParameters, bias, aStride, k, b);
+}
+void MNNPackedMatMul_int8(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
+    _MNNPackedMatMulRemain_int8(C, A, B, 16, parameter, postParameters, bias, 16, k, b);
+}
+void MNNPackedMatMulRemain_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
+    auto aStride = parameter[0] / sizeof(float);
+    _MNNPackedMatMulRemain_int8(C, A, B, eSize, parameter, postParameters, bias, aStride, k, b);
+}
+#endif // MNN_CPU_WEIGHT_DEQUANT_GEMM
+
+#ifdef MNN_LOW_MEMORY
+void MNNQuantScaleFP32(float* absmax, float* quant_scale, float* dequant_scale, size_t thread, size_t batch) {
+    for (int i = 0; i < batch; ++i) {
+        auto absmaxPtr = absmax + i;
+        float absVal = 0.f;
+        for (int t = 0; t < thread; ++t) {
+            absVal = std::max(absVal, absmaxPtr[t * batch]);
+        }
+        if (absVal < 1e-7) {
+            quant_scale[i] = 1.f;
+            dequant_scale[i] = 1.f;
+        } else {
+            quant_scale[i] = 127.0f / absVal;
+            dequant_scale[i] = absVal / 127.0f;
+        }
+    }
+}
+void MNNQuantSumFP32(float* sum, const float* dequant_scale, size_t thread, size_t batch) {
+    for (int i = 0; i < batch; ++i) {
+        auto sumPtr = reinterpret_cast<int*>(sum) + i;
+        int sumVal = 0.f;
+        for (int t = 0; t < thread; ++t) {
+            sumVal += sumPtr[t * batch];
+        }
+        sum[i] = sumVal * dequant_scale[i];
+    }
+}
+
+void MNNDynamicUpdateConvBiasScale(float* newbias, float* newscale, float* oldbias, float* weightScale, float* inputScale, float* weightKernelSum, float* inputZero, size_t ocQuad, size_t scaleSize) {
+    int ocUp4 = 4 * ocQuad;
+    int pack = 4;
+    int blockNum = scaleSize / ocUp4;
+    for (int i = 0; i < ocUp4; ++i) {
+        newbias[i] = oldbias[i] - weightKernelSum[i] * inputZero[0];
+    }
+    for (int k = 0; k < blockNum; ++k) {
+        for (int i = 0; i < ocUp4; ++i) {
+           newscale[i + k * ocUp4] = weightScale[i + k * ocUp4] * inputScale[0];
+        }
+    }
+}
+
+#endif // LOW_MEMORY
+#endif // not __aarch64__
+
+#ifdef MNN_LOW_MEMORY
+static void MNNAbsMaxFP32(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) {
+#ifdef __aarch64__
+    if (pack == 4) {
+        MNNAbsMaxFP32_Pack4(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+#endif
+    // source: (ic/4, N, 4)
+    auto srcStep = pack * realSize;
+    for (int i = 0; i < realSize; ++i) {
+        float absmaxVal = 0.f; // absmaxVal>=0
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto src = source + c * srcStep + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                absmaxVal = std::max(absmaxVal, std::abs(src[k]));
+            }
+        }
+        absmax[i] = absmaxVal;
+    }
+}
+
+void MNNDynamicQuantFP32(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack) {
+#ifdef __aarch64__
+    if (pack == 4) {
+        MNNDynamicQuantFP32_Pack4(src, dst, scale, src_depth_quad, realSize, pack);
+        return;
+    }
+#endif
+#ifdef MNN_USE_SSE
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dst);
+    int offset = 128;
+#else
+    int8_t* dstPtr = dst;
+    int offset = 0;
+#endif
+    for (int i = 0; i < realSize; ++i) {
+        auto scaleVal = scale[i];
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto srcZ = src + c * pack * realSize + i * pack;
+            auto dstZ = dstPtr + c * pack * realSize + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                int val = (int)roundf(srcZ[k] * scaleVal);
+                dstZ[k] = val + offset;
+            }
+        }
+    }
+}
+#endif
+
+static void MNNSumByAxisLForMatmul_A(float* dest, int8_t* source, const float* scale, ssize_t realDstCount, SumByAxisParams sumParams) {
+#ifdef MNN_USE_SSE
+    uint8_t* srcInt8 = reinterpret_cast<uint8_t*>(source);
+#else
+    int8_t* srcInt8 = source;
+#endif
+    auto scalePtr = scale;
+    auto blockNum = sumParams.blockNum;
+    auto EP = sumParams.DST_XUNIT;
+    auto LP = sumParams.SRC_UNIT;
+    auto col_buffer_unit_size = sumParams.col_buffer_unit_size;
+    auto oneScale = sumParams.oneScale;
+    auto LU = sumParams.LU;
+    auto valid = sumParams.valid;
+    auto kernelxy = sumParams.kernelxy;
+    auto blockSizeQuad = LU / blockNum;
+    auto lastL = LP;
+    if (valid) {
+        lastL = valid;
+    }
+    float singlescale = scale[0];
+    do {
+        int step = ALIMIN(EP, realDstCount);
+
+        for (int k = 0; k < blockNum; ++k) {
+            const auto src_x = srcInt8 + k * (step * LP * blockSizeQuad);
+            for (int w = 0; w < step; ++w) {
+                float dequantScale = singlescale;
+                if (oneScale == 0) {
+                    dequantScale = scalePtr[w];
+                }
+                int sumint32 = 0;
+                const auto src_y = src_x + w * LP;
+                for (int j = 0; j < kernelxy; ++j) {
+                    for (int i = 0; i < blockSizeQuad; ++i) {
+                        auto sumsize = i == (blockSizeQuad - 1) ? lastL : LP;
+                        const auto src_z = src_y + j * (blockSizeQuad * step * LP) + i * step * LP;
+                        for (int x = 0; x < sumsize; ++x) {
+                            sumint32 += src_z[x];
+                        }
+                    }
+                }
+                dest[w + k * step] = dequantScale * static_cast<float>(sumint32);
+            }
+        }
+        scalePtr += step;
+
+        dest += (step * blockNum);
+        realDstCount -= step;
+        srcInt8 += col_buffer_unit_size;
+    } while(realDstCount > 0);
+}
 
 template<typename T>
 void MNNPackC4Common(T* dst, const T* src, size_t area, size_t depth, int* areaOffset) {
@@ -103,109 +412,351 @@ void MNNUnpackC4Common(T* dst, const T* src, size_t area, size_t depth, int* are
     }
 }
 
-/*
-    source: source matrix is h x l
-    transpose: if false, export compressed matrix as h x l, other export as l x h.
- */
-void MNNPackForSparseMatMul_B(float* dest, unsigned int* NNZMap, int* dataOffsetMap, int sparseBlockOC, const float* source, size_t h, size_t l, const int eP, bool transpose) {
-    // 1. in convolution, source B layout is OC x (KH * KW * IC),
-    //    the dest layout of weight is BCSC(block compressed sparse colum) format, which is OC(!=0) x (KH*KW*IC!=0), as a canceled result, just do BCSR, transpose should be false.
-    // 2. in ordinary sparse MatMul, transpose is corresponding to BCSR or BCSC
-
-    // BCSR
-    if (transpose) {
-        int rowOffset = 0;
-        for (int i = 0; i < l; i += 1) {
-            *NNZMap = 0;
-            for(int j = 0; j < h; j += sparseBlockOC) {
-                if(!MNN::CommonCompute::checkAllZeros(source + j * l + i, l, sparseBlockOC, 1)) {
-                    *dest = *(source + j * l + l);
-                    dest++;
-                    *NNZMap = *NNZMap + 1;
-                    *dataOffsetMap = rowOffset;
-                    dataOffsetMap++;
-                    rowOffset = 0;
-                }
-                rowOffset += eP;
-            }
-            NNZMap++;
-            rowOffset -= h * eP;
+template<typename T>
+void MNNPackC2Common(T* dst, const T* src, size_t area, size_t depth, int* areaOffset) {
+    int depthC2     = depth / 2;
+    int depthRemain = depthC2 * 2;
+    int remain      = depth - depthRemain;
+    int z, x, y;
+    const T* srcChannel[2];
+    const T* srcOffset = src;
+    for(z = 0; z < depthC2; ++z) {
+        auto dstZ = dst + z * areaOffset[1] * 2;
+        for(y = 0; y < 2; ++y) {
+            srcChannel[y] = srcOffset + areaOffset[0] * y;
         }
-    } else { // BCSC
-        int columOffset = 0;
-        int i = 0;
-        for (; i + sparseBlockOC <= h; i += sparseBlockOC) {
-            *NNZMap = 0;
-            for(int j = 0; j < l; j += 1) {
-                if (!MNN::CommonCompute::checkAllZeros(source, l, sparseBlockOC, 1)) {
-                    for (int ioc = 0; ioc < sparseBlockOC; ioc++) {
-                        *dest = *(source + ioc * l);
-                        dest++;
-                    }
-                    *NNZMap = *NNZMap + 1;
-                    *dataOffsetMap = columOffset;
-                    dataOffsetMap++;
-                    columOffset = 0;
-                }
-                columOffset += eP;
-                source++;
+        for(x = 0; x < area; ++x) {
+            for(y = 0; y < 2; ++y) {
+                dstZ[0] = srcChannel[y][x];
+                dstZ++;
             }
-            NNZMap++;
-            source += l * (sparseBlockOC - 1);
-            columOffset -= l * eP;
         }
-
-        for (; i < h; i++) {
-            *NNZMap = 0;
-            for(int j = 0; j < l; j++) {
-                if (*source != 0.0f) {
-                    *dest = *source;
-                    dest++;
-                    *NNZMap = *NNZMap + 1;
-                    *dataOffsetMap = columOffset;
-                    dataOffsetMap++;
-                    columOffset = 0;
-                }
-                columOffset += eP;
-                source++;
-            }
-            NNZMap++;
-            columOffset -= l * eP;
-        }
-
-        *dataOffsetMap = columOffset; //
+        srcOffset += areaOffset[0] * 2;
     }
-    return;
+    if(remain > 0){
+        auto dstZ = dst + depthC2 * areaOffset[1] * 2;
+        for(y = 0; y < remain; ++y) {
+            srcChannel[y] = srcOffset + areaOffset[0] * y;
+        }
+        for(x = 0; x < area; ++x) {
+            for(y = 0; y < remain; ++y) {
+                dstZ[0] = srcChannel[y][x];
+                dstZ++;
+            }
+            for(y = remain; y < 2; ++y) {
+                dstZ[0] = 0;
+                dstZ++;
+            }
+        }
+    }
 }
 
+template<typename T>
+void MNNUnpackC2Common(T* dst, const T* src, size_t area, size_t depth, int* areaOffset, int pack = 1) {
+    int depthC2     = depth / 2;
+    int depthRemain = depthC2 * 2;
+    int remain      = depth - depthRemain;
+    int z, x, y;
+    const T* srcChannel[2];
+    const T* srcOffset = src;
+    for(z = 0; z < depthC2; ++z) {
+        for(y = 0; y < 2; ++y) {
+            auto dstZ = dst + (z * 2 + y) * areaOffset[1] * pack;
+            srcChannel[y] = srcOffset + y * pack;
+            for(x = 0; x < area; ++x) {
+                for (int p = 0; p < pack; ++p) {
+                    dstZ[x * pack + p] = srcChannel[y][p];
+                }
+                srcChannel[y] += (2 * pack);
+            }
+        }
+        srcOffset += areaOffset[0] * 2 * pack;
+    }
+    if(remain > 0){
+        auto dstZ = dst + depthC2 * areaOffset[1] * 2 * pack;
+        for(y = 0; y < remain; ++y) {
+            srcChannel[y] = srcOffset + y * pack;
+            for(x = 0; x < area; ++x) {
+                for (int p = 0; p < pack; ++p) {
+                    dstZ[x * pack + p] = srcChannel[y][p];
+                }
+                srcChannel[y] += 2 * pack;
+            }
+            dstZ += areaOffset[1] * pack;
+        }
+    }
+}
 
-void MNNGetOptimalBlockShape(size_t& weightNNZElement, size_t& weightBlockNumber, const float* source, int sparseBlockOC, size_t h, size_t l) {
-    size_t nnzBlock = 0;
-    size_t nnzTail = 0;
-    int ocEven = (h / sparseBlockOC) * sparseBlockOC;
-    size_t ioc = 0;
-    for (; ioc < ocEven; ioc += sparseBlockOC) {
-        for (size_t i = 0; i < l; i++) {
-            bool isZero = MNN::CommonCompute::checkAllZeros(source, l, sparseBlockOC, 1);
-            nnzBlock += !isZero;
-            source++;
-        }
-        source += (sparseBlockOC - 1) * l;
+void MNN4BitcopyWithStride (uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
+    auto src = (uint32_t*)srcO;
+    auto dst = (uint32_t*)dstO;
+    for (int i = 0; i < size; ++i) {
+        dst[0] = *src;
+        dst += ds;
+        src += stride;
     }
-    for (; ioc < h; ioc++) {
-        for (size_t i = 0; i < l; i++) {
-            bool isZero = (*source) == 0.0f;
-            nnzTail += !isZero;
-            source++;
+}
+
+void MNN4BitcopyFast (uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
+    // ds=1, stride=0||1
+    auto src = (float*)srcO;
+    auto dst = (float*)dstO;
+    int cnt  = size;
+    if (stride == 1) { // stride=1
+#ifdef MNN_USE_NEON
+        for (; cnt >= 8; cnt -= 8) {
+            auto v4 = vld1q_f32(src);
+            auto u4 = vld1q_f32(src + 4);
+            vst1q_f32(dst, v4);
+            vst1q_f32(dst + 4, u4);
+            dst += 8;
+            src += 8;
+        }
+        for (; cnt >= 4; cnt -= 4) {
+            auto v4 = vld1q_f32(src);
+            vst1q_f32(dst, v4);
+            dst += 4;
+            src += 4;
+        }
+#elif defined(MNN_USE_SSE)
+        for (; cnt >= 8; cnt -= 8) {
+            __m128 v4 = _mm_loadu_ps(src);
+            __m128 u4 = _mm_loadu_ps(src + 4);
+            _mm_storeu_ps(dst, v4);
+            _mm_storeu_ps(dst + 4, u4);
+            dst += 8;
+            src += 8;
+        }
+        for (; cnt >= 4; cnt -= 4) {
+            __m128 v4 = _mm_loadu_ps(src);
+            _mm_storeu_ps(dst, v4);
+            dst += 4;
+            src += 4;
+        }
+#endif
+    } else { // stride=0
+        int i = 0;
+        float val = *src;
+#ifdef MNN_USE_NEON
+        auto val4 = vdupq_n_f32(val);
+        for (; cnt >= 8; cnt -= 8) {
+            vst1q_f32(dst, val4);
+            vst1q_f32(dst + 4, val4);
+            dst += 8;
+        }
+        for (; cnt >= 4; cnt -= 4) {
+            vst1q_f32(dst, val4);
+            dst += 4;
+        }
+#elif defined(MNN_USE_SSE)
+        __m128 val4 = _mm_set_ps(val, val, val, val);
+        for (; cnt >= 8; cnt -= 8) {
+            _mm_storeu_ps(dst, val4);
+            _mm_storeu_ps((dst + 4), val4);
+            dst += 8;
+        }
+        for (; cnt >= 4; cnt -= 4) {
+            _mm_storeu_ps(dst, val4);
+            dst += 4;
+        }
+#endif
+    }
+    for (; cnt > 0; --cnt) {
+        dst[0] = *src;
+        dst += ds;
+        src += stride;
+    }
+}
+
+void MNN2BitcopyWithStride(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
+    auto src = (uint16_t*)srcO;
+    auto dst = (uint16_t*)dstO;
+    for (int i=0; i<size; ++i) {
+        *dst = *src;
+        src+=stride;
+        dst+=ds;
+    }
+}
+
+void MNN2BitcopyFast(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
+    auto src = (uint16_t*)srcO;
+    auto dst = (uint16_t*)dstO;
+    int cnt  = size;
+    uint16_t val = *src;
+    if (stride == 1) {
+#ifdef MNN_USE_NEON
+        for (; cnt >= 8; cnt-=8) {
+            auto val8 = vld1q_u16(src);
+            vst1q_u16(dst, val8);
+            src += 8;
+            dst += 8;
+        }
+        for (; cnt >= 4; cnt-=4) {
+            auto val4 = vld1_u16(src);
+            vst1_u16(dst, val4);
+            src += 4;
+            dst += 4;
+        }
+#elif defined(MNN_USE_SSE)
+        for (; cnt >= 8; cnt-=8) {
+            auto tmp = _mm_loadu_ps((float*)src);
+            _mm_storeu_ps((float*)dst, tmp);
+            src += 8;
+            dst += 8;
+        }
+#endif
+    } else { // stride=0
+#ifdef MNN_USE_NEON
+        auto val4 = vdup_n_u16(val);
+        auto val8 = vdupq_n_u16(val);
+        for (; cnt >= 8; cnt-=8) {
+            vst1q_u16(dst, val8);
+            dst += 8;
+        }
+        for (; cnt >= 4; cnt-=4) {
+            vst1_u16(dst, val4);
+            dst += 4;
+        }
+#elif defined(MNN_USE_SSE)
+        uint16_t arr[8] = {val, val, val, val, val, val, val, val};
+        auto val8 = _mm_loadu_ps((float*)arr);
+        for (; cnt >= 8; cnt-=8) {
+            _mm_storeu_ps((float*)dst, val8);
+            dst += 8;
+        }
+#endif
+    }
+    for (; cnt > 0; --cnt) {
+        *dst = *src;
+        src += stride;
+        dst += ds;
+    }
+}
+
+void MNN1BitcopyWithStride (uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
+    for (int i = 0; i < size; ++i) {
+        dstO[0] = *srcO;
+        dstO += ds;
+        srcO += stride;
+    }
+
+}
+
+void MNN1BitCopyFast (uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
+    int cnt = size;
+    uint8_t val = *srcO;
+    if (stride == 1) {
+#ifdef MNN_USE_SSE
+        for (; cnt >= 16; cnt-=16) {
+            auto tmp = _mm_loadu_ps((float*)srcO);
+            _mm_storeu_ps((float*)dstO, tmp);
+            srcO += 16;
+            dstO += 16;
+        }
+#elif defined(MNN_USE_NEON)
+        for (; cnt >= 16; cnt-=16) {
+            auto val16 = vld1q_u8(srcO);
+            vst1q_u8(dstO, val16);
+            srcO += 16;
+            dstO += 16;
+        }
+        for (; cnt >= 8; cnt-=8) {
+            auto val8 = vld1_u8(srcO);
+            vst1_u8(dstO, val8);
+            srcO += 8;
+            dstO += 8;
+        }
+#endif
+    } else { // stride=0
+#ifdef MNN_USE_SSE
+        std::vector<uint8_t> arr(16, val);
+        auto val16 = _mm_loadu_ps((float*)arr.data());
+
+        for (; cnt >= 16; cnt-=16) {
+            _mm_storeu_ps((float*)dstO, val16);
+            dstO += 16;
+        }
+#elif defined(MNN_USE_NEON)
+        auto val16 = vdupq_n_u8(val);
+        auto val8 = vdup_n_u8(val);
+        for (; cnt >= 16; cnt-=16) {
+            vst1q_u8(dstO, val16);
+            dstO += 16;
+        }
+        for (; cnt >= 8; cnt-=8) {
+            vst1_u8(dstO, val8);
+            dstO += 8;
+        }
+#endif
+    }
+    for (; cnt > 0; --cnt) {
+        dstO[0] = *srcO;
+        dstO += ds;
+        srcO += stride;
+    }
+}
+
+void MNNAccumulateSequenceNumber (float* dst, const float* src, int size) {
+    // mode: 0:Add, 1:Sub, 2:Min, 3:Max
+    int size8 = (size / 8) * 8;
+    int i = 0;
+    float sum = 0.f;
+    float tmp[4];
+#ifdef MNN_USE_NEON
+    if (size >= 8) {
+        auto sum4_1 = vdupq_n_f32(0.f);
+        auto sum4_2 = vdupq_n_f32(0.f);
+        for (; i < size8; i += 8) {
+            auto v4 = vld1q_f32(src);
+            auto u4 = vld1q_f32(src + 4);
+            sum4_1 = vaddq_f32(sum4_1, v4);
+            sum4_2 = vaddq_f32(sum4_2, u4);
+            src += 8;
+        }
+        sum4_1 = vaddq_f32(sum4_1, sum4_2);
+        sum = (sum4_1[0] + sum4_1[1]) + (sum4_1[2] + sum4_1[3]);
+    }
+#elif defined(MNN_USE_SSE)
+    if (size >= 8) {
+        auto sum4_1 = _mm_set_ps1(0.f);
+        auto sum4_2 = _mm_set_ps1(0.f);
+
+        for (; i < size8; i += 8) {
+            auto v4 = _mm_loadu_ps(src);
+            auto u4 = _mm_loadu_ps(src + 4);
+            sum4_1 = _mm_add_ps(sum4_1, v4);
+            sum4_2 = _mm_add_ps(sum4_2, u4);
+            src += 8;
+        }
+
+        sum4_1 = _mm_add_ps(sum4_1, sum4_2);
+        _mm_storeu_ps(tmp, sum4_1);
+        sum += (tmp[0] + tmp[1] + tmp[2] + tmp[3]);
+    }
+#endif
+    for (; i < size; ++i) {
+        sum += (*src);
+        src += 1;
+    }
+    *dst = sum;
+}
+
+void MNNCountMaxMinValue(float* source, float* minVal, float* maxVal, size_t size) {
+    int pack = 4;
+    float max_ = source[0], min_ = source[0];
+    for (int i = 1; i < size; ++i) {
+        if (max_ < source[i]) {
+            max_ = source[i];
+        }
+        if (min_ > source[i]) {
+            min_ = source[i];
         }
     }
-    weightNNZElement = nnzBlock * sparseBlockOC + nnzTail;
-    weightBlockNumber = nnzBlock + nnzTail;
-    return;
+    *minVal = min_;
+    *maxVal = max_;
 }
 
 #ifndef MNN_USE_NEON
-
 void MNNGetMatMulPackMode(int* eP, int *lP, int* hP) {
     *eP = 16;
     *lP = 1;
@@ -306,15 +857,15 @@ static void _MNNPackedMatMulRemain(float* C, const float* A, const float* B, siz
         }
     }
 }
-void MNNPackedMatMul(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias) {
+
+void MNNPackedMatMul(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
     return _MNNPackedMatMulRemain(C, A, B, 16, parameter, postParameters, bias, 16);
 }
 
-void MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias) {
+void MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) {
     auto aStride = parameter[0] / sizeof(float);
     _MNNPackedMatMulRemain(C, A, B, eSize, parameter, postParameters, bias, aStride);
 }
-
 
 void MNNPackC4ForMatMul_A(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el) {
     int number = info[0];
@@ -1330,6 +1881,21 @@ void MNNTranspose32Bit(int32_t* dstO, const int32_t* srcO, int32_t* dim) {
         }
     }
 }
+void MNNTranspose16Bit(int16_t* dstO, const int16_t* srcO, int32_t* dim) {
+    int w = dim[0];
+    int h = dim[1];
+    int srcStride = dim[2];
+    int dstStride = dim[3];
+    for (int i=0; i<h; ++i) {
+        auto si = srcO + i;
+        auto di = dstO + i * dstStride;
+        for (int j=0; j<w; ++j) {
+            auto sj = si + j * srcStride;
+            auto dj = di + j;
+            *dj = *sj;
+        }
+    }
+}
 #endif
 void MNNFunctionInit() {
     // Do nothing
@@ -1392,24 +1958,29 @@ void MNNUnpackC4(float* dst, const float* src, size_t area, size_t depth, int* a
     MNNUnpackC4Common<float>(dst, src, area, depth, areaOffset);
 }
 
-void MNNExpC8(float* dest, const float* source, const float* offset, const float* parameters, size_t countC8) {
+void MNNExpC8(float* dest, const float* source, float* offset, const float* parameters, size_t countC8) {
     auto count = countC8 * 8;
     auto param = parameters[0];
     float xLimit = 87;
+    float summer = offset[3];
     for (int i = 0; i < count; ++i) {
-        auto x         = source[i] * offset[0];
+        auto x         = source[i] * offset[0] + offset[2];
         x = ALIMAX(x, -xLimit);
         x = ALIMIN(x, xLimit);
         int div        = (x * parameters[1]);
         int div2       = (div + 127) << 23;
         auto xReamin   = x - div * param;
         float expBasic = *(float*)(&div2);
-        auto t = xReamin;
+        auto t = xReamin * 0.25f;
         auto expRemain =
-            ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + parameters[3]) * t +
-            parameters[2];
+        ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + 1.0f) * t +
+            1.0f;
+        expRemain = expRemain * expRemain;
+        expRemain = expRemain * expRemain;
         dest[i] = expBasic * expRemain + offset[1];
+        summer+= dest[i];
     }
+    offset[3] = summer;
 }
 
 void MNNSoftmax(float* dest, const float* source, size_t size) {
@@ -1439,11 +2010,10 @@ void MNNSoftmax(float* dest, const float* source, size_t size) {
     }
 }
 
-void MNNReluInt8(int8_t* dst, const int8_t* src, size_t size) {
-    int i;
-    for (i = 0; i < size; ++i) {
-        if (src[i] < 0) {
-            dst[i] = 0;
+void MNNReluInt8(int8_t* dst, const int8_t* src, size_t size, ssize_t zeroPoint) {
+    for (int i = 0; i < size; ++i) {
+        if (src[i] < zeroPoint) {
+            dst[i] = zeroPoint;
         } else {
             dst[i] = src[i];
         }
@@ -1529,52 +2099,68 @@ void MNNPowC8(float* dest, const float* source, const float* powfParam, size_t b
 }
 #endif // no MNN_USE_NEON
 
-void MNNGridSampleComputeCord(float* dst, const float* src, size_t inH, size_t inW, size_t outH, size_t outW, size_t stride, bool alignCorners) {
+void MNNGridSampleComputeCord(float* dst, const float* src, size_t inH, size_t inW, size_t outH, size_t outW, bool alignCorners) {
     float a = alignCorners ? 1.0f : 0.0f;
     float b = alignCorners ? 0.0f : 1.0f;
-    for (auto h = 0; h < outH; ++h) {
-        auto __gridPtr = src + h * stride;
-        auto cordH = dst + h * outW * 2;
-        for (auto w = 0; w < outW; ++w) {
-            auto x = __gridPtr[2 * w + 0];
-            auto y = __gridPtr[2 * w + 1];
-            cordH[2 * w + 0] = ((1 + x) * (inW - a) - b) * 0.5f;
-            cordH[2 * w + 1] = ((1 + y) * (inH - a) - b) * 0.5f;
-        }
+    int area = outH * outW;
+    float kx = 0.5f * ((float)inW - a);
+    float bx = 0.5f * ((float)inW - a - b);
+    float ky = 0.5f * ((float)inH - a);
+    float by = 0.5f * ((float)inH - a - b);
+    for (int w = 0; w < area; ++w) {
+        auto x = src[2 * w + 0];
+        auto y = src[2 * w + 1];
+        dst[2 * w + 0] = kx * x + bx;
+        dst[2 * w + 1] = ky * y + by;
     }
 }
-void MNNGridSampleComputeCord3D(float* dst, const float* src, size_t inD, size_t inH, size_t inW, size_t outD, size_t outH, size_t outW, size_t strideD, size_t strideH, bool alignCorners) {
+void MNNGridSampleComputeCord3D(float* dst, const float* src, size_t inD, size_t inH, size_t inW, size_t outD, size_t outH, size_t outW, bool alignCorners) {
+    int strideD = outH * outW * 3;
+    int strideH = outW * 3;
     float a = alignCorners ? 1.0f : 0.0f;
     float b = alignCorners ? 0.0f : 1.0f;
-    for (auto d = 0; d < outD; ++d) {
-        for (auto h = 0; h < outH; ++h) {
-            auto __gridPtr = src + d * strideD + h * strideH;
-            auto cordH = dst + (d * outH + h) * outW * 3;
-            for (auto w = 0; w < outW; ++w) {
-                auto x = __gridPtr[3 * w + 0];
-                auto y = __gridPtr[3 * w + 1];
-                auto z = __gridPtr[3 * w + 2];
-                cordH[3 * w + 0] = ((1 + x) * (inW - a) - b) * 0.5f;
-                cordH[3 * w + 1] = ((1 + y) * (inH - a) - b) * 0.5f;
-                cordH[3 * w + 2] = ((1 + z) * (inD - a) - b) * 0.5f;
-            }
-        }
+    int area = outD * outH * outW;
+    float kx = 0.5f * ((float)inW - a);
+    float bx = 0.5f * ((float)inW - a - b);
+    float ky = 0.5f * ((float)inH - a);
+    float by = 0.5f * ((float)inH - a - b);
+    float kz = 0.5f * ((float)inD - a);
+    float bz = 0.5f * ((float)inD - a - b);
+
+    for (int w=0; w<area; ++w) {
+        auto x = src[3 * w + 0];
+        auto y = src[3 * w + 1];
+        auto z = src[3 * w + 2];
+        dst[3 * w + 0] = kx * x + bx;
+        dst[3 * w + 1] = ky * y + by;
+        dst[3 * w + 2] = kz * z + bz;
     }
 }
 
 #ifndef MNN_USE_SSE
-void MNNNorm(float *dst, const float *src, const float *gamma, const float *beta, float epsilon, size_t size) {
-    float sum = 0.f;
-    for (int j = 0; j < size; ++j) {
-        sum += src[j];
+void MNNNorm(float *dst, const float *src, const float *gamma, const float *beta, float epsilon, size_t size, bool RMSNorm) {
+    float mean = 0;
+    if(false == RMSNorm){
+        float sum = 0.f;
+        for (int j = 0; j < size; ++j) {
+            sum += src[j];
+        }
+        mean = sum / size;
     }
-    float mean = sum / size;
     float square_sum = 0.f;
     for (int j = 0; j < size; ++j) {
         square_sum += (src[j] - mean) * (src[j] - mean);
     }
+#ifdef __aarch64__
+    auto vs = vadd_f32(vdiv_f32(vdup_n_f32(square_sum), vdup_n_f32(size)), vdup_n_f32(epsilon));
+    auto vecs = vdiv_f32(vdup_n_f32(1.0f), vsqrt_f32(vs));
+    float vars[2];
+    vst1_f32(vars, vecs);
+    float variable = vars[0];
+#else
     float variable = square_sum / size;
     variable = 1.f / std::sqrt(variable + epsilon);
+#endif
 
     if (gamma && beta) {
         for (int j = 0; j < size; ++j) {
@@ -1588,84 +2174,6 @@ void MNNNorm(float *dst, const float *src, const float *gamma, const float *beta
 }
 #endif
 
-size_t MNNGridSampleComputeOffset(int h, int w, int height, int width, bool padMode) {
-    if (padMode == true) { //padMode == BorderMode_ZEROS
-        if (h < 0 || h >= height || w < 0 || w >= width) {
-            return -1;
-        }
-    } else {
-        // Clearly, CLAMP is the right way to go for GridSamplePaddingMode_BORDER
-        // For GridSamplePaddingMode_REFLECTION, since we have reflected the values into (-1, 1),
-        // the leftover reflections degrade to GridSamplePaddingMode_BORDER
-        h = h < 0 ? 0 : ( h > (height - 1) ? (height - 1) : h);
-        w = w < 0 ? 0 : ( w > (width - 1) ? (width - 1) : w);
-    }
-    return h * width * 4 + w * 4;
-}
-
-size_t MNNGridSampleComputeOffset3D(int d, int h, int w, int depth, int height, int width, bool padMode) {
-    if (padMode == true) { //padMode == BorderMode_ZEROS
-        if (h < 0 || h >= height || w < 0 || w >= width || d < 0 || d >= depth) {
-            return -1;
-        }
-    } else {
-        // Clearly, CLAMP is the right way to go for GridSamplePaddingMode_BORDER
-        // For GridSamplePaddingMode_REFLECTION, since we have reflected the values into (-1, 1),
-        // the leftover reflections degrade to GridSamplePaddingMode_BORDER
-        d = d < 0 ? 0 : (d > (depth - 1) ? (depth - 1) : d);
-        h = h < 0 ? 0 : ( h > (height - 1) ? (height - 1) : h);
-        w = w < 0 ? 0 : ( w > (width - 1) ? (width - 1) : w);
-    }
-    return ((d * height + h) * width + w) * 4;
-}
-
-void MNNGridSampleInterp(float* outputPtr, const float* inputPtr, const float* cordPtr, size_t inH, size_t inW, size_t outW, size_t channelCUnit, size_t inOffset, size_t outOffset, bool sampleMode, bool padMode) {
-    for (auto ow = 0; ow < outW; ++ow) {
-        auto w = cordPtr[2 * ow + 0];
-        auto h = cordPtr[2 * ow + 1];
-        Vec4 interp;
-
-        if (sampleMode == true) { //sampleMode == SampleMode_NEAREST
-            int nh = ::floor(h + 0.5f);
-            int nw = ::floor(w + 0.5f);
-            size_t ns = MNNGridSampleComputeOffset(nh, nw, inH, inW, padMode);
-            for (int k = 0; k < channelCUnit; ++k) {
-                interp = ns == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + ns);
-                Vec4::save(outputPtr + k * outOffset + 4 * ow, interp);
-            }
-        } else { //sampleMode == GridSampleMode_BILINEAR
-            int w0_h = ::floor(h);
-            int w0_w = ::floor(w);
-            int w1_h = ::ceil(h);
-            int w1_w = ::ceil(w);
-            auto oneV = Vec4(1.0f);
-
-            auto f0 = Vec4((float)w1_w - w);
-            auto f1 = oneV - f0;
-            auto h0 = Vec4((float)w1_h - h);
-            auto h1 = oneV - h0;
-
-            size_t s00 = MNNGridSampleComputeOffset(w0_h, w0_w, inH, inW, padMode);
-            size_t s01 = MNNGridSampleComputeOffset(w0_h, w1_w, inH, inW, padMode);
-            size_t s10 = MNNGridSampleComputeOffset(w1_h, w0_w, inH, inW, padMode);
-            size_t s11 = MNNGridSampleComputeOffset(w1_h, w1_w, inH, inW, padMode);
-
-            for (int k = 0; k < channelCUnit; ++k) {
-                Vec4 i00 = s00 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s00);
-                Vec4 i01 = s01 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s01);
-                Vec4 i10 = s10 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s10);
-                Vec4 i11 = s11 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s11);
-
-                Vec4 i0 = i00 * f0 + i01 * f1;
-                Vec4 i1 = i10 * f0 + i11 * f1;
-
-                interp = i0 * h0 + i1 * h1;
-                Vec4::save(outputPtr + k * outOffset + 4 * ow, interp);
-            }
-        }
-    }
-}
-
 void MNNRoiPoolingMax(float* dst, const float* src, int hLen, int wLen, int iw) {
     Vec4 max = Vec4(-FLT_MAX);
     for (int h = 0; h < hLen; h++, src += iw * UNIT) {
@@ -1675,10 +2183,10 @@ void MNNRoiPoolingMax(float* dst, const float* src, int hLen, int wLen, int iw) 
         }
     }
     Vec4::save(dst, max);
- }
+}
 
 void MNNRoiAlignMax(float* dst, const float* src, const std::vector<std::vector<int>> &vecPos, const std::vector<std::vector<float>> &vecArea, int samplingRatioArea, int pooledHeight, int pooledWidth) {
-    for (int h = 0; h < pooledHeight; ++h, dst += pooledHeight * UNIT) {
+    for (int h = 0; h < pooledHeight; ++h, dst += pooledWidth * UNIT) {
         int preCalcIdx = h * pooledWidth * samplingRatioArea;
         for (int w = 0; w < pooledWidth; ++w) {
             Vec4 res = Vec4(-FLT_MAX);
@@ -1704,7 +2212,7 @@ void MNNRoiAlignMax(float* dst, const float* src, const std::vector<std::vector<
 
 void MNNRoiAlignAvg(float* dst, const float* src, const std::vector<std::vector<int>> &vecPos, const std::vector<std::vector<float>> &vecArea, int samplingRatioArea, int pooledHeight, int pooledWidth) {
     float invSamplingCnt = 1.f / samplingRatioArea;
-    for (int h = 0; h < pooledHeight; ++h, dst += pooledHeight * UNIT) {
+    for (int h = 0; h < pooledHeight; ++h, dst += pooledWidth * UNIT) {
         int preCalcIdx = h * pooledWidth * samplingRatioArea;
         for (int w = 0; w < pooledWidth; ++w) {
             Vec4 res = Vec4(0.f);
@@ -1725,71 +2233,6 @@ void MNNRoiAlignAvg(float* dst, const float* src, const std::vector<std::vector<
             }
             res = res * invSamplingCnt;
             Vec4::save(dst + w * UNIT, res);
-        }
-    }
-}
-
-void MNNGridSampleInterp3D(float* outputPtr, const float* inputPtr, const float* cordPtr, size_t inD, size_t inH, size_t inW, size_t outW, size_t channelCUnit, size_t inOffset, size_t outOffset, bool sampleMode, bool padMode) {
-    for (auto ow = 0; ow < outW; ++ow) {
-        auto w = cordPtr[3 * ow + 0];
-        auto h = cordPtr[3 * ow + 1];
-        auto d = cordPtr[3 * ow + 2];
-        Vec4 interp;
-
-        if (sampleMode == true) { //sampleMode == SampleMode_NEAREST
-            int nd = ::floor(d + 0.5f);
-            int nh = ::floor(h + 0.5f);
-            int nw = ::floor(w + 0.5f);
-            size_t ns = MNNGridSampleComputeOffset3D(nd, nh, nw, inD, inH, inW, padMode);
-            for (int k = 0; k < channelCUnit; ++k) {
-                interp = ns == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + ns);
-                Vec4::save(outputPtr + k * outOffset + 4 * ow, interp);
-            }
-        } else { //sampleMode == GridSampleMode_BILINEAR
-            int w0_d = ::floor(d);
-            int w0_h = ::floor(h);
-            int w0_w = ::floor(w);
-            int w1_d = ::ceil(d);
-            int w1_h = ::ceil(h);
-            int w1_w = ::ceil(w);
-            auto oneV = Vec4(1.0f);
-
-            auto f0 = Vec4((float)w1_w - w);
-            auto f1 = oneV - f0;
-            auto h0 = Vec4((float)w1_h - h);
-            auto h1 = oneV - h0;
-            auto d0 = Vec4((float)w1_d - d);
-            auto d1 = oneV - d0;
-
-            size_t s000 = MNNGridSampleComputeOffset3D(w0_d, w0_h, w0_w, inD, inH, inW, padMode);
-            size_t s001 = MNNGridSampleComputeOffset3D(w0_d, w0_h, w1_w, inD, inH, inW, padMode);
-            size_t s010 = MNNGridSampleComputeOffset3D(w0_d, w1_h, w0_w, inD, inH, inW, padMode);
-            size_t s011 = MNNGridSampleComputeOffset3D(w0_d, w1_h, w1_w, inD, inH, inW, padMode);
-            size_t s100 = MNNGridSampleComputeOffset3D(w1_d, w0_h, w0_w, inD, inH, inW, padMode);
-            size_t s101 = MNNGridSampleComputeOffset3D(w1_d, w0_h, w1_w, inD, inH, inW, padMode);
-            size_t s110 = MNNGridSampleComputeOffset3D(w1_d, w1_h, w0_w, inD, inH, inW, padMode);
-            size_t s111 = MNNGridSampleComputeOffset3D(w1_d, w1_h, w1_w, inD, inH, inW, padMode);
-
-            for (int k = 0; k < channelCUnit; ++k) {
-                Vec4 i000 = s000 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s000);
-                Vec4 i001 = s001 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s001);
-                Vec4 i010 = s010 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s010);
-                Vec4 i011 = s011 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s011);
-                Vec4 i100 = s100 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s100);
-                Vec4 i101 = s101 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s101);
-                Vec4 i110 = s110 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s110);
-                Vec4 i111 = s111 == -1 ? Vec4(0.f) : Vec4::load(inputPtr + k * inOffset + s111);
-
-                Vec4 i00 = i000 * f0 + i001 * f1;
-                Vec4 i01 = i010 * f0 + i011 * f1;
-                Vec4 i0 = i00 * h0 + i01 * h1;
-                Vec4 i10 = i100 * f0 + i101 * f1;
-                Vec4 i11 = i110 * f0 + i111 * f1;
-                Vec4 i1 = i10 * h0 + i11 * h1;
-                interp = i0 * d0 + i1 * d1;
-
-                Vec4::save(outputPtr + k * outOffset + 4 * ow, interp);
-            }
         }
     }
 }
@@ -2030,6 +2473,40 @@ void MNNPackTransposeUint8(uint8_t* dst, const uint8_t* src, size_t area,size_t 
 }
 
 void MNNPackTranspose(float* dst, const float* src, size_t area, size_t depth, int* areaOffset) {
+#if defined(MNN_USE_NEON)
+    if (3 == depth) {
+        int areaC4     = (int)area / 4;
+        int remain     = areaC4 * 4;
+        for (int i = 0; i < areaC4; ++i) {
+            auto srcCur   = src + 16 * i;
+            auto dstCur   = dst + 12 * i;
+            auto srcValue = vld4q_f32(srcCur);
+            float32x4x3_t dstValue;
+            dstValue.val[0] = srcValue.val[0];
+            dstValue.val[1] = srcValue.val[1];
+            dstValue.val[2] = srcValue.val[2];
+            vst3q_f32(dstCur, dstValue);
+        }
+        for (int i = remain; i < area; ++i) {
+            dst[3 * i + 0] = src[4 * i + 0];
+            dst[3 * i + 1] = src[4 * i + 1];
+            dst[3 * i + 2] = src[4 * i + 2];
+        }
+        return;
+    }
+#elif defined(MNN_USE_SSE)
+    if (3 == depth) {
+        if (area < 1) return;
+        for (int i = 0; i < area - 1; ++i) {
+            auto srcValue = Vec4::load(src + 4 * i);
+            Vec4::save(dst + 3 * i, srcValue);
+        }
+        for (int i = 0; i < 3; ++i) {
+            dst[3 * (area - 1) + i] = src[4 * (area - 1) + i];
+        }
+        return;
+    }
+#endif
     int c      = (int)depth;
     int cDiv4  = c / 4;
     int cAlign = cDiv4 * 4;
@@ -2060,36 +2537,39 @@ void MNNPackTranspose(float* dst, const float* src, size_t area, size_t depth, i
     }
 }
 
-void MNNExp(float* dst, const float* src, const float* offset, size_t dataSize) {
-    int countC8        = (int)dataSize / 8;
+void MNNExp(float* dst, const float* src, float* offset, size_t dataSize) {
+    int countC8        = static_cast<int32_t>(dataSize) / 8;
+    int remain = static_cast<int32_t>(dataSize) % 8;
+    static const float parameters[] = {
+        (float)logf(2.0f), 1.0f / (float)logf(2.0f), 0.25f, 1.0f, 0.5f, 1.0f / 6.0f, 1.0f / 24.0f, 1.0f / 120.0f};
     if (countC8 > 0) {
         // Align to eight so asm is easier to write
-        float parameters[] = {
-            (float)logf(2.0f), 1.0f / (float)logf(2.0f), 1.0f, 1.0f, 0.5f, 1.0f / 6.0f, 1.0f / 24.0f, 1.0f / 120.0f};
         MNNExpC8(dst, src, offset, parameters, countC8);
     }
-    float alpha = offset[0];
-    float beta = offset[1];
-    int remain = countC8 * 8;
-    auto param = logf(2.0f);
-    float xLimit = 87;
-    for (int i = remain; i < dataSize; i++) {
-        /*Origin Function*/
-        //dst[i] = expf(src[i] * alpha) + beta;
-        /*Approciate Function*/
-
-        auto x         = alpha * src[i];
-        x = ALIMAX(x, -xLimit);
-        x = ALIMIN(x, xLimit);
-
-        int div        = (x / param);
-        int div2       = (div + 127) << 23;
-        auto xReamin   = x - div * param;
-        float expBasic = *(float*)(&div2);
-
-        auto t         = xReamin;
-        auto expRemain = ((((1.0f / 120 * t + 1.0f / 24) * t + 1.0f / 6) * t + 0.5f) * t + 1.0f) * t + 1.0f;
-        dst[i]  = expBasic * expRemain + beta;
+    if (remain > 0) {
+        auto param = parameters[0];
+        float xLimit = 87;
+        float summer = offset[3];
+        auto source = src + countC8 * 8;
+        auto dest = dst + countC8 * 8;
+        for (int i = 0; i < remain; ++i) {
+            auto x         = source[i] * offset[0] + offset[2];
+            x = ALIMAX(x, -xLimit);
+            x = ALIMIN(x, xLimit);
+            int div        = (x * parameters[1]);
+            int div2       = (div + 127) << 23;
+            auto xReamin   = x - div * param;
+            float expBasic = *(float*)(&div2);
+            auto t = xReamin * 0.25f;
+            auto expRemain =
+            ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + 1.0f) * t +
+                1.0f;
+            expRemain = expRemain * expRemain;
+            expRemain = expRemain * expRemain;
+            dest[i] = expBasic * expRemain + offset[1];
+            summer+= dest[i];
+        }
+        offset[3] = summer;
     }
 }
 
@@ -2115,8 +2595,10 @@ void MNNTanh(float* dst, const float* src, size_t dataSize) {
         dst[i] = tanhf_poly(src[i]);
     }
      */
-    float offset[2] = {
+    float offset[4] = {
         -2.0f,
+        0.0f,
+        0.0f,
         0.0f
     };
     MNNExp(dst, src, offset, dataSize);
@@ -2136,30 +2618,33 @@ void MNNReluWithSlope(float* dst, const float* src, size_t sizeQuad, float slope
 }
 
 void MNNReluWithSlopeCommon(float* dst, const float* src, size_t size, float slope) {
-    int sizeQuad = size / 4;
-    int start = 0;
+    int sizeQuad = static_cast<int32_t>(size) / 4;
+    int remain = static_cast<int32_t>(size) % 4;
     if (sizeQuad > 0) {
         MNNReluWithSlope(dst, src, sizeQuad, slope);
-        start = sizeQuad * 4;
     }
-    for (int j = start; j < size; j++) {
-        if (src[j] < 0) {
-            dst[j] = src[j] * slope;
-        } else {
-            dst[j] = src[j];
-        }
+    if (remain > 0) {
+        float intmp[4] = {0}, outmp[4] = {0};
+        ::memcpy(intmp, src + sizeQuad * 4, remain * sizeof(float));
+        MNNReluWithSlope(outmp, intmp, 1, slope);
+        ::memcpy(dst + sizeQuad * 4, outmp, remain * sizeof(float));
     }
 }
 
 void MNNHardSwishCommon(float* dst, const float* src, size_t size) {
-    int sizeQuad = size / 4;
-    int start = 0;
+    int sizeQuad = static_cast<int32_t>(size / 4);
+    int remain = static_cast<int32_t>(size) % 4;
 #ifdef MNN_USE_SSE
     if (sizeQuad > 0) {
         MNNHardSwish(dst, src, sizeQuad);
-        start = sizeQuad * 4;
     }
-#endif
+    if (remain > 0) {
+        float intmp[4] = {0}, outmp[4] = {0};
+        ::memcpy(intmp, src + sizeQuad * 4, remain * sizeof(float));
+        MNNHardSwish(outmp, intmp, 1);
+        ::memcpy(dst + sizeQuad * 4, outmp, remain * sizeof(float));
+    }
+#else
 #ifdef MNN_USE_NEON
     float32x4_t zero = vdupq_n_f32(0.f);
     float32x4_t three = vdupq_n_f32(3.f);
@@ -2170,9 +2655,16 @@ void MNNHardSwishCommon(float* dst, const float* src, size_t size) {
         auto y = vmulq_f32(vmulq_f32(x, vminq_f32(vmaxq_f32(vaddq_f32(x, three), zero), six)), divsix);
         vst1q_f32(dst + 4 * i, y);
     }
-    start = sizeQuad * 4;
-#endif
-    for (int j = start; j < size; j++) {
+    if (remain > 0) {
+        float intmp[4] = {0}, outmp[4] = {0};
+        ::memcpy(intmp, src + sizeQuad * 4, remain * sizeof(float));
+        auto x = vld1q_f32(intmp);
+        auto y = vmulq_f32(vmulq_f32(x, vminq_f32(vmaxq_f32(vaddq_f32(x, three), zero), six)), divsix);
+        vst1q_f32(outmp, y);
+        ::memcpy(dst + sizeQuad * 4, outmp, remain * sizeof(float));
+    }
+#else
+    for (int j = 0; j < size; j++) {
         if (src[j] <= -3) {
             dst[j] = 0;
         } else if (src[j] >= 3){
@@ -2181,6 +2673,8 @@ void MNNHardSwishCommon(float* dst, const float* src, size_t size) {
             dst[j] = src[j] * (src[j] + 3) / 6.f;
         }
     }
+#endif
+#endif
 }
 
 void MNNGeluStandardCommon(float* dst, const float* src, size_t size) {
@@ -2190,14 +2684,21 @@ void MNNGeluStandardCommon(float* dst, const float* src, size_t size) {
 }
 
 void MNNGeluCommon(float* dst, const float* src, size_t size) {
-    int sizeQuad = size / 8;
-    int start = 0;
-#ifdef MNN_USE_SSE
+    int sizeQuad = static_cast<int32_t>(size / 8);
+    int remain = static_cast<int32_t>(size) % 8;
+#if defined(MNN_USE_SSE) || defined(MNN_USE_NEON)
+    float parameters[8] = {0.044715f, 0.79788458f, 378.f, 17325.f, 135135.f, 28.f, 3150.f, 62370.f};
     if (sizeQuad > 0) {
-        MNNGelu(dst, src, sizeQuad);
-        start = sizeQuad * 8;
+        MNNGelu(dst, src, sizeQuad, parameters);
     }
-#endif
+    if (remain > 0) {
+        float intmp[8] = {0};
+        float outmp[8] = {0};
+        ::memcpy(intmp, src + 8 * sizeQuad, remain * sizeof(float));
+        MNNGelu(outmp, intmp, 1, parameters);
+        ::memcpy(dst + 8 * sizeQuad, outmp, remain * sizeof(float));
+    }
+#else
     auto tanhf_poly = [](float value) -> float {
         if (value > 5.0f) {
             return 1.0f;
@@ -2210,11 +2711,12 @@ void MNNGeluCommon(float* dst, const float* src, size_t size) {
             return a / b;
         }
     };
-    for (int i = start; i < size; i++) {
+    for (int i = 0; i < size; i++) {
         float temp = 0.044715f * src[i] * src[i] * src[i];
         temp = 0.79788458f * (temp + src[i]);
         dst[i] = (1.0f + tanhf_poly(temp)) * src[i] * 0.5f;
     }
+#endif
 }
 
 void MNNScaleAndAddBiasScalar(float* dst, const float* src, float bias, float alpha, size_t number) {
@@ -2304,7 +2806,7 @@ void MNNComputeMatMulForE_1(const float* A, const float* B, float* C, const floa
             Vec4 sumValue = Vec4(0.0f);
             auto by = B + y * l;
             for (int x=0; x<lC4; ++x) {
-                sumValue = sumValue + Vec4::load(A + x * 4) * Vec4::load(by + x * 4);
+                sumValue = Vec4::fma(sumValue, Vec4::load(A + x * 4), Vec4::load(by + x * 4));
             }
             float sumRemain = 0.0f;
             for (int x=lR; x<l; ++x) {
@@ -2316,19 +2818,32 @@ void MNNComputeMatMulForE_1(const float* A, const float* B, float* C, const floa
             C[y] = sumRemain + sumValue[0] + sumValue[1] + sumValue[2] + sumValue[3];
         }
     } else {
-        auto hC4 = h / 4;
-        auto hR = hC4 * 4;
+        auto hC4 = h / 16;
+        auto hR = hC4 * 16;
         for (int y=tId; y<hC4; y+=numberThread) {
-            auto bs = B + 4 * y;
-            Vec4 sumValue = Vec4(0.0f);
+            auto bs = B + 16 * y;
+            Vec4 sumValue0 = Vec4(0.0f);
+            Vec4 sumValue1 = Vec4(0.0f);
+            Vec4 sumValue2 = Vec4(0.0f);
+            Vec4 sumValue3 = Vec4(0.0f);
             if (biasPtr != nullptr) {
-                sumValue = Vec4::load(biasPtr + 4 * y);
+                sumValue0 = Vec4::load(biasPtr + 16 * y + 0);
+                sumValue1 = Vec4::load(biasPtr + 16 * y + 4);
+                sumValue2 = Vec4::load(biasPtr + 16 * y + 8);
+                sumValue3 = Vec4::load(biasPtr + 16 * y + 12);
             }
             auto srcY = A + y * l;
             for (int x=0; x<l; ++x) {
-                sumValue = sumValue + Vec4(A[x]) * Vec4::load(bs + h * x);
+                auto a = Vec4(A[x]);
+                sumValue0 = Vec4::fma(sumValue0, a, Vec4::load(bs + h * x));
+                sumValue1 = Vec4::fma(sumValue1, a, Vec4::load(bs + h * x + 4));
+                sumValue2 = Vec4::fma(sumValue2, a, Vec4::load(bs + h * x + 8));
+                sumValue3 = Vec4::fma(sumValue3, a, Vec4::load(bs + h * x + 12));
             }
-            Vec4::save(C + 4 * y, sumValue);
+            Vec4::save(C + 16 * y, sumValue0);
+            Vec4::save(C + 16 * y + 4, sumValue1);
+            Vec4::save(C + 16 * y + 8, sumValue2);
+            Vec4::save(C + 16 * y + 12, sumValue3);
         }
         for (int y=hR + tId; y<h; y+=numberThread) {
             auto bs = B + y;
@@ -2500,8 +3015,10 @@ void MNNSin(float* dst, const float* src, size_t dataSize) {
 }
 
 void MNNSigmoid(float* dst, const float* src, size_t dataSize) {
-    float offset[2] = {
+    float offset[4] = {
        -1.0f,
+        0.0f,
+        0.0f,
         0.0f
     };
     MNNExp(dst, src, offset, dataSize);
@@ -2510,22 +3027,39 @@ void MNNSigmoid(float* dst, const float* src, size_t dataSize) {
     }
 }
 
+void MNNSiLu(float* dst, const float* src, size_t dataSize) {
+    float offset[4] = {
+       -1.0f,
+        0.0f,
+        0.0f,
+        0.0f
+    };
+    MNNExp(dst, src, offset, dataSize);
+    for (int i = 0; i < dataSize; ++i) {
+        dst[i] = src[i] / (1.0f + dst[i]);
+    }
+}
+
 /**
  Modified from https://github.com/alibaba/MNN/pull/1359
  Thanks for https://github.com/hroken
  */
 void MNNSigmoidLowp(float* dst, const float* src, size_t dataSize) {
-    float offset[2] = {
+    float offset[4] = {
        -1.0f,
+        0.0f,
+        0.0f,
         0.0f
     };
     MNNExp(dst, src, offset, dataSize);
 #ifdef MNN_USE_NEON
-    int dataC4 = (int)dataSize / 4;
+    int dataC4 = static_cast<int32_t>(dataSize) / 4;
+    int remain = static_cast<int32_t>(dataSize) % 4;
+    float32x4_t value = vdupq_n_f32(1.0f);
+
     if(dataC4 > 0) {
-        // neon optimization for sigmid cpu
-        float32x4_t value = vdupq_n_f32(1.0f);
         float32x4_t out = vld1q_f32(dst);
+        // neon optimization for sigmid cpu
         for (int i = 1; i < dataC4; ++i) {
             out = vrecpeq_f32(vaddq_f32(value,out));
             vst1q_f32(dst ,out);
@@ -2535,210 +3069,69 @@ void MNNSigmoidLowp(float* dst, const float* src, size_t dataSize) {
         out = vrecpeq_f32(vaddq_f32(value,out));
         vst1q_f32(dst, out);
         dst += 4;
-        dataSize = dataSize - 4 * dataC4;
     }
-#endif
+    if (remain > 0) {
+        float intmp[4] = {0};
+        ::memcpy(intmp, dst, remain * sizeof(float));
+        float32x4_t out = vld1q_f32(intmp);
+        out = vrecpeq_f32(vaddq_f32(value,out));
+        vst1q_f32(intmp, out);
+        ::memcpy(dst, intmp, remain * sizeof(float));
+    }
+#else
     for (int i = 0; i < dataSize; ++i) {
         dst[i] = 1.0f / (1.0f + dst[i]);
     }
-}
-
-void MNNMultiAndDestTransformCommon23(float **cacheLine, const float *weigth, float *dest, int cacheLineSize, int ow, const float* bias, const float* parameters) {
-    int unit = ow / 2;
-    MNN_ASSERT(cacheLineSize >= 1);
-    auto biasF = Vec4::load(bias);
-    auto minF = Vec4(parameters[2]);
-    auto maxF = Vec4(parameters[3]);
-    for (int x = 0; x < unit; ++x) {
-        auto offset = 4 * 4 * x;
-        int i = 0;
-        Vec4 m0     = Vec4::load(weigth + i * 16 + 4 * 0) * Vec4::load(cacheLine[i] + offset + 4 * 0);
-        Vec4 m1     = Vec4::load(weigth + i * 16 + 4 * 1) * Vec4::load(cacheLine[i] + offset + 4 * 1);
-        Vec4 m2     = Vec4::load(weigth + i * 16 + 4 * 2) * Vec4::load(cacheLine[i] + offset + 4 * 2);
-        Vec4 m3     = Vec4::load(weigth + i * 16 + 4 * 3) * Vec4::load(cacheLine[i] + offset + 4 * 3);
-
-        for (i = 1; i < cacheLineSize; ++i) {
-            m0 = m0 + Vec4::load(weigth + i * 16 + 4 * 0) * Vec4::load(cacheLine[i] + offset + 4 * 0);
-            m1 = m1 + Vec4::load(weigth + i * 16 + 4 * 1) * Vec4::load(cacheLine[i] + offset + 4 * 1);
-            m2 = m2 + Vec4::load(weigth + i * 16 + 4 * 2) * Vec4::load(cacheLine[i] + offset + 4 * 2);
-            m3 = m3 + Vec4::load(weigth + i * 16 + 4 * 3) * Vec4::load(cacheLine[i] + offset + 4 * 3);
-        }
-
-        auto o0 = m0 + m1 + m2 + biasF;
-        auto o1 = m1 - m2 + m3 + biasF;
-        o0 = Vec4::min(maxF, o0);
-        o1 = Vec4::min(maxF, o1);
-        o0 = Vec4::max(minF, o0);
-        o1 = Vec4::max(minF, o1);
-        Vec4::save(dest + 8 * x + 0 * 4, o0);
-        Vec4::save(dest + 8 * x + 1 * 4, o1);
-    }
-    if (unit * 2 < ow) {
-        auto offset = 4 * 4 * unit;
-        int i = 0;
-        Vec4 m0     = Vec4::load(weigth + i * 16 + 4 * 0) * Vec4::load(cacheLine[i] + offset + 4 * 0);
-        Vec4 m1     = Vec4::load(weigth + i * 16 + 4 * 1) * Vec4::load(cacheLine[i] + offset + 4 * 1);
-        Vec4 m2     = Vec4::load(weigth + i * 16 + 4 * 2) * Vec4::load(cacheLine[i] + offset + 4 * 2);
-
-        for (i = 1; i < cacheLineSize; ++i) {
-            m0 = m0 + Vec4::load(weigth + i * 16 + 4 * 0) * Vec4::load(cacheLine[i] + offset + 4 * 0);
-            m1 = m1 + Vec4::load(weigth + i * 16 + 4 * 1) * Vec4::load(cacheLine[i] + offset + 4 * 1);
-            m2 = m2 + Vec4::load(weigth + i * 16 + 4 * 2) * Vec4::load(cacheLine[i] + offset + 4 * 2);
-        }
-        auto o0 = m0 + m1 + m2 + biasF;
-        o0 = Vec4::min(maxF, o0);
-        o0 = Vec4::max(minF, o0);
-        Vec4::save(dest + 8 * unit + 0 * 4, o0);
-    }
-}
-extern "C" {
-void MNNConvDwF23SourceTransUnit(const float *source, float *dest, size_t unit);
-}
-
-void MNNSourceTransformCommonF23(const float *source, float *dest, int unit, int iw, int pad, int su, int eu) {
-    for (int x = 0; x < su; ++x) {
-        auto dstX = dest + 4 * 4 * x;
-        auto sx   = x * 2 - (int)pad;
-        auto ex   = sx + 4;
-
-        auto clampSx = std::max(sx, 0);
-        auto clampEx = std::min(ex, (int)iw);
-
-        Vec4 v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = clampSx; i < clampEx; ++i) {
-            v[i - sx] = Vec4::load(source + 4 * i);
-        }
-        auto m0 = v[0] - v[2];
-        auto m1 = v[1] + v[2];
-        auto m2 = v[2] - v[1];
-        auto m3 = v[3] - v[1];
-
-        Vec4::save(dstX + 4 * 0, m0);
-        Vec4::save(dstX + 4 * 1, m1);
-        Vec4::save(dstX + 4 * 2, m2);
-        Vec4::save(dstX + 4 * 3, m3);
-    }
-    MNNConvDwF23SourceTransUnit(source + 4 * (su * 2 - pad), dest + 4 * 4 * su, eu - su);
-
-    for (int x = eu; x < unit; ++x) {
-        auto dstX = dest + 4 * 4 * x;
-        auto sx   = x * 2 - (int)pad;
-        auto ex   = sx + 4;
-
-        auto clampSx = std::max(sx, 0);
-        auto clampEx = std::min(ex, (int)iw);
-
-        Vec4 v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = clampSx; i < clampEx; ++i) {
-            v[i - sx] = Vec4::load(source + 4 * i);
-        }
-        auto m0 = v[0] - v[2];
-        auto m1 = v[1] + v[2];
-        auto m2 = v[2] - v[1];
-        auto m3 = v[3] - v[1];
-
-        Vec4::save(dstX + 4 * 0, m0);
-        Vec4::save(dstX + 4 * 1, m1);
-        Vec4::save(dstX + 4 * 2, m2);
-        Vec4::save(dstX + 4 * 3, m3);
-    }
-}
-
-#ifndef MNN_USE_NEON
-void MNNConvDwF23MulTransUnit(float **cacheLine, const float *weigth, float *dest, size_t ow, const float* bias, const float* parameters) {
-    int unit = ow / 2;
-    auto w00 = Vec4::load(weigth + 0 * 16 + 4 * 0);
-    auto w01 = Vec4::load(weigth + 0 * 16 + 4 * 1);
-    auto w02 = Vec4::load(weigth + 0 * 16 + 4 * 2);
-    auto w03 = Vec4::load(weigth + 0 * 16 + 4 * 3);
-    auto w10 = Vec4::load(weigth + 1 * 16 + 4 * 0);
-    auto w11 = Vec4::load(weigth + 1 * 16 + 4 * 1);
-    auto w12 = Vec4::load(weigth + 1 * 16 + 4 * 2);
-    auto w13 = Vec4::load(weigth + 1 * 16 + 4 * 3);
-    auto w20 = Vec4::load(weigth + 2 * 16 + 4 * 0);
-    auto w21 = Vec4::load(weigth + 2 * 16 + 4 * 1);
-    auto w22 = Vec4::load(weigth + 2 * 16 + 4 * 2);
-    auto w23 = Vec4::load(weigth + 2 * 16 + 4 * 3);
-    auto biasF = Vec4::load(bias);
-    auto minF = Vec4(parameters[2]);
-    auto maxF = Vec4(parameters[3]);
-    for (int x = 0; x < unit; ++x) {
-        auto offset = 4 * 4 * x;
-        int i = 0;
-        Vec4 m0     = w00 * Vec4::load(cacheLine[0] + offset + 4 * 0);
-        Vec4 m1     = w01 * Vec4::load(cacheLine[0] + offset + 4 * 1);
-        Vec4 m2     = w02 * Vec4::load(cacheLine[0] + offset + 4 * 2);
-        Vec4 m3     = w03 * Vec4::load(cacheLine[0] + offset + 4 * 3);
-
-        m0 = m0 + w10 * Vec4::load(cacheLine[1] + offset + 4 * 0);
-        m1 = m1 + w11 * Vec4::load(cacheLine[1] + offset + 4 * 1);
-        m2 = m2 + w12 * Vec4::load(cacheLine[1] + offset + 4 * 2);
-        m3 = m3 + w13 * Vec4::load(cacheLine[1] + offset + 4 * 3);
-
-        m0 = m0 + w20 * Vec4::load(cacheLine[2] + offset + 4 * 0);
-        m1 = m1 + w21 * Vec4::load(cacheLine[2] + offset + 4 * 1);
-        m2 = m2 + w22 * Vec4::load(cacheLine[2] + offset + 4 * 2);
-        m3 = m3 + w23 * Vec4::load(cacheLine[2] + offset + 4 * 3);
-
-        auto o0 = m0 + m1 + m2 + biasF;
-        auto o1 = m1 - m2 + m3 + biasF;
-        o0 = Vec4::min(maxF, o0);
-        o1 = Vec4::min(maxF, o1);
-        o0 = Vec4::max(minF, o0);
-        o1 = Vec4::max(minF, o1);
-        Vec4::save(dest + 8 * x + 0 * 4, o0);
-        Vec4::save(dest + 8 * x + 1 * 4, o1);
-    }
-    if (unit * 2 < ow) {
-        auto offset = 4 * 4 * unit;
-        Vec4 m0     = w00 * Vec4::load(cacheLine[0] + offset + 4 * 0);
-        Vec4 m1     = w01 * Vec4::load(cacheLine[0] + offset + 4 * 1);
-        Vec4 m2     = w02 * Vec4::load(cacheLine[0] + offset + 4 * 2);
-
-        m0 = m0 + w10 * Vec4::load(cacheLine[1] + offset + 4 * 0);
-        m1 = m1 + w11 * Vec4::load(cacheLine[1] + offset + 4 * 1);
-        m2 = m2 + w12 * Vec4::load(cacheLine[1] + offset + 4 * 2);
-
-        m0 = m0 + w20 * Vec4::load(cacheLine[2] + offset + 4 * 0);
-        m1 = m1 + w21 * Vec4::load(cacheLine[2] + offset + 4 * 1);
-        m2 = m2 + w22 * Vec4::load(cacheLine[2] + offset + 4 * 2);
-        auto o0 = m0 + m1 + m2 + biasF;
-        o0 = Vec4::min(maxF, o0);
-        o0 = Vec4::max(minF, o0);
-        Vec4::save(dest + 8 * unit + 0 * 4, o0);
-    }
-}
-void MNNConvDwF23SourceTransUnit(const float *source, float *dest, size_t unit) {
-    if (unit <= 0) {
-        return;
-    }
-    Vec4 v0 = Vec4::load(source + 4 * 0);
-    Vec4 v1 = Vec4::load(source + 4 * 1);
-    Vec4 v2;
-    Vec4 v3;
-    source += 8;
-
-    for (int x = 0; x < unit; ++x) {
-        v2 = Vec4::load(source + 0 * 4);
-        v3 = Vec4::load(source + 1 * 4);
-        auto m0 = v0 - v2;
-        auto m1 = v1 + v2;
-        auto m2 = v2 - v1;
-        auto m3 = v3 - v1;
-
-        Vec4::save(dest + 4 * 0, m0);
-        Vec4::save(dest + 4 * 1, m1);
-        Vec4::save(dest + 4 * 2, m2);
-        Vec4::save(dest + 4 * 3, m3);
-
-        source += 8;
-        dest += 16;
-
-        v0 = v2;
-        v1 = v3;
-    }
-}
 #endif
+}
+
+void MNNSiLuLowp(float* dst, const float* src, size_t dataSize) {
+    float offset[4] = {
+       -1.0f,
+        0.0f,
+        0.0f,
+        0.0f
+    };
+    MNNExp(dst, src, offset, dataSize);
+#ifdef __aarch64__
+    int dataC4 = static_cast<int32_t>(dataSize) / 4;
+    int remain = static_cast<int32_t>(dataSize) % 4;
+    float32x4_t one = vdupq_n_f32(1.0f);
+
+    if(dataC4 > 0) {
+        float32x4_t out = vld1q_f32(dst);
+        float32x4_t in = vld1q_f32(src);
+        // neon optimization for sigmid cpu
+        for (int i = 1; i < dataC4; ++i) {
+            out = vdivq_f32(in, vaddq_f32(one,out));
+            vst1q_f32(dst ,out);
+            dst += 4;
+            src += 4;
+            out = vld1q_f32(dst);
+            in = vld1q_f32(src);
+        }
+        out = vdivq_f32(in, vaddq_f32(one,out));
+        vst1q_f32(dst, out);
+        dst += 4;
+        src += 4;
+    }
+    if (remain > 0) {
+        float intmp[4] = {0};
+        float atmp[4] = {0};
+        ::memcpy(intmp, dst, remain * sizeof(float));
+        ::memcpy(atmp, src, remain * sizeof(float));
+        float32x4_t out = vld1q_f32(intmp);
+        float32x4_t in = vld1q_f32(atmp);
+        out = vdivq_f32(in, vaddq_f32(one, out));
+        vst1q_f32(intmp, out);
+        ::memcpy(dst, intmp, remain * sizeof(float));
+    }
+#else
+    for (int i = 0; i < dataSize; ++i) {
+        dst[i] = src[i] / (1.0f + dst[i]);
+    }
+#endif
+}
 
 static void _MNNAdjustOptimalSparseKernel(int& sparseBlockOC, MNN::CoreFunctions::MNNPackedSparseMatMul& packedSparseMatMul) {
     if(sparseBlockOC == 4) {
@@ -2756,27 +3149,137 @@ static void _MNNAdjustOptimalSparseKernel(int& sparseBlockOC, MNN::CoreFunctions
     }
 }
 
+// fp32 <--> fp8
+static const int FP32_EXP_BIAS = 127;
+static const int FP8_EXP_BIAS = 24;   // [0, 31] --> [-24, 7] --> [1 / 2^24, 2^7]
+void MNNFp32ToFp8(uint8_t* dst, const float* src, size_t size) {
+    for (int i = 0; i < size; i++) {
+        uint32_t rawData = *((uint32_t *)(&src[i]));
+        uint32_t sign = (rawData >> 31) & 1U;
+        uint32_t exp = (int)((rawData >> 23) & 0x0ffU);
+        uint32_t mant = (rawData >> 21) & 3U;
+        int realExp = (int)exp - FP32_EXP_BIAS;
+        realExp = ALIMAX(realExp,  0 - FP8_EXP_BIAS);
+        realExp = ALIMIN(realExp, 31 - FP8_EXP_BIAS);
+        exp = (uint32_t)(realExp + FP8_EXP_BIAS);
+        dst[i] = (int8_t)((sign << 7) | (exp << 2) | mant);
+    }
+}
+void MNNFp8ToFp32(float* dst, const uint8_t* src, size_t size) {
+    for (int i = 0; i < size; i++) {
+        uint32_t sign = (src[i] >> 7) & 1U;
+        uint32_t exp = (int)((src[i] >> 2) & 0x1fU);
+        uint32_t mant = (src[i] & 3U) << 21;
+        int realExp = (int)exp - FP8_EXP_BIAS;
+        exp = (uint32_t)(realExp + FP32_EXP_BIAS);
+        uint32_t rawData = (sign << 31) | (exp << 23) | mant;
+        dst[i] = *((float *)(&rawData));
+    }
+}
+// fp16 <--> fp8
+void MNNFp16ToFp8(uint8_t* dst, const uint16_t* src, size_t size) {
+#ifdef MNN_USE_NEON
+#ifdef __aarch64__
+    int loopN = size / 16;
+    for (int i = 0; i < loopN; i++) {
+        uint8x16_t v1 = vld1q_u8((uint8_t*)(src + i * 16));
+        uint8x16_t v2 = vld1q_u8((uint8_t*)(src + i * 16 + 8));
+        uint8x16_t res = vuzp2q_u8(v1, v2);
+        vst1q_u8(dst + i * 16, res);
+    }
+    for (int i = loopN * 16; i < size; i++) {
+        dst[i] = static_cast<int8_t>(src[i] >> 8);
+    }
+#else
+    int loopN = size / 8;
+    for (int i = 0; i < loopN; i++) {
+        uint16x8_t vec = vld1q_u16(src + i * 8);
+        uint8x8_t  res = vshrn_n_u16(vec, 8);
+        vst1_u8(dst + i * 8, res);
+    }
+    for (int i = loopN * 8; i < size; i++) {
+        dst[i] = static_cast<int8_t>(src[i] >> 8);
+    }
+#endif // ARM64
+#else
+    for (int i = 0; i < size; i++) {
+        dst[i] = static_cast<int8_t>(src[i] >> 8);
+    }
+#endif // USE_NEON
+}
+void MNNFp8ToFp16(uint16_t* dst, const uint8_t* src, size_t size) {
+#ifdef MNN_USE_NEON
+    int loopN = size / 8;
+    for (int i = 0; i < loopN; i++) {
+        uint8x8_t vec8x8 = vld1_u8(src + i * 8);
+        uint16x8_t vec16x8 = vshll_n_u8(vec8x8, 8);
+        vst1q_u16(dst + i * 8, vec16x8);
+    }
+    for (int i = loopN * 8; i < size; i++) {
+        dst[i] = static_cast<int16_t>(src[i]) << 8;
+    }
+#else
+    for (int i = 0; i < size; i++) {
+        dst[i] = static_cast<int16_t>(src[i]) << 8;
+    }
+#endif // USE_NEON
+}
+
+#ifdef MNN_LOW_MEMORY
+static void generalIm2col(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el, int LP, int pack) {
+    // LP >= pack
+    int number = info[0];
+    int eReal = info[1];
+    int eDest = info[2];
+    int offset = info[3];
+    for (int n=0; n<number; ++n) {
+        int e = el[4 * n + 0];
+        int l = el[4 * n + 1];
+        int eOffset = el[4 * n + 2];
+        int lOffset = el[4 * n + 3];
+        int lC = lOffset / LP;
+        int lR = lOffset % LP;
+        auto dest = destOrigin + eOffset * LP + lC * eDest * LP + lR;
+        auto source = sourceGroup[n];
+
+        for (int y=0; y<e; ++y) {
+            auto yR = y % eDest;
+            for (int x=0; x<l; ++x) {
+                auto xR = x % pack;
+                auto xC = x / pack;
+                auto xOut = x / LP;
+                auto xIn = x % LP;
+                dest[xOut * eDest * LP + yR * LP + xIn] = source[xC * eReal * pack + y * pack * offset + xR];
+            }
+        }
+    }
+}
+#endif
+
 namespace MNN {
 
 static CoreFunctions* gCoreFunction = nullptr;
 
 void MNNCoreFunctionInit() {
     gCoreFunction = new CoreFunctions;
+    // fp8
+    gCoreFunction->MNNFp32ToFp8 = MNNFp32ToFp8;
+    gCoreFunction->MNNFp16ToFp8 = MNNFp16ToFp8;
+    gCoreFunction->MNNFp8ToFp32 = MNNFp8ToFp32;
+    gCoreFunction->MNNFp8ToFp16 = MNNFp8ToFp16;
+
     // MatMul
     gCoreFunction->MNNGetMatMulPackMode = MNNGetMatMulPackMode;
     gCoreFunction->MNNPackC4ForMatMul_A = MNNPackC4ForMatMul_A;
     gCoreFunction->MNNPackForMatMul_B = MNNPackForMatMul_B;
     gCoreFunction->MNNPackedMatMul = MNNPackedMatMul;
     gCoreFunction->MNNPackedMatMulRemain = MNNPackedMatMulRemain;
-
+    gCoreFunction->MNNCountMaxMinValue = MNNCountMaxMinValue;
     gCoreFunction->MNNGetSparseMatMulPackMode = MNNGetSparseMatMulPackMode;
-    gCoreFunction->MNNPackForSparseMatMul_B = MNNPackForSparseMatMul_B; // sparse packing B
-    gCoreFunction->MNNGetOptimalBlockShape = MNNGetOptimalBlockShape;
     gCoreFunction->MNNAdjustOptimalSparseKernel = _MNNAdjustOptimalSparseKernel;
 
     gCoreFunction->MNNComputeMatMulForE_1 = MNNComputeMatMulForE_1;
     gCoreFunction->MNNComputeMatMulForH_1 = MNNComputeMatMulForH_1;
-
 
     // Lowp
     gCoreFunction->MNNFp32ToLowp = nullptr;
@@ -2801,10 +3304,6 @@ void MNNCoreFunctionInit() {
 
     gCoreFunction->MNNAxByClampBroadcastUnit = MNNAxByClampBroadcastUnit;
     gCoreFunction->MNNConvRunForLineDepthwise = MNNConvRunForLineDepthwise;
-    gCoreFunction->MNNConvRunForUnitDepthWise = MNNConvRunForUnitDepthWise;
-    gCoreFunction->MNNSourceTransformCommonF23 = MNNSourceTransformCommonF23;
-    gCoreFunction->MNNConvDwF23MulTransUnit = MNNConvDwF23MulTransUnit;
-    gCoreFunction->MNNMultiAndDestTransformCommon23 = MNNMultiAndDestTransformCommon23;
     gCoreFunction->MNNMatrixAdd = MNNMatrixAdd;
     gCoreFunction->MNNMatrixSub = MNNMatrixSub;
     gCoreFunction->MNNStrassenMergeCFunction = MNNStrassenMergeCFunction;
@@ -2812,6 +3311,7 @@ void MNNCoreFunctionInit() {
     gCoreFunction->MNNScaleAndAddBias = MNNScaleAndAddBias;
     gCoreFunction->MNNGridSampleComputeCord = MNNGridSampleComputeCord;
     gCoreFunction->MNNGridSampleInterp = MNNGridSampleInterp;
+    gCoreFunction->MNNGridSampleInterpGrad = MNNGridSampleInterpGrad;
     gCoreFunction->MNNGridSampleComputeCord3D = MNNGridSampleComputeCord3D;
     gCoreFunction->MNNGridSampleInterp3D = MNNGridSampleInterp3D;
     gCoreFunction->MNNRoiPoolingMax = MNNRoiPoolingMax;
@@ -2825,12 +3325,18 @@ void MNNCoreFunctionInit() {
     gCoreFunction->chooseWinoDestUnrollTransform = WinogradFunction::chooseWinoDestUnrollTransform;
     gCoreFunction->MNNDeconvRunForLineDepthwise = MNNDeconvRunForLineDepthwise;
     gCoreFunction->MNNDeconvRunForUnitDepthWise = MNNDeconvRunForUnitDepthWise;
+#ifdef MNN_USE_NEON
+    gCoreFunction->MNNDepthwiseConvFastKernel = MNNDepthwiseConvFastKernel;
+#endif
     gCoreFunction->MNNSelectBinaryFunctionForFloat = CPUBinary::selectForFloat;
     gCoreFunction->MNNSelectUnaryFunctionForFloat = CPUUnary::selectForFloat;
+    gCoreFunction->MNNSelectUnaryFunctionForInt8 = CPUUnary::selectForInt8;
     gCoreFunction->MNNReluWithSlopeChannel = MNNReluWithSlopeChannel;
     gCoreFunction->MNNPoolingAvg = (decltype(gCoreFunction->MNNPoolingAvg))(poolingAvg<float, Vec4, 4>);
     // Set min value as 1 << 24
     gCoreFunction->MNNPoolingMax = (decltype(gCoreFunction->MNNPoolingMax))(poolingMax<float, Vec4, 4, -16777216>);
+
+    gCoreFunction->MNNPoolingMaxWithRedice = (decltype(gCoreFunction->MNNPoolingMaxWithRedice))(poolingMaxWithRedice<float, -16777216>);
     // ImageProcess Functions
     gCoreFunction->MNNRGBAToBGRA = MNNRGBAToBGRA;
     gCoreFunction->MNNNV21ToRGBA = MNNNV21ToRGBA;
@@ -2840,12 +3346,45 @@ void MNNCoreFunctionInit() {
     gCoreFunction->MNNC1ToFloatC1 = MNNC1ToFloatC1;
     gCoreFunction->MNNC3ToFloatC3 = MNNC3ToFloatC3;
     gCoreFunction->MNNC3ToFloatRGBA = MNNC3ToFloatRGBA;
+    gCoreFunction->MNNSamplerC4Nearest = MNNSamplerC4Nearest;
+    gCoreFunction->MNNSamplerC4Bilinear = MNNSamplerC4Bilinear;
 
-#ifdef MNN_USE_ARMV82
-    cpuinfo_arm_isa gCPUInfo;
-    cpuinfo_arm_init(&gCPUInfo);
+    gCoreFunction->MNN4BitcopyWithStride = MNN4BitcopyWithStride;
+    gCoreFunction->MNN1BitcopyWithStride = MNN1BitcopyWithStride;
+    gCoreFunction->MNN2BitcopyWithStride = MNN2BitcopyWithStride;
+    gCoreFunction->MNN4BitcopyFast = MNN4BitcopyFast;
+    gCoreFunction->MNN2BitcopyFast = MNN2BitcopyFast;
+    gCoreFunction->MNN1BitcopyFast = MNN1BitCopyFast;
+
+    gCoreFunction->MNNAccumulateSequenceNumber = MNNAccumulateSequenceNumber;
+
+    const MNNCPUInfo& gCPUInfo = *MNNGetCPUInfo();
     gCoreFunction->supportFp16arith = gCPUInfo.fp16arith;
     gCoreFunction->supportSDot = gCPUInfo.dot;
+    gCoreFunction->supportI8mm = gCPUInfo.i8mm;
+    gCoreFunction->MNNSumByAxisLForMatmul_A = MNNSumByAxisLForMatmul_A;
+#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
+    // Weight Dequant Gemm Kernels
+    gCoreFunction->MNNPackedMatMul_int8 = MNNPackedMatMul_int8;
+    gCoreFunction->MNNPackedMatMulRemain_int8 = MNNPackedMatMulRemain_int8;
+#endif
+#ifdef MNN_LOW_MEMORY
+    // Dynamic Quant Helper Functions
+    gCoreFunction->MNNAbsMax = MNNAbsMaxFP32;
+    gCoreFunction->MNNDynamicQuant = MNNDynamicQuantFP32;
+    gCoreFunction->MNNQuantScale = MNNQuantScaleFP32;
+    gCoreFunction->MNNQuantSum = MNNQuantSumFP32;
+    // Dynamic Quan Bias
+    gCoreFunction->MNNDynamicUpdateConvBiasScale = MNNDynamicUpdateConvBiasScale;
+    gCoreFunction->MNNGeneralIm2Col = generalIm2col;
+#ifdef __aarch64__
+    if (gCoreFunction->supportSDot) {
+        gCoreFunction->MNNGeneralIm2Col = MNNGeneralIm2col_Fp32Arm82;
+    }
+    if (gCoreFunction->supportI8mm) {
+        gCoreFunction->MNNGeneralIm2Col = MNNGeneralIm2col_Fp32Arm86;
+    }
+#endif
 #endif
     MNNCoreInt8FunctionInit();
     MNNFunctionInit();
@@ -2868,4 +3407,56 @@ void MNNPackC4Origin(float* dst, const float* src, size_t area, size_t depth, in
         areaOffset,
     };
     MNNPackC4(dst, src, area, depth, offset);
+}
+
+void MNNPackC2(double* dst, const double* src, size_t area, size_t depth, int* areaOffset) {
+    MNNPackC2Common<double>(dst, src, area, depth, areaOffset);
+}
+
+void MNNUnpackC2(double* dst, const double* src, size_t area, size_t depth, int* areaOffset) {
+    MNNUnpackC2Common<double>(dst, src, area, depth, areaOffset);
+}
+
+void MNNUnpackC2Float(float* dst, const float* src, size_t area, size_t depth, int* areaOffset, int pack) {
+    MNNUnpackC2Common<float>(dst, src, area, depth, areaOffset, pack);
+}
+#ifndef __aarch64__
+void MNNPackInt8C2(float* dst, const float* src, size_t area, size_t depth, int* areaOffset) {
+    MNNPackC2Common<float>(dst, src, area, depth, areaOffset);
+}
+#endif
+
+void MNNUnpackInt8C2(float* dst, const float* src, size_t area, size_t depth, int* areaOffset) {
+    MNNUnpackC2Common<float>(dst, src, area, depth, areaOffset);
+}
+
+
+void MNNUnpackC2Origin(double* dst, const double* src, size_t area, size_t depth, int areaOffset) {
+    int offset[] = {
+        areaOffset,
+        areaOffset,
+    };
+    MNNUnpackC2(dst, src, area, depth, offset);
+}
+void MNNPackC2Origin(double* dst, const double* src, size_t area, size_t depth, int areaOffset) {
+    int offset[] = {
+        areaOffset,
+        areaOffset,
+    };
+    MNNPackC2(dst, src, area, depth, offset);
+}
+
+void MNNUnpackInt8C2Origin(float* dst, const float* src, size_t area, size_t depth, int areaOffset) {
+    int offset[] = {
+        areaOffset,
+        areaOffset,
+    };
+    MNNUnpackInt8C2(dst, src, area, depth, offset);
+}
+void MNNPackInt8C2Origin(float* dst, const float* src, size_t area, size_t depth, int areaOffset) {
+    int offset[] = {
+        areaOffset,
+        areaOffset,
+    };
+    MNNPackInt8C2(dst, src, area, depth, offset);
 }

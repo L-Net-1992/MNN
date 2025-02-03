@@ -15,7 +15,7 @@
 namespace MNN {
 namespace OpenCL {
 
-MultiInputDWConvExecution::MultiInputDWConvExecution(const MNN::Op *op, Backend *backend) : CommonExecution(backend) {
+MultiInputDWConvExecution::MultiInputDWConvExecution(const MNN::Op *op, Backend *backend) : CommonExecution(backend, op) {
     auto common = op->main_as_Convolution2D()->common();
     mPadMode = common->padMode();
     mStrides = {common->strideY(), common->strideX()};
@@ -25,14 +25,13 @@ MultiInputDWConvExecution::MultiInputDWConvExecution(const MNN::Op *op, Backend 
     }
     isRelu = common->relu();
     isRelu6 = common->relu6();
-    mOp = op;
 }
 
 MultiInputDWConvExecution::~MultiInputDWConvExecution() {
     // do nothing
 }
 
-ErrorCode MultiInputDWConvExecution::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+ErrorCode MultiInputDWConvExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     mUnits.clear();
     mUnits.resize(3);
 
@@ -82,24 +81,28 @@ ErrorCode MultiInputDWConvExecution::onResize(const std::vector<Tensor *> &input
         auto shape = tensorShapeFormat(inputs[1]);
         std::vector<uint32_t> gws = {static_cast<uint32_t>(shape[2] * UP_DIV(shape[3], 4)), static_cast<uint32_t>(shape[0] * shape[1])};
 
-        cl::Kernel kernel = runtime->buildKernel("buffer_to_image", kernelName, {});
-        kernel.setArg(0, gws[0]);
-        kernel.setArg(1, gws[1]);
-        kernel.setArg(2, *bufferPtr);
-        kernel.setArg(3, shape[1]);
-        kernel.setArg(4, shape[2]);
-        kernel.setArg(5, shape[3]);
-        kernel.setArg(6, openCLImage(inputs[1]));
+        auto kernelW = runtime->buildKernel("buffer_to_image", kernelName, {}, inputs[1], inputs[1]);
+        auto kernel = kernelW->get();
+        cl_int ret = CL_SUCCESS;
+        ret |= kernel.setArg(0, gws[0]);
+        ret |= kernel.setArg(1, gws[1]);
+        ret |= kernel.setArg(2, *bufferPtr);
+        ret |= kernel.setArg(3, shape[1]);
+        ret |= kernel.setArg(4, shape[2]);
+        ret |= kernel.setArg(5, shape[3]);
+        ret |= kernel.setArg(6, openCLImage(inputs[1]));
+        MNN_CHECK_CL_SUCCESS(ret, "setArg MultiInputDWConvExecution transform input");
 
-        const uint32_t maxWorkGroupSize = runtime->getMaxWorkGroupSize(kernel);
+        const uint32_t maxWorkGroupSize = runtime->getMaxWorkGroupSize(kernelW);
         std::vector<uint32_t> lws = {16, std::max((uint32_t)1, maxWorkGroupSize / 16)};
         for (size_t i = 0; i < lws.size(); ++i) {
             gws[i] = ROUND_UP(gws[i], lws[i]);
         }
 
-        mUnits[0].kernel = kernel;
+        mUnits[0].kernel = kernelW;
         mUnits[0].localWorkSize = {lws[0], lws[1]};
         mUnits[0].globalWorkSize = {gws[0], gws[1]};
+        openclBackend->recordKernel2d(mUnits[0].kernel, gws, lws);
     }
     
     
@@ -122,30 +125,33 @@ ErrorCode MultiInputDWConvExecution::onResize(const std::vector<Tensor *> &input
 
 
         std::set<std::string> buildOptions;
-        cl::Kernel kernel = runtime->buildKernel("buffer_to_image", kernelName, buildOptions);
+        auto kernelW = runtime->buildKernel("buffer_to_image", kernelName, buildOptions, buffer, image);
+        auto kernel = kernelW->get();
 
        uint32_t idx = 0;
-       kernel.setArg(idx++, gws[0]);
-       kernel.setArg(idx++, gws[1]);
-       kernel.setArg(idx++, openCLBuffer(buffer));
-
+       cl_int ret = CL_SUCCESS;
+       ret |= kernel.setArg(idx++, gws[0]);
+       ret |= kernel.setArg(idx++, gws[1]);
+       ret |= kernel.setArg(idx++, openCLBuffer(buffer));
 
        const int heightWidthSumSize = buffer->buffer().dim[2].extent * buffer->buffer().dim[3].extent;
        int kernelShape[4] = {buffer->buffer().dim[0].extent, buffer->buffer().dim[1].extent, buffer->buffer().dim[2].extent, buffer->buffer().dim[3].extent};
-       kernel.setArg(idx++, sizeof(kernelShape),kernelShape);
-       kernel.setArg(idx++, static_cast<uint32_t>(heightWidthSumSize));
-       kernel.setArg(idx++, openCLImage(image));
+       ret |= kernel.setArg(idx++, sizeof(kernelShape),kernelShape);
+       ret |= kernel.setArg(idx++, static_cast<uint32_t>(heightWidthSumSize));
+       ret |= kernel.setArg(idx++, openCLImage(image));
+       MNN_CHECK_CL_SUCCESS(ret, "setArg MultiInputDWConvExecution transform kernel");
+
     
-    
-        const uint32_t maxWorkGroupSize = runtime->getMaxWorkGroupSize(kernel);
+        const uint32_t maxWorkGroupSize = runtime->getMaxWorkGroupSize(kernelW);
         std::vector<uint32_t> lws = {16, std::max((uint32_t)1, maxWorkGroupSize / 16)};
         for (size_t i = 0; i < lws.size(); ++i) {
             gws[i] = ROUND_UP(gws[i], lws[i]);
         }
 
-        mUnits[1].kernel = kernel;
+        mUnits[1].kernel = kernelW;
         mUnits[1].localWorkSize = {lws[0], lws[1]};
         mUnits[1].globalWorkSize = {gws[0], gws[1]};
+        openclBackend->recordKernel2d(mUnits[1].kernel, {gws[0], gws[1]}, {lws[0], lws[1]});
     }
 
     {
@@ -191,29 +197,33 @@ ErrorCode MultiInputDWConvExecution::onResize(const std::vector<Tensor *> &input
             buildOptions.emplace("-DNO_BIAS");
         }
 
-        cl::Kernel kernel = runtime->buildKernel("depthwise_conv2d", kernelName, buildOptions);
-        
-        kernel.setArg(idx++, gws[0]);
-        kernel.setArg(idx++, gws[1]);
-        kernel.setArg(idx++, openCLImage(inputs[0]));
-        kernel.setArg(idx++, openCLImage(mFilter.get()));
+        auto kernelW = runtime->buildKernel("depthwise_conv2d", kernelName, buildOptions);
+        auto kernel = kernelW->get();
+        cl_int ret = CL_SUCCESS;
+        ret |= kernel.setArg(idx++, gws[0]);
+        ret |= kernel.setArg(idx++, gws[1]);
+        ret |= kernel.setArg(idx++, openCLImage(inputs[0]));
+        ret |= kernel.setArg(idx++, openCLImage(mFilter.get()));
         if (inputs.size() > 2) {
-            kernel.setArg(idx++, openCLImage(inputs[2]));
+            ret |= kernel.setArg(idx++, openCLImage(inputs[2]));
         }
-        kernel.setArg(idx++, openCLImage(outputs[0]));
-        kernel.setArg(idx++, sizeof(inputImageShape), inputImageShape);
-        kernel.setArg(idx++, static_cast<int>(inputChannelBlocks));
-        kernel.setArg(idx++, sizeof(outputImageShape), outputImageShape);
-        kernel.setArg(idx++, sizeof(kernelShape), kernelShape);
-        kernel.setArg(idx++, sizeof(paddingShape), paddingShape);
+        ret |= kernel.setArg(idx++, openCLImage(outputs[0]));
+        ret |= kernel.setArg(idx++, sizeof(inputImageShape), inputImageShape);
+        ret |= kernel.setArg(idx++, static_cast<int>(inputChannelBlocks));
+        ret |= kernel.setArg(idx++, sizeof(outputImageShape), outputImageShape);
+        ret |= kernel.setArg(idx++, sizeof(kernelShape), kernelShape);
+        ret |= kernel.setArg(idx++, sizeof(paddingShape), paddingShape);
         if (mStrides[0] != 1 || mStrides[1] != 1 || mDilations[0] != 1 || mDilations[1] != 1) {
-            kernel.setArg(idx++, sizeof(dilationShape), dilationShape);
-            kernel.setArg(idx++, sizeof(strideShape), strideShape);
+            ret |= kernel.setArg(idx++, sizeof(dilationShape), dilationShape);
+            ret |= kernel.setArg(idx++, sizeof(strideShape), strideShape);
         }
-        
-        mUnits[2].kernel = kernel;
+        MNN_CHECK_CL_SUCCESS(ret, "setArg MultiInputDWConvExecution");
+
+        mUnits[2].kernel = kernelW;
         mUnits[2].localWorkSize = {1, 1};
         mUnits[2].globalWorkSize = {gws[0], gws[1]};
+        
+        openclBackend->recordKernel2d(mUnits[2].kernel, gws, {1, 1});
     }
 
     return NO_ERROR;

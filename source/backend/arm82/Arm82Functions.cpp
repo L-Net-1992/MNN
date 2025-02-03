@@ -10,6 +10,13 @@
 #include "Arm82Relu.hpp"
 #include "backend/cpu/compute/CommonOptFunction.h"
 #include "backend/cpu/CPUPool.hpp"
+#include "backend/cpu/CPURuntime.hpp"
+
+#define FLOAT FLOAT16
+#define PACK 8
+using Vec = MNN::Math::Vec<FLOAT16, 8>;
+
+#include "backend/cpu/GridSampler.hpp"
 
 #if defined(MNN_USE_NEON)
 #include <arm_neon.h>
@@ -26,17 +33,36 @@ void MNNPackedMatMulFP16(float* C, const float* A, const float* B, const size_t*
 
 // C(UP_DIV(h,8), e, h8) = B(UP_DIV(h,hP), l, hP) * A(l, e), hP = 24, e >= 1
 // parameter: [aStride, l, h, cStride, bExtraStride]
-void MNNPackedMatMulRemainFP16(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias);
+void MNNPackedMatMulRemainFP16(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 
-void MNNConvDwF23MulTransUnitFP16(FLOAT16 **cacheLine, const FLOAT16 *weight, FLOAT16 *dest, size_t ow);
+#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
+void MNNPackedMatMulFP16_int4(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
+void MNNPackedMatMulRemainFP16_int4(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
+void MNNPackedMatMulFP16_int8(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
+void MNNPackedMatMulRemainFP16_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
+#endif
 
-void MNNConvDwF23SourceTransUnitFP16(const FLOAT16 *source, FLOAT16 *dest, size_t unit);
+#ifdef MNN_LOW_MEMORY
+void MNNAbsMaxFP16_Pack8(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack);
+void MNNAbsMaxFP16_Pack4(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack);
+void MNNQuantScaleFP16(float* sum, float* absmax, float* quant_scale, float* dequant_scale, size_t thread, size_t batch);
+void MNNDynamicQuantFP16_Pack8(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack);
+void MNNDynamicQuantFP16_Pack4(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack);
+void MNNQuantSumFP16(float* sum, const float* dequant_scale, size_t thread, size_t batch);
+void MNNGeneralIm2col_Arm82(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el, int32_t LP, int32_t pack);
+void MNNGeneralIm2col_Arm86(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el, int32_t LP, int32_t pack);
+#endif
+#if defined(__aarch64__)
+void CountMinMaxValue_FP16(float* source, float* minVal, float* maxVal, size_t sizeQuad);
+void MNNDepthwiseConvFastKernelFP16(float* dst, const float* src, const float* weight, size_t width, size_t src_w_setup,
+                                    size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, size_t height,
+                                    size_t srcHStep, size_t dstHStep, const float* bias, const float* parameters);
+#endif
 
 void MNNConvRunForLineDepthwiseFP16(float* dst, const float* src, const float* weight, size_t width, size_t src_w_setup,
                                 size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, size_t height, size_t srcHStep, size_t dstHStep);
 }
 
-using Vec = MNN::Math::Vec<FLOAT16, 8>;
 
 namespace MNN {
 
@@ -58,6 +84,32 @@ static void MNNMatrixSubFP16(FLOAT16* C, const FLOAT16* A, const FLOAT16* B, siz
         }
     }
 }
+#if defined(__aarch64__)
+static void ARM82CountMinMaxValue(float* source, float* minVal, float* maxVal, size_t size) {
+    if (size % 8 == 0) {
+        CountMinMaxValue_FP16(source, minVal, maxVal, size / 8);
+    } else {
+        auto remain = size - 8 * (size / 8);
+        auto max_ = ((__fp16*)source)[0];
+        auto min_ = max_;
+        if (size >= 8) {
+            CountMinMaxValue_FP16(source, minVal, maxVal, size / 8);
+            max_ = ((__fp16*)maxVal)[0];
+            min_ = ((__fp16*)minVal)[0];
+        }
+        if (remain > 0) {
+            int16_t tmp[8] = {0};
+            auto srcRemain = reinterpret_cast<uint8_t*>(source) + 8 * (size / 8) * 2;
+            ::memcpy(tmp, srcRemain, remain * 2);
+            CountMinMaxValue_FP16((float*)tmp, (float*)tmp, (float*)((uint8_t*)tmp + 2), 1);
+            max_ = ALIMAX(((__fp16*)tmp)[1], max_);
+            min_ = ALIMIN(((__fp16*)tmp)[0], min_);
+        }
+        reinterpret_cast<__fp16*>(minVal)[0] = min_;
+        reinterpret_cast<__fp16*>(maxVal)[0] = max_;
+    }
+}
+#endif
 
 static void Arm82MNNPackForMatMul_B(float* destC, const float* sourceC, size_t h, size_t l, bool transpose) {
     auto dest = (int16_t*)destC;
@@ -132,87 +184,60 @@ static void MNNGridSampleComputeCordFP16(FLOAT16* dst, const FLOAT16* src, size_
         src += 16;
         dst += 16;
     }
+    if (areaRemain == 0) {
+        return;
+    }
 
     // areaRemain
-    int areaLack = 8 - areaRemain;
-    auto cordH = vld2q_f16(src - areaLack * 2); // use data of the last pack to fill the vacancy.
+    FLOAT16 tempDst[16];
+    ::memcpy(tempDst, src, areaRemain * 2 * sizeof(int16_t));
+    auto cordH = vld2q_f16(tempDst);
     cordH.val[0] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[0]), inW_sub_a), b));
     cordH.val[1] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[1]), inH_sub_a), b));
-    if (src != dst) {
-        vst2q_f16(dst - areaLack * 2, cordH);
-    } else {
-        auto tmp = vld1q_f16_x2(dst - 16); // store data of the last pack to avoid covering.
-        vst2q_f16(dst - areaLack * 2, cordH);
-        vst1q_f16_x2(dst - 16, tmp);
-    }
+    vst2q_f16(tempDst, cordH);
+    ::memcpy(dst, tempDst, areaRemain * 2 * sizeof(int16_t));
 }
 
-static size_t MNNGridSampleComputeOffsetFP16(int h, int w, int height, int width, bool padMode) {
-    if (padMode == true) { //padMode == BorderMode_ZEROS
-        if (h < 0 || h >= height || w < 0 || w >= width) {
-            return -1;
-        }
-    } else {
-        // Clearly, CLAMP is the right way to go for GridSamplePaddingMode_BORDER
-        // For GridSamplePaddingMode_REFLECTION, since we have reflected the values into (-1, 1),
-        // the leftover reflections degrade to GridSamplePaddingMode_BORDER
-        h = h < 0 ? 0 : (h > (height - 1) ? (height - 1) : h);
-        w = w < 0 ? 0 : (w > (width - 1) ? (width - 1) : w);
+static void MNNGridSampleComputeCord3DFp16(FLOAT* dst, const FLOAT* src, size_t inD, size_t inH, size_t inW, size_t outD, size_t outH, size_t outW, size_t strideD, size_t strideH, bool alignCorners) {
+    float16x8_t zero = vdupq_n_f16(0);
+    float16x8_t one = vdupq_n_f16(1);
+    float16x8_t half = vdupq_n_f16(0.5f);
+    float16x8_t a = alignCorners ? one : zero;
+    float16x8_t b = alignCorners ? zero : one;
+    float16x8_t inW_sub_a = vsubq_f16(vdupq_n_f16(inW), a);
+    float16x8_t inH_sub_a = vsubq_f16(vdupq_n_f16(inH), a);
+    float16x8_t inD_sub_a = vsubq_f16(vdupq_n_f16(inD), a);
+    size_t area = outH * outW * outD;
+    size_t areaC8 = area / 8;
+    size_t areaRemain = area - areaC8 * 8;
+
+    for (int i = 0; i < areaC8; ++i) {
+        auto cordH = vld3q_f16(src);
+        // float16x8_t x = cordH.val[0];
+        // float16x8_t y = cordH.val[1];
+        cordH.val[0] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[0]), inW_sub_a), b));
+        cordH.val[1] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[1]), inH_sub_a), b));
+        cordH.val[2] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[2]), inD_sub_a), b));
+        vst3q_f16(dst, cordH);
+        src += 24;
+        dst += 24;
     }
-    return h * width * 8 + w * 8;
-}
-
-static void MNNGridSampleInterpFP16(FLOAT16* outputPtr, const FLOAT16* inputPtr, const FLOAT16* cordPtr, size_t inH, size_t inW, size_t outW, size_t channelCUnit, size_t inOffset, size_t outOffset, bool sampleMode, bool padMode) {
-    for (auto ow = 0; ow < outW; ++ow) {
-        auto w_fp16 = cordPtr[2 * ow + 0];
-        auto h_fp16 = cordPtr[2 * ow + 1];
-        float w = (float)(w_fp16);
-        float h = (float)(h_fp16);
-        Vec interp;
-
-        if (sampleMode == true) { //sampleMode == SampleMode_NEAREST
-            int nh = ::floor(h + 0.5f);
-            int nw = ::floor(w + 0.5f);
-            size_t ns = MNNGridSampleComputeOffsetFP16(nh, nw, inH, inW, padMode);
-            for (int k = 0; k < channelCUnit; ++k) {
-                interp = ns == -1 ? Vec(0.f) : Vec::load(inputPtr + k * inOffset + ns);
-                Vec::save(outputPtr + k * outOffset + 8 * ow, interp);
-            }
-        } else { //sampleMode == GridSampleMode_BILINEAR
-            int w0_h = ::floor(h);
-            int w0_w = ::floor(w);
-            int w1_h = ::ceil(h);
-            int w1_w = ::ceil(w);
-            auto oneV = Vec((FLOAT16)1);
-
-            auto f0 = Vec((FLOAT16)w1_w - w_fp16);
-            auto f1 = oneV - f0;
-            auto h0 = Vec((FLOAT16)w1_h - h_fp16);
-            auto h1 = oneV - h0;
-
-            size_t s00 = MNNGridSampleComputeOffsetFP16(w0_h, w0_w, inH, inW, padMode);
-            size_t s01 = MNNGridSampleComputeOffsetFP16(w0_h, w1_w, inH, inW, padMode);
-            size_t s10 = MNNGridSampleComputeOffsetFP16(w1_h, w0_w, inH, inW, padMode);
-            size_t s11 = MNNGridSampleComputeOffsetFP16(w1_h, w1_w, inH, inW, padMode);
-
-            for (int k = 0; k < channelCUnit; ++k) {
-                Vec i00 = s00 == -1 ? Vec(0.f) : Vec::load(inputPtr + k * inOffset + s00);
-                Vec i01 = s01 == -1 ? Vec(0.f) : Vec::load(inputPtr + k * inOffset + s01);
-                Vec i10 = s10 == -1 ? Vec(0.f) : Vec::load(inputPtr + k * inOffset + s10);
-                Vec i11 = s11 == -1 ? Vec(0.f) : Vec::load(inputPtr + k * inOffset + s11);
-
-                Vec i0 = i00 * f0 + i01 * f1;
-                Vec i1 = i10 * f0 + i11 * f1;
-
-                interp = i0 * h0 + i1 * h1;
-                Vec::save(outputPtr + k * outOffset + 8 * ow, interp);
-            }
-        }
+    if (areaRemain == 0) {
+        return;
     }
-}
 
+    // areaRemain
+    FLOAT16 tempDst[24];
+    ::memcpy(tempDst, src, areaRemain * 3 * sizeof(int16_t));
+    auto cordH = vld3q_f16(tempDst);
+    cordH.val[0] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[0]), inW_sub_a), b));
+    cordH.val[1] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[1]), inH_sub_a), b));
+    cordH.val[2] = vmulq_f16(half, vsubq_f16(vmulq_f16(vaddq_f16(one, cordH.val[2]), inD_sub_a), b));
+    vst3q_f16(tempDst, cordH);
+    ::memcpy(dst, tempDst, areaRemain * 3 * sizeof(int16_t));
+}
 static void MNNRoiPoolingMaxFP16(FLOAT16* dst, const FLOAT16* src, int hLen, int wLen, int iw) {
-    Vec max = Vec(-__FLT16_MAX__);
+    Vec max = Vec(-65504.0f);
     for (int h = 0; h < hLen; h++, src += iw * 8) {
         for (int w = 0; w < wLen; w++) {
             Vec in = Vec::load(src + w * 8);
@@ -223,10 +248,10 @@ static void MNNRoiPoolingMaxFP16(FLOAT16* dst, const FLOAT16* src, int hLen, int
 }
 
 static void MNNRoiAlignMaxFP16(FLOAT16* dst, const FLOAT16* src, const std::vector<std::vector<int>> &vecPos, const std::vector<std::vector<float>> &vecArea, int samplingRatioArea, int pooledHeight, int pooledWidth) {
-    for (int h = 0; h < pooledHeight; ++h, dst += pooledHeight * 8) {
+    for (int h = 0; h < pooledHeight; ++h, dst += pooledWidth * 8) {
         int preCalcIdx = h * pooledWidth * samplingRatioArea;
         for (int w = 0; w < pooledWidth; ++w) {
-            Vec res = Vec(-__FLT16_MAX__);
+            Vec res = Vec(-65504.0f);
             for (int i = 0; i < samplingRatioArea; ++i) {
                 const std::vector<int>& pos    = vecPos[preCalcIdx];
                 const std::vector<float>& area = vecArea[preCalcIdx];
@@ -249,7 +274,7 @@ static void MNNRoiAlignMaxFP16(FLOAT16* dst, const FLOAT16* src, const std::vect
 
 static void MNNRoiAlignAvgFP16(FLOAT16* dst, const FLOAT16* src, const std::vector<std::vector<int>> &vecPos, const std::vector<std::vector<float>> &vecArea, int samplingRatioArea, int pooledHeight, int pooledWidth) {
     float invSamplingCnt = 1.f / samplingRatioArea;
-    for (int h = 0; h < pooledHeight; ++h, dst += pooledHeight * 8) {
+    for (int h = 0; h < pooledHeight; ++h, dst += pooledWidth * 8) {
         int preCalcIdx = h * pooledWidth * samplingRatioArea;
         for (int w = 0; w < pooledWidth; ++w) {
             Vec res = Vec(0.f);
@@ -312,94 +337,6 @@ static void MNNAxByClampBroadcastC8FP16(float* CF, const float* AF, const float*
             cv = Vec::max(cv, minF);
             Vec::save(c + 8 * x, cv);
         }
-    }
-}
-
-void ARM82MultiAndDestTransformCommon(FLOAT16 **cacheLine, const FLOAT16 *weight, FLOAT16 *dest, int cacheLineSize, int ow, const float* bias, const float* parameters) {
-    constexpr int pack = 8;
-    int unit = ow / 2;
-    auto biasF = Vec::load((const float16_t*)bias);
-    auto minF = Vec(parameters[2]);
-    auto maxF = Vec(parameters[3]);
-    MNN_ASSERT(cacheLineSize >= 1);
-    for (int x = 0; x < unit; ++x) {
-        int offset = 4 * pack * x, i = 0;
-        Vec m0 = Vec::load(weight + i * 4 * pack) * Vec::load(cacheLine[i] + offset);
-        Vec m1 = Vec::load(weight + (i * 4 + 1) * pack) * Vec::load(cacheLine[i] + offset + pack * 1);
-        Vec m2 = Vec::load(weight + (i * 4 + 2) * pack) * Vec::load(cacheLine[i] + offset + pack * 2);
-        Vec m3 = Vec::load(weight + (i * 4 + 3) * pack) * Vec::load(cacheLine[i] + offset + pack * 3);
-        for (i = 1; i < cacheLineSize; ++i) {
-            m0 = m0 + Vec::load(weight + i * 4 * pack) * Vec::load(cacheLine[i] + offset);
-            m1 = m1 + Vec::load(weight + (i * 4 + 1) * pack) * Vec::load(cacheLine[i] + offset + pack * 1);
-            m2 = m2 + Vec::load(weight + (i * 4 + 2) * pack) * Vec::load(cacheLine[i] + offset + pack * 2);
-            m3 = m3 + Vec::load(weight + (i * 4 + 3) * pack) * Vec::load(cacheLine[i] + offset + pack * 3);
-        }
-        auto o0 = m0 + m1 + m2 + biasF;
-        auto o1 = m1 - m2 + m3 + biasF;
-        o0 = Vec::min(maxF, o0);
-        o1 = Vec::min(maxF, o1);
-        o0 = Vec::max(minF, o0);
-        o1 = Vec::max(minF, o1);
-        Vec::save(dest + (2 * x + 0) * pack, o0);
-        Vec::save(dest + (2 * x + 1) * pack, o1);
-    }
-    if (unit * 2 < ow) {
-        int offset = 4 * pack * unit, i = 0;
-        Vec m0 = Vec::load(weight + i * 4 * pack) * Vec::load(cacheLine[i] + offset);
-        Vec m1 = Vec::load(weight + (i * 4 + 1) * pack) * Vec::load(cacheLine[i] + offset + pack);
-        Vec m2 = Vec::load(weight + (i * 4 + 2) * pack) * Vec::load(cacheLine[i] + offset + pack * 2);
-        for (i = 1; i < cacheLineSize; ++i) {
-            m0 = m0 + Vec::load(weight + i * 4 * pack) * Vec::load(cacheLine[i] + offset);
-            m1 = m1 + Vec::load(weight + (i * 4 + 1) * pack) * Vec::load(cacheLine[i] + offset + pack);
-            m2 = m2 + Vec::load(weight + (i * 4 + 2) * pack) * Vec::load(cacheLine[i] + offset + pack * 2);
-        }
-        auto o0 = m0 + m1 + m2 + biasF;
-        o0 = Vec::min(maxF, o0);
-        o0 = Vec::max(minF, o0);
-        Vec::save(dest + 2 * unit * pack, o0);
-    }
-}
-// unit: winograd unit (output is w/2)
-void ARM82SourceTransformCommon(const FLOAT16 *source, FLOAT16 *dest, int unit, int iw, int pad, int su, int eu) {
-    constexpr int pack = 8; // float16x8
-    for (int x = 0; x < su; ++x) {
-        auto dstX = dest + 4 * pack * x;
-        auto sx   = x * 2 - (int)pad;
-        auto ex   = sx + 4;
-        auto clampSx = std::max(sx, 0);
-        auto clampEx = std::min(ex, (int)iw);
-        Vec v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = clampSx; i < clampEx; ++i) {
-            v[i - sx] = Vec::load(source + pack * i);
-        }
-        auto m0 = v[0] - v[2];
-        auto m1 = v[1] + v[2];
-        auto m2 = v[2] - v[1];
-        auto m3 = v[3] - v[1];
-        Vec::save(dstX + pack * 0, m0);
-        Vec::save(dstX + pack * 1, m1);
-        Vec::save(dstX + pack * 2, m2);
-        Vec::save(dstX + pack * 3, m3);
-    }
-    MNNConvDwF23SourceTransUnitFP16(source + pack * (su * 2 - pad), dest + 4 * pack * su, eu - su);
-    for (int x = eu; x < unit; ++x) {
-        auto dstX = dest + 4 * pack * x;
-        auto sx   = x * 2 - (int)pad;
-        auto ex   = sx + 4;
-        auto clampSx = std::max(sx, 0);
-        auto clampEx = std::min(ex, (int)iw);
-        Vec v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = clampSx; i < clampEx; ++i) {
-            v[i - sx] = Vec::load(source + pack * i);
-        }
-        auto m0 = v[0] - v[2];
-        auto m1 = v[1] + v[2];
-        auto m2 = v[2] - v[1];
-        auto m3 = v[3] - v[1];
-        Vec::save(dstX + pack * 0, m0);
-        Vec::save(dstX + pack * 1, m1);
-        Vec::save(dstX + pack * 2, m2);
-        Vec::save(dstX + pack * 3, m3);
     }
 }
 
@@ -493,24 +430,6 @@ void MNNPackTransposeInt16C8(int16_t* dst, const int16_t* src, size_t area, size
             dstHeight[ci] = srcHeight[ci];
         }
     }
-}
-
-static void MNNConvRunForUnitDepthWiseFP16(float* dst, const float* src, const float* weight, size_t fw, size_t fh,
-                                           size_t weight_y_step, size_t dilateX_step, size_t dilateY_step) {
-    int fx, fy;
-    Vec dstValue(0.0f);
-    auto src_z    = (const FLOAT16*)src;
-    auto weight_z = (const FLOAT16*)weight;
-    for (fy = 0; fy < fh; ++fy) {
-        auto src_y    = src_z + fy * dilateY_step;
-        auto weight_y = weight_z + fy * weight_y_step;
-        for (fx = 0; fx < fw; ++fx) {
-            auto weight_x = weight_y + 8 * fx;
-            auto src_x    = src_y + fx * dilateX_step;
-            dstValue = dstValue + Vec::load(src_x) * Vec::load(weight_x);
-        }
-    }
-    Vec::save((FLOAT16*)dst, dstValue);
 }
 
 static void _MNNDeconvRunForUnitDepthWise(const FLOAT16* dst, FLOAT16* src, const FLOAT16* weight, size_t fw, size_t fh,
@@ -611,7 +530,7 @@ static void _MNNComputeMatMulForE_1_FP16(const float* AF, const float* BF, float
             Vec sumValue = Vec(0.0f);
             auto by = B + y * l;
             for (int x=0; x<lC4; ++x) {
-                sumValue = sumValue + Vec::load(A + x * 8) * Vec::load(by + x * 8);
+                sumValue = Vec::fma(sumValue, Vec::load(A + x * 8), Vec::load(by + x * 8));
             }
             if (lR > 0) {
                 FLOAT16 AR[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -629,7 +548,36 @@ static void _MNNComputeMatMulForE_1_FP16(const float* AF, const float* BF, float
     } else {
         auto hC4 = h / 8;
         auto hR = h % 8;
-        for (int y=tId; y<hC4; y+=numberThread) {
+        auto hC16 = hC4 / 4;
+        auto hC4R = hC4 % 4;
+        for (int y=tId; y<hC16; y+=numberThread) {
+            auto biasP = biasPtr + 8 * 4 * y;
+            auto bs = B + 8 * 4 * y;
+            Vec s0 = Vec(0.0f);
+            Vec s1 = Vec(0.0f);
+            Vec s2 = Vec(0.0f);
+            Vec s3 = Vec(0.0f);
+            if (biasPtr != nullptr) {
+                s0 = Vec::load(biasP + 8 * 0);
+                s1 = Vec::load(biasP + 8 * 1);
+                s2 = Vec::load(biasP + 8 * 2);
+                s3 = Vec::load(biasP + 8 * 3);
+            }
+            auto srcY = A + y * l * 8 * 4;
+            for (int x=0; x<l; ++x) {
+                auto a = Vec(A[x]);
+                s0 = Vec::fma(s0, a, Vec::load(bs + h * x + 0 * 8));
+                s1 = Vec::fma(s1, a, Vec::load(bs + h * x + 1 * 8));
+                s2 = Vec::fma(s2, a, Vec::load(bs + h * x + 2 * 8));
+                s3 = Vec::fma(s3, a, Vec::load(bs + h * x + 3 * 8));
+            }
+            Vec::save(C + 4 * 8 * y + 8 * 0, s0);
+            Vec::save(C + 4 * 8 * y + 8 * 1, s1);
+            Vec::save(C + 4 * 8 * y + 8 * 2, s2);
+            Vec::save(C + 4 * 8 * y + 8 * 3, s3);
+        }
+
+        for (int y=hC16*4+tId; y<hC4; y+=numberThread) {
             auto bs = B + 8 * y;
             Vec sumValue = Vec(0.0f);
             if (biasPtr != nullptr) {
@@ -637,7 +585,7 @@ static void _MNNComputeMatMulForE_1_FP16(const float* AF, const float* BF, float
             }
             auto srcY = A + y * l * 8;
             for (int x=0; x<l; ++x) {
-                sumValue = sumValue + Vec(A[x]) * Vec::load(bs + h * x);
+                sumValue = Vec::fma(sumValue, Vec(A[x]), Vec::load(bs + h * x));
             }
             Vec::save(C + 8 * y, sumValue);
         }
@@ -662,12 +610,278 @@ static void _MNNComputeMatMulForE_1_FP16(const float* AF, const float* BF, float
     }
 }
 
+template<int EP, int LP>
+static void _Arm82MNNPackC4ForMatMul_A(int8_t* destOrigin, int8_t const** sourceGroup, const int32_t* info, const int32_t* el) {
+    const int pack = 8;
+    int number = info[0];
+    int eReal = info[1];
+    int xStride = info[3];
+    int xS4 = xStride * pack / sizeof(int32_t);
+    int PUNIT = pack / LP;
+    int FLOATPACK = pack / sizeof(int32_t);
+    int eOutsideStride = info[2] / sizeof(int32_t);
+    int eDest = EP;
+    int realDstCount = info[4];
+    for (int n=0; n<number; ++n) {
+        int e = el[4 * n + 0];
+        int l = el[4 * n + 1];
+        int eOffset = el[4 * n + 2];
+        int lOffset = el[4 * n + 3];
+        int eC = eOffset / EP;
+        int eR = eOffset % EP;
+        int eS = eDest - eR;
+        bool lastBag = false;
+        int eOutsideStride4LastBag = eOutsideStride;
+        if (realDstCount % EP > 0) {
+            int jobsE = realDstCount - eOffset - e;
+            if (jobsE == 0 || (jobsE < (realDstCount % EP))) {
+                lastBag = true;
+            }
+        }
+        auto source = (int32_t*)sourceGroup[n];
+        auto dest = (int32_t*)(destOrigin + eC * info[2] + eR * LP + lOffset * EP);
+        //printf("e=%d, l=%d, eOffset=%d, lOffset=%d, eDest=%d\n", e, l, eOffset, lOffset, eDest);
+        l = l / 4; // Use float instead of int8 * 4
+        if (lastBag && e + eR < EP) {
+            int elast = ALIMAX(eR + e, realDstCount % EP);
+            dest = (int32_t*)(destOrigin + lOffset * elast + eC * info[2] + eR * LP);
+        }
+        int offsetLC = lOffset / 4;
+        for (int x = 0; x < l; ++x) {
+            int eRemain = e;
+            auto xR                  = x % PUNIT;
+            auto xC                  = x / PUNIT;
+            auto d = dest;
+            auto s = source + xC * eReal * FLOATPACK + xR;
+            if (eR > 0) {
+                int eStep = ALIMIN(eRemain, eS);
+                for (int yi=0; yi<eStep; ++yi) {
+                    d[yi] = s[yi * xS4];
+                }
+                eRemain-=eStep;
+                if (!lastBag ||eRemain >= EP) {
+                    d += (eOutsideStride - eR);
+                } else {
+                    int eFill = ALIMAX(eRemain, realDstCount % EP); // maybe padding>0
+                    eOutsideStride4LastBag = eOutsideStride - (EP * 4 * offsetLC / sizeof(float));
+                    d += (eOutsideStride4LastBag - eR + offsetLC * eFill);
+                }
+                s += eS * xS4;
+            }
+            while (eRemain > 0) {
+                int eStep = ALIMIN(eDest, eRemain);
+                for (int yi=0; yi<eStep; ++yi) {
+                    d[yi] = s[yi * xS4];
+                }
+                eRemain-=eStep;
+                if (!lastBag || eRemain >= EP) {
+                    d+= eOutsideStride;
+                } else {
+                    int eFill = ALIMAX(eRemain, realDstCount % EP); // maybe padding>0
+                    eOutsideStride4LastBag = eOutsideStride - (EP * 4 * offsetLC / sizeof(float));
+                    d+= (eOutsideStride4LastBag + offsetLC * eFill);
+                }
+                s+= eStep * xS4;
+            }
+            if (lastBag && e + eR < EP) {
+                int efill = ALIMAX(e + eR, realDstCount % EP);
+                dest += efill;
+            } else {
+                dest += eDest;
+            }
+            offsetLC++;
+        }
+    }
+}
+
+template<int EP, int HP>
+static void _ArmBasicMNNPackC4ForMatMul_A_L8(int8_t* destOrigin, int8_t const** sourceGroup, const int32_t* info, const int32_t* el) {
+    int number = info[0];
+    int eReal = info[1];
+    int eDest = EP;
+    int offset = info[3];
+    const int LP = 8;
+    int eOutsideStride = info[2] / sizeof(int64_t);
+    int realDstCount = info[4];
+    for (int n=0; n<number; ++n) {
+        int e = el[4 * n + 0];
+        int l = el[4 * n + 1];
+        int eOffset = el[4 * n + 2];
+        int lOffset = el[4 * n + 3];
+        int eC = eOffset / EP;
+        int eR = eOffset % EP;
+        int eS = eDest - eR;
+        bool lastBag = false;
+        int eOutsideStride4LastBag = eOutsideStride;
+        int eres = realDstCount - eOffset;
+        if (realDstCount % EP > 0) {
+            int jobsE = realDstCount - eOffset - e;
+            if (jobsE == 0 || (jobsE < (realDstCount % EP))) {
+                lastBag = true;
+            }
+        }
+        auto dest = (int64_t*)(destOrigin + lOffset * eDest + eC * info[2] + eR * LP);
+        auto source = (int64_t*)sourceGroup[n];
+        int lRemain = l / LP;
+        if (lastBag && e + eR < EP) {
+            int elast = ALIMIN(ALIMAX(eR + e, realDstCount % EP), EP);
+            dest = (int64_t*)(destOrigin + lOffset * elast + eC * info[2] + eR * LP);
+        }
+        int offsetLC = lOffset / LP;
+        for (int x = 0; x < lRemain; ++x) {
+            int eRemain = e;
+            auto d = dest;
+            auto s = source;
+            if (1 == offset) {
+                if (eR > 0) {
+                    int eStep = ALIMIN(eRemain, eS);
+                    ::memcpy(d, s, eStep * sizeof(int64_t));
+                    eRemain-=eStep;
+                    if (!lastBag ||eRemain >= EP) {
+                        d += (eOutsideStride - eR);
+                    } else {
+                        int eFill = ALIMAX(eRemain, realDstCount % EP); // maybe padding>0
+                        eOutsideStride4LastBag = eOutsideStride - (EP * offsetLC);
+                        d += (eOutsideStride4LastBag - eR + offsetLC * eFill);
+                    }
+                    s += (eS * offset);
+                }
+                while (eRemain > 0) {
+                    int eStep = ALIMIN(eDest, eRemain);
+                    ::memcpy(d, s, eStep * sizeof(int64_t));
+                    eRemain-=eStep;
+                    if (!lastBag || eRemain >= EP) {
+                        d+= eOutsideStride;
+                    } else {
+                        int eFill = ALIMAX(eRemain, realDstCount % EP); // maybe padding>0
+                        eOutsideStride4LastBag = eOutsideStride - (EP * offsetLC);
+                        d+= (eOutsideStride4LastBag + offsetLC * eFill);
+                    }
+                    s+= (eStep * offset);
+                }
+            } else {
+                if (eR > 0) {
+                    int eStep = ALIMIN(eRemain, eS);
+                    for (int yi=0; yi<eStep; ++yi) {
+                        d[yi] = s[yi * offset];
+                    }
+                    eRemain-=eStep;
+                    if (!lastBag ||eRemain >= EP) {
+                        d += (eOutsideStride - eR);
+                    } else {
+                        int eFill = ALIMAX(eRemain, realDstCount % EP); // maybe padding>0
+                        eOutsideStride4LastBag = eOutsideStride - (EP * offsetLC);
+                        d += (eOutsideStride4LastBag - eR + offsetLC * eFill);
+                    }
+                    s += eS * offset;
+                }
+                while (eRemain > 0) {
+                    int eStep = ALIMIN(eDest, eRemain);
+                    for (int yi=0; yi<eStep; ++yi) {
+                        d[yi] = s[yi * offset];
+                    }
+                    eRemain-=eStep;
+                    if (!lastBag || eRemain >= EP) {
+                        d+= eOutsideStride;
+                    } else {
+                        int eFill = ALIMAX(eRemain, realDstCount % EP); // maybe padding>0
+                        eOutsideStride4LastBag = eOutsideStride - (EP * offsetLC);
+                        d+= (eOutsideStride4LastBag + offsetLC * eFill);
+                    }
+                    s+= eStep * offset;
+                }
+            }
+            source += eReal;
+            if (lastBag && e + eR < EP ) { // eR=0;eR>0
+                int efill = ALIMAX(e + eR, realDstCount % EP);
+                dest += efill;
+            } else {
+                dest += eDest;
+            }
+            offsetLC++;
+        }
+    }
+}
+
+#ifdef MNN_LOW_MEMORY
+void MNNAbsMaxFP16(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) {
+    if (pack == 4) {
+        MNNAbsMaxFP16_Pack4(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+    if (pack == 8) {
+        MNNAbsMaxFP16_Pack8(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+    // source: (src_depth_quad, realSize, pack)
+    auto srcStep = pack * realSize;
+    auto srcPtr = (FLOAT16*)source;
+    auto dstPtr = (FLOAT16*)absmax;
+    for (int i = 0; i < realSize; ++i) {
+        FLOAT16 absmaxVal = 0; // absmaxVal>=0
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto src = srcPtr + c * srcStep + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                if (std::abs(src[k]) > absmaxVal) {
+                    absmaxVal = std::abs(src[k]);
+                }
+            }
+        }
+        dstPtr[i] = absmaxVal;
+    }
+    return;
+}
+
+static void MNNDynamicQuantFP16(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack) {
+    if (pack == 8) {
+        MNNDynamicQuantFP16_Pack8(src, dst, scale, src_depth_quad,realSize, pack);
+        return;
+    }
+    if (pack == 4) {
+        MNNDynamicQuantFP16_Pack4(src, dst, scale, src_depth_quad,realSize, pack);
+        return;
+    }
+    int8_t* dstPtr = dst;
+    auto srcPtr = (FLOAT16*)src;
+
+    for (int i = 0; i < realSize; ++i) {
+        auto scaleVal = static_cast<FLOAT16>(scale[i]);
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto srcZ = srcPtr + c * pack * realSize + i * pack;
+            auto dstZ = dstPtr + c * pack * realSize + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                int val = (int)roundf(srcZ[k] * scaleVal);
+                dstZ[k] = val;
+            }
+        }
+    }
+    return;
+}
+#endif
+
 static CoreFunctions* gInstance = nullptr;
+static CoreInt8Functions* gArm82CoreInt8Functions = nullptr;
 
 bool Arm82Functions::init() {
     using Vec = MNN::Math::Vec<FLOAT16, 8>;
+    auto origin = MNNGetCoreFunctions();
 #define FUNC_PTR_ASSIGN(dst, src) dst = (decltype(dst))(src)
     gInstance = new CoreFunctions;
+    gArm82CoreInt8Functions = new CoreInt8Functions;
+    *gArm82CoreInt8Functions = *MNNGetInt8CoreFunctions();
+    {
+        if (origin->supportSDot) {
+            gArm82CoreInt8Functions->MNNPackC4Int8ForMatMul_A = _Arm82MNNPackC4ForMatMul_A<12, 4>;
+        }
+        if (origin->supportI8mm) {
+            gArm82CoreInt8Functions->MNNPackC4Int8ForMatMul_A = _ArmBasicMNNPackC4ForMatMul_A_L8<10, 8>;
+        }
+    }
+
+    FUNC_PTR_ASSIGN(gInstance->MNNFp32ToFp8, MNNFp32ToFp8);
+    FUNC_PTR_ASSIGN(gInstance->MNNFp16ToFp8, MNNFp16ToFp8);
+    FUNC_PTR_ASSIGN(gInstance->MNNFp8ToFp32, MNNFp8ToFp32);
+    FUNC_PTR_ASSIGN(gInstance->MNNFp8ToFp16, MNNFp8ToFp16);
 
     FUNC_PTR_ASSIGN(gInstance->MNNFp32ToLowp, MNNQuantizeFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNLowpToFp32, MNNDequantizeFP16);
@@ -679,19 +893,28 @@ bool Arm82Functions::init() {
     FUNC_PTR_ASSIGN(gInstance->MNNUnpackCUnit, MNNUnPackC8FP16);
     FUNC_PTR_ASSIGN(gInstance->MNNPackCUnitTranspose, MNNPackTransposeInt16C8);
     FUNC_PTR_ASSIGN(gInstance->MNNUnpackCUnitTranspose, MNNUnpackTransposeInt16C8);
-    FUNC_PTR_ASSIGN(gInstance->MNNConvRunForUnitDepthWise, MNNConvRunForUnitDepthWiseFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNConvRunForLineDepthwise, MNNConvRunForLineDepthwiseFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNAxByClampBroadcastUnit, MNNAxByClampBroadcastC8FP16);
-    FUNC_PTR_ASSIGN(gInstance->MNNConvDwF23MulTransUnit, MNNConvDwF23MulTransUnitFP16);
-    FUNC_PTR_ASSIGN(gInstance->MNNSourceTransformCommonF23, ARM82SourceTransformCommon);
-    FUNC_PTR_ASSIGN(gInstance->MNNMultiAndDestTransformCommon23, ARM82MultiAndDestTransformCommon);
     FUNC_PTR_ASSIGN(gInstance->MNNMatrixSub, MNNMatrixSubFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNMatrixAdd, MNNMatrixAddFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNStrassenMergeCFunction, ARM82StrassenMerge);
+#ifdef MNN_LOW_MEMORY
+    FUNC_PTR_ASSIGN(gInstance->MNNDynamicUpdateConvBiasScale, origin->MNNDynamicUpdateConvBiasScale);
+    if (origin->supportSDot) {
+        FUNC_PTR_ASSIGN(gInstance->MNNGeneralIm2Col, MNNGeneralIm2col_Arm82);
+    }
+    if (origin->supportI8mm) {
+        FUNC_PTR_ASSIGN(gInstance->MNNGeneralIm2Col, MNNGeneralIm2col_Arm86);
+    }
+    
+#endif
     gInstance->penalty = 2.0f;
     FUNC_PTR_ASSIGN(gInstance->MNNScaleAndAddBias, MNNScaleAndAddBiasFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNGridSampleComputeCord, MNNGridSampleComputeCordFP16);
-    FUNC_PTR_ASSIGN(gInstance->MNNGridSampleInterp, MNNGridSampleInterpFP16);
+    FUNC_PTR_ASSIGN(gInstance->MNNGridSampleInterp, MNNGridSampleInterp);
+    FUNC_PTR_ASSIGN(gInstance->MNNGridSampleInterpGrad, MNNGridSampleInterpGrad);
+    FUNC_PTR_ASSIGN(gInstance->MNNGridSampleComputeCord3D, MNNGridSampleComputeCord3DFp16);
+    FUNC_PTR_ASSIGN(gInstance->MNNGridSampleInterp3D, MNNGridSampleInterp3D);
     FUNC_PTR_ASSIGN(gInstance->MNNRoiPoolingMax, MNNRoiPoolingMaxFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNRoiAlignMax, MNNRoiAlignMaxFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNRoiAlignAvg, MNNRoiAlignAvgFP16);
@@ -701,6 +924,26 @@ bool Arm82Functions::init() {
     // MatMul
     FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMul, MNNPackedMatMulFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemain, MNNPackedMatMulRemainFP16);
+#if defined(__aarch64__)
+    gInstance->supportFp16arith = origin->supportFp16arith;
+    gInstance->supportSDot = origin->supportSDot;
+    gInstance->supportI8mm = origin->supportI8mm;
+#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
+    // Weight Dequant Gemm Kernels
+    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMul_int8, MNNPackedMatMulFP16_int8);
+    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemain_int8, MNNPackedMatMulRemainFP16_int8);
+#endif
+#ifdef MNN_LOW_MEMORY
+    // Dynamic Qaunt Helper Functions
+    FUNC_PTR_ASSIGN(gInstance->MNNAbsMax, MNNAbsMaxFP16);
+    FUNC_PTR_ASSIGN(gInstance->MNNQuantScale, MNNQuantScaleFP16);
+    FUNC_PTR_ASSIGN(gInstance->MNNDynamicQuant, MNNDynamicQuantFP16);
+    FUNC_PTR_ASSIGN(gInstance->MNNQuantSum, MNNQuantSumFP16);
+    FUNC_PTR_ASSIGN(gInstance->MNNCountMaxMinValue, ARM82CountMinMaxValue);
+#endif
+    FUNC_PTR_ASSIGN(gInstance->MNNSumByAxisLForMatmul_A, origin->MNNSumByAxisLForMatmul_A);
+    FUNC_PTR_ASSIGN(gInstance->MNNDepthwiseConvFastKernel, MNNDepthwiseConvFastKernelFP16);
+#endif
     FUNC_PTR_ASSIGN(gInstance->MNNPackC4ForMatMul_A, Arm82MNNPackForMatMul_A);
     FUNC_PTR_ASSIGN(gInstance->MNNGetMatMulPackMode, Arm82MNNGetMatMulPackMode);
     FUNC_PTR_ASSIGN(gInstance->MNNPackForMatMul_B, Arm82MNNPackForMatMul_B);
@@ -728,6 +971,9 @@ bool Arm82Functions::init() {
 
 CoreFunctions* Arm82Functions::get() {
     return gInstance;
+}
+CoreInt8Functions* Arm82Functions::getInt8() {
+    return gArm82CoreInt8Functions;
 }
 };
 #endif

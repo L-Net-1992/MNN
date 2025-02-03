@@ -13,7 +13,9 @@ namespace MNN {
 namespace OpenCL {
 
 InterpExecution::InterpExecution(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend)
-    : Execution(backend) {
+    : CommonExecution(backend, op) {
+    mUnits.resize(1);
+    auto &unit = mUnits[0];
     mOpenCLBackend = static_cast<OpenCLBackend *>(backend);
     auto runtime   = mOpenCLBackend->getOpenCLRuntime();
     auto interpParam = op->main_as_Interp();
@@ -25,18 +27,22 @@ InterpExecution::InterpExecution(const std::vector<Tensor *> &inputs, const MNN:
     std::set<std::string> buildOptions;
     std::string kernelName = "interp";
     if (op->main_as_Interp()->resizeType() == 1) {
-        mKernel                = runtime->buildKernel("nearest", kernelName, buildOptions);
-    } else {
-        mKernel                = runtime->buildKernel("interp", kernelName, buildOptions);
+        unit.kernel                = runtime->buildKernel("nearest", kernelName, buildOptions);
+    }else if (op->main_as_Interp()->resizeType() == 4) {
+        buildOptions.emplace("-DUSE_ROUND");
+        unit.kernel                 = runtime->buildKernel("nearest", kernelName, buildOptions);
+    }else {
+        unit.kernel                 = runtime->buildKernel("interp", kernelName, buildOptions);
     }
 
-    mMaxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel));
+    mMaxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(unit.kernel ));
 }
 
-ErrorCode InterpExecution::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+ErrorCode InterpExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     Tensor *input  = inputs[0];
     Tensor *output = outputs[0];
     auto runtime = ((OpenCLBackend *)backend())->getOpenCLRuntime();
+    auto &unit = mUnits[0];
 
     std::vector<int> inputShape  = tensorShapeFormat(input);
     std::vector<int> outputShape = tensorShapeFormat(output);
@@ -58,49 +64,43 @@ ErrorCode InterpExecution::onResize(const std::vector<Tensor *> &inputs, const s
     MNN_ASSERT(outputHeight > 0 && outputWidth > 0);
 
     uint32_t idx = 0;
-    mKernel.setArg(idx++, mGWS[0]);
-    mKernel.setArg(idx++, mGWS[1]);
-    mKernel.setArg(idx++, mGWS[2]);
-    mKernel.setArg(idx++, openCLImage(input));
-    mKernel.setArg(idx++, openCLImage(output));
-    mKernel.setArg(idx++, mCordTransform[2]);
-    mKernel.setArg(idx++, mCordTransform[0]);
-    mKernel.setArg(idx++, mCordTransform[3]);
-    mKernel.setArg(idx++, mCordTransform[1]);
-    mKernel.setArg(idx++, static_cast<int32_t>(inputHeight));
-    mKernel.setArg(idx++, static_cast<int32_t>(inputWidth));
-    mKernel.setArg(idx++, static_cast<int32_t>(outputHeight));
-    
+    cl_int ret = CL_SUCCESS;
+    ret |= unit.kernel->get().setArg(idx++, mGWS[0]);
+    ret |= unit.kernel->get().setArg(idx++, mGWS[1]);
+    ret |= unit.kernel->get().setArg(idx++, mGWS[2]);
+    ret |= unit.kernel->get().setArg(idx++, openCLImage(input));
+    ret |= unit.kernel->get().setArg(idx++, openCLImage(output));
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[2]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[0]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[3]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[1]);
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(inputHeight));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(inputWidth));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(outputHeight));
+    MNN_CHECK_CL_SUCCESS(ret, "setArg InterpExecution");
+
     std::string name = "interp";
-    mLWS = localWS3DDefault(mGWS, mMaxWorkGroupSize, runtime, name, mKernel).first;
+    mLWS = localWS3DDefault(mGWS, mMaxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), name, unit.kernel).first;
+    mOpenCLBackend->recordKernel3d(unit.kernel, mGWS, mLWS);
+    unit.globalWorkSize = {mGWS[0], mGWS[1], mGWS[2]};
+    unit.localWorkSize = {mLWS[0], mLWS[1], mLWS[2]};
     return NO_ERROR;
 
 }
 
-ErrorCode InterpExecution::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-#ifdef LOG_VERBOSE
-    MNN_PRINT("Start InterpExecution onExecute... \n");
-#endif
+class InterpCreator : public OpenCLBackend::Creator {
+public:
+    virtual ~InterpCreator() = default;
+    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, const MNN::Op *op, Backend *backend) const override {
+        if(op->main_as_Interp()->resizeType() == 3) {
+            MNN_PRINT("openCL not support interp type:%d, fallback to cpu\n", op->main_as_Interp()->resizeType());
+            return nullptr;
+        }
+        return new InterpExecution(inputs, op, backend);
+    }
+};
 
-#ifdef ENABLE_OPENCL_TIME_PROFILER
-    cl::Event event;
-    run3DKernelDefault(mKernel, mGWS, mLWS,
-                       mOpenCLBackend->getOpenCLRuntime(), &event);
-    
-    int costTime = (int)mOpenCLBackend->getOpenCLRuntime()->getCostTime(&event);
-    MNN_PRINT("kernel cost:%d    us Interp\n",costTime);
-#else
-    run3DKernelDefault(mKernel, mGWS, mLWS, mOpenCLBackend->getOpenCLRuntime());
-#endif
-
-#ifdef LOG_VERBOSE
-    MNN_PRINT("end InterpExecution onExecute... \n");
-#endif
-
-    return NO_ERROR;
-}
-
-OpenCLCreatorRegister<TypedCreator<InterpExecution>> __Interp_op_(OpType_Interp, IMAGE);
+REGISTER_OPENCL_OP_CREATOR(InterpCreator, OpType_Interp, IMAGE);
 
 } // namespace OpenCL
 } // namespace MNN

@@ -12,9 +12,9 @@
 #include "MNN_generated.h"
 #include "MNNTestSuite.h"
 #include "TestUtils.h"
-#include "common/CommonCompute.hpp"
-#include "common/MemoryFormater.h"
-#include "common/WinogradInt8Attr.hpp"
+#include "core/CommonCompute.hpp"
+#include "core/MemoryFormater.h"
+#include "core/WinogradInt8Attr.hpp"
 #include "math/WingoradGenerater.hpp"
 #include <MNN/AutoTime.hpp>
 
@@ -35,7 +35,9 @@ static PadMode _convertPadMode(PaddingMode mode) {
 }
 
 inline int8_t int32ToInt8(int data, int bias, float scale) {
-    float value = roundf((float)(data + bias) * scale);
+    float value = 0.f;
+    value = roundf((float)(data + bias) * scale);
+
     value       = std::max(value, -127.0f);
     value       = std::min(value, 127.0f);
     return static_cast<int8_t>(value);
@@ -87,11 +89,11 @@ VARP _Conv(std::vector<int8_t>&& weight, std::vector<int>&& bias, std::vector<fl
 
         std::unique_ptr<MNN::AttributeT> arg3(new MNN::AttributeT);
         arg3->key = "NNZElement";
-        arg3->i = weightNNZElement;
+        arg3->i = static_cast<int32_t>(weightNNZElement);
 
         std::unique_ptr<MNN::AttributeT> arg4(new MNN::AttributeT);
         arg4->key = "blockNumber";
-        arg4->i = weightBlockNumber;
+        arg4->i = static_cast<int32_t>(weightBlockNumber);
 
         flatbuffers::FlatBufferBuilder builder;
         std::vector<flatbuffers::Offset<MNN::Attribute>> argsVector;
@@ -183,7 +185,7 @@ protected:
 
     bool testKernel(INTS inputShape, INTS kernel, INTS channel, INTS pad, INTS strides, INTS dilate, int nbit = 8,
                     bool overflow = false, int group = 1, int batch = 1, MNN::SparseAlgo sparseAlgo = MNN::SparseAlgo_RANDOM,
-                    int sparseBlockOC = 1, bool debug = false) {
+                    int sparseBlockOC = 1, bool debug = false, bool speed = false) {
 
         std::vector<int> bias(channel[1]);
         std::vector<float> scale(channel[1]);
@@ -232,6 +234,10 @@ protected:
             y     = _Conv(std::vector<int8_t>(weight), std::vector<int>(bias), std::vector<float>(scale), xC4,
                                channel, kernel, PaddingMode::CAFFE, strides, dilate, group, pad, false, 0, 0, -127, 127, false, sparseAlgo, sparseBlockOC);
         }
+        bool testDepthwise = false;
+        if (channel[0] == channel[1] && channel[0] == group) {
+            testDepthwise = true;
+        }
         y = _Int8ToFloat(y, _Scalar<float>(1.0f));
         y = _Cast<int8_t>(y);
         y = _Convert(y, NCHW);
@@ -246,20 +252,35 @@ protected:
             MNN_PRINT("\nreal output:");
             formatMatrix(yPtr, {yInfo->dim[0], yInfo->dim[1]/4, yInfo->dim[2], yInfo->dim[3], 4});
         }
-
         for (int i = 0; i < targetValues.size(); ++i) {
             int8_t targetValue = targetValues[i], computeResult = yPtr[i];
             // Because of round implement in ARM / X86 / PC may cause 1 / 0 / -1 diff, don't care about this error
             auto error = (int32_t)targetValue - (int32_t)computeResult;
             if (error * error > 1) {
-                MNN_PRINT("%d x %d, ConvInt8 result %d Error: %d -> %d\n", ow, oh, i, targetValue, computeResult);
-                MNN_PRINT("\nexpected output:");
-                formatMatrix(targetValues.data(), {yInfo->dim[0], yInfo->dim[1]/4, yInfo->dim[2], yInfo->dim[3], 4});
-                MNN_PRINT("\nreal output:");
-                formatMatrix(yPtr, {yInfo->dim[0], yInfo->dim[1]/4, yInfo->dim[2], yInfo->dim[3], 4});
-
+                MNN_PRINT("ic=%d, oc=%d, ow=%d, oh=%d, ConvInt8 result No.%d Error: right=%d, error=%d\n", channel[0], channel[1], ow, oh, i, targetValue, computeResult);
+#ifdef DEBUG 
+                x->writeMap<int8_t>();
+                auto ptr = y->readMap<int8_t>();
+                FUNC_PRINT_ALL(ptr, p);
+#endif
                 return false;
             }
+        }
+        if (speed) {
+            x.fix(VARP::INPUT);
+            // warm up, do onResize first for shapeDirty
+            x->writeMap<float>();
+            y->readMap<float>();
+
+            MNN::Timer _t;
+            const int LOOP = 100;
+            for (int i = 0; i < LOOP; ++i) {
+                x->writeMap<float>();
+                y->readMap<float>();
+            }
+            auto time = (float)_t.durationInUs() / 1000.0f;
+            MNN_PRINT("DepthwiseConvInt8 Speed: input = (1x%dx%dx%d), kernel=(%dx%dx%d), avg time=%f\n",
+                      channel[0], ih, iw, channel[0], kernel[0], kernel[1], time);
         }
         return true;
     }
@@ -269,38 +290,105 @@ class ConvInt8Im2colGemmTest : public ConvInt8TestCommon {
 public:
 
     virtual bool run(int precision) {
-        INTS strides = {1, 1}, dilate = {1, 1}, pad = {3, 4}, inputShape = {34, 23}; // {w, h}
-        INTS channel = {64, 64}; // {ci, co}
+        auto backendType = getCurrentType();
+        if (backendType != MNN_FORWARD_CPU && backendType != MNN_FORWARD_CPU_EXTENSION) {
+            // Skip other backend test for conv int8
+            return true;
+        }
+        std::vector< std::vector<int>> iwih = {{27, 27}, {20, 20}, {11, 11}, {14, 11}, {14, 12}};
+        std::vector< std::vector<int>> kxky = {{3, 3}, {5, 5}};
+        std::vector< std::vector<int>> icoc = {{3, 64}, {8, 32}, {1, 32}, {54, 8}};
+        std::vector<int> batch              = {1, 2, 5};
+        std::vector< std::vector<int>> pxpy = {{1, 1}, {0, 0}, {2, 3}};
+        std::vector< std::vector<int>> sxsy = {{1, 1}, {2, 2}};
+        std::vector< std::vector<int>> dxdy = {{1, 1}, {2, 2}};
+        
+        for (int i0 = 0; i0 < kxky.size(); i0++) {
+            for (int i1 = 0; i1 < icoc.size(); i1++) {
+                for (int i2 = 0; i2 < batch.size(); i2++) {
+                    for (int i3 = 0; i3 < pxpy.size(); i3++) {
+                        for (int i4 = 0; i4 < sxsy.size(); i4++) {
+                            for (int i5 = 0; i5 < dxdy.size(); i5++) {
+                                for (int i6 = 3; i6 < iwih.size(); i6++) {
+                                    auto res = testKernel(iwih[i6], kxky[i0], icoc[i1], pxpy[i3], sxsy[i4], dxdy[i5], 8, false, 1, batch[i2], MNN::SparseAlgo_RANDOM, 1, false);
+                                    if (!res) {
+                                        MNN_ERROR("kx=%d, ky=%d, iw=%d, ih=%d, overflow=false, bit=8, batch=%d, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", 
+                                                   kxky[i0][0], kxky[i0][1], iwih[i6][0], iwih[i6][1], batch[i2], sxsy[i4][0], sxsy[i4][1], dxdy[i5][0], dxdy[i5][1], pxpy[i3][0], pxpy[i3][1], icoc[i1][0], icoc[i1][1]);
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        int sx = 1, sy = 1, dx = 1, dy = 1, px = 1, py = 1, ic = 17, oc = 8, kx = 3, ky = 3; // ic=17,54,{14,11},{7,7}
+        auto res = testKernel({7, 7}, {kx, ky}, {ic, oc}, {px, py}, {sx, sy}, {dx, dy}, 8, false, 1, 1, MNN::SparseAlgo_RANDOM, 1, false);
+        if (!res) {
+            MNN_ERROR("overflow=false, bit=8, batch=%d, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", 1, sx, sy, dx, dy, px, py, ic, oc);
+            return false;
+        }
+        res = testKernel({4, 4}, {1, 3}, {ic, oc}, {px, py}, {sx, sy}, {dx, dy}, 8, false, 1, 1, MNN::SparseAlgo_RANDOM, 1, false);
+        if (!res) {
+            MNN_ERROR("overflow=false, bit=8, batch=%d, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", 1, sx, sy, dx, dy, px, py, ic, oc);
+            return false;
+        }
+        
         std::vector<std::vector<int>> kernels = {
             {4, 2}, {1, 5}, {7, 1}
         };
+        int iw = 14; int ih = 11;
         std::vector<std::string> titles = {"4x2", "1x5", "7x1"};
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 8, false, 1, 2, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                MNN_ERROR("Error for test kernel %s for convint8 215, 204 (im2col + gemm)\n", titles[i].c_str());
-                return false;
-            }
-        }
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 3, true, 1, 3, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                MNN_ERROR("Error for test kernel %s for convint8 215, 204 (im2col + gemm + overflow aware)\n", titles[i].c_str());
-                return false;
-            }
-        }
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 8, false, 1, 5, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                MNN_ERROR("Error for test kernel %s for convint8 215, 201 (im2col + gemm)\n", titles[i].c_str());
-                return false;
-            }
-        }
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 3, true, 1, 2, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                MNN_ERROR("Error for test kernel %s for convint8 215, 201 (im2col + gemm + overflow aware)\n", titles[i].c_str());
-                return false;
+        for (int sx=1; sx<2; ++sx) {
+            for (int sy=1; sy<2; ++sy) {
+                for (int dx=1; dx<2; ++dx) {
+                    for (int dy=1; dy<2; ++dy) {
+                        for (int px=2; px<4; ++px) {
+                            for (int py=3; py<4; ++py) {
+                                for (int ic=1; ic<=64; ic*=8) {
+                                    for (int oc=1; oc<=64; oc*=8) {
+                                        INTS strides = {sx, sy}, dilate = {dx, dy}, pad = {px, py}, inputShape = {iw, ih};
+                                        INTS channel = {ic, oc};
+                                        for (int i = 0; i < kernels.size(); ++i) {
+                                            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 8, false, 1, 2, MNN::SparseAlgo_RANDOM, 1, false);
+                                            if (!res) {
+                                                MNN_ERROR("Error for test kernel %s for convint8 215, 204 (im2col + gemm)\n", titles[i].c_str());
+                                                MNN_ERROR("overflow=false, bit=8, batch=2, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", sx, sy, dx, dy, px, py, ic, oc);
+                                                return false;
+                                            }
+                                        }
+                                        for (int i = 0; i < kernels.size(); ++i) {
+                                            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 3, true, 1, 3, MNN::SparseAlgo_RANDOM, 1, false);
+                                            if (!res) {
+                                                MNN_ERROR("Error for test kernel %s for convint8 215, 204 (im2col + gemm + overflow aware)\n", titles[i].c_str());
+                                                MNN_ERROR("overflow=true,bit=3, batch=3, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", sx, sy, dx, dy, px, py, ic, oc);
+                                                return false;
+                                            }
+                                        }
+                                        for (int i = 0; i < kernels.size(); ++i) {
+                                            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 8, false, 1, 5, MNN::SparseAlgo_RANDOM, 1, false);
+                                            if (!res) {
+                                                MNN_ERROR("Error for test kernel %s for convint8 215, 201 (im2col + gemm)\n", titles[i].c_str());
+                                                MNN_ERROR("overflow=false,bit=8, batch=5, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", sx, sy, dx, dy, px, py, ic, oc);
+                                                return false;
+                                            }
+                                        }
+                                        for (int i = 0; i < kernels.size(); ++i) {
+                                            auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 3, true, 1, 2, MNN::SparseAlgo_RANDOM, 1, false);
+                                            if (!res) {
+                                                MNN_ERROR("Error for test kernel %s for convint8 215, 201 (im2col + gemm + overflow aware)\n", titles[i].c_str());
+                                                MNN_ERROR("overflow=true,bit=3, batch=2, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", sx, sy, dx, dy, px, py, ic, oc);
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         return true;
@@ -376,22 +464,22 @@ public:
             for (int i = 0; i < kernels.size(); ++i) {
                 auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 3, true, 1, 3, SparseList[is].first, SparseList[is].second, false);
                 if (!res) {
-                    MNN_ERROR("Error for test kernel %s for convint8 215, 204 (im2col + gemm + overflow aware)\n", titles[i].c_str());
+                    MNN_ERROR("Error for test kernel %s for convint8 (im2col + gemm + overflow aware)\n", titles[i].c_str());
                     return false;
                 }
             }
-            inputShape = {215, 201};
+            inputShape = {123, 65};
             for (int i = 0; i < kernels.size(); ++i) {
                 auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 8, false, 1, 5, SparseList[is].first, SparseList[is].second, false);
                 if (!res) {
-                    MNN_ERROR("Error for test kernel %s for convint8 215, 201 (im2col + gemm)\n", titles[i].c_str());
+                    MNN_ERROR("Error for test kernel %s for convint8 (im2col + gemm)\n", titles[i].c_str());
                     return false;
                 }
             }
             for (int i = 0; i < kernels.size(); ++i) {
                 auto res = testKernel(inputShape, kernels[i], channel, pad, strides, dilate, 3, true, 1, 2, SparseList[is].first, SparseList[is].second, false);
                 if (!res) {
-                    MNN_ERROR("Error for test kernel %s for convint8 215, 201 (im2col + gemm + overflow aware)\n", titles[i].c_str());
+                    MNN_ERROR("Error for test kernel %s for convint8 (im2col + gemm + overflow aware)\n", titles[i].c_str());
                     return false;
                 }
             }
@@ -404,10 +492,10 @@ class ConvInt8WinogradTestCommon : public MNNTestCase {
 public:
     static VARP referenceWinograd(const VARP xInt, const std::vector<int8_t>& weight, const std::vector<float>& wScale, const std::vector<float>& bias, INTS kernel, INTS channel, INTS pads, const WinogradInt8Attr::Attr& attr, float xScale, float yScale, int8_t xZeroPoint, int8_t yZeroPoint, bool relu) {
         auto clamp = [](VARP x) {return _Maximum(_Minimum(x, _Scalar<float>(127)), _Scalar<float>(-127));};
-        
+
         //auto round = [](VARP x) { return _Round(x); };
         auto roundWithEps = [](VARP x) { return _Round(x + _Sign(x) * _Scalar<float>(1e-6)); };
-        
+
         auto inDims = xInt->getInfo()->dim;
         int batch = inDims[0], inH = inDims[2], inW = inDims[3];
         int outChannel = channel[1], inChannel = channel[0], kernelH = kernel[1], kernelW = kernel[0];
@@ -415,10 +503,10 @@ public:
         int outH = inH + 2 * padH - kernelH + 1, outW = inW + 2 * padW - kernelW + 1;
         int unitH = attr.unitY, unitW = attr.unitX, unitNumH = UP_DIV(outH, unitH), unitNumW = UP_DIV(outW, unitW);
         int alphaH = unitH + kernelH - 1, alphaW = unitW + kernelW - 1;
-        
+
         int needH = unitNumH * unitH + kernelH - 1, needW = unitNumW * unitW + kernelW - 1;
         int paddings[] = {0, 0, 0, 0, padH, needH - inH - padH, padW, needW - inW - padW};
-        
+
         auto xx = _Int8ToFloat(xInt, _Scalar<float>(xScale), xZeroPoint);
         xx = _Convert(xx, NCHW);
         xx = _Pad(xx, _Const(paddings, {8}, NCHW, halide_type_of<int32_t>()));
@@ -432,12 +520,12 @@ public:
         xx = _MatMul(_MatMul(_Transpose(srcTransH, {1, 0}), xx), srcTransW);
         // [alphaH * alphaW, ic, N * h_unit_num * w_unit_num]
         xx = _Reshape(_Transpose(xx, {2, 3, 1, 0}), {alphaH * alphaW, inChannel, -1});
-        
+
         // simulate input asym quant
         auto xxScale = _Const(attr.inputScales.data(), {alphaH * alphaW, 1, 1}, NCHW);
         auto xxZeroPoint = _Cast<float>(_Const(attr.inputZeroPoints.data(), {alphaH * alphaW, 1, 1}, NCHW, halide_type_of<int>()));
         xx = (clamp(_Round(xx / xxScale + xxZeroPoint)) - xxZeroPoint) * xxScale;
-        
+
         auto w = _Const(weight.data(), {outChannel, inChannel, kernelH, kernelW}, NCHW, halide_type_of<int8_t>());
         w = _Cast<float>(w) * _Const(wScale.data(), {outChannel, 1, 1, 1}, NCHW);
         auto wTransH = _Const(genH.G()->host<void>(), {alphaH, kernelH}, NCHW);
@@ -476,76 +564,79 @@ public:
     }
     static bool testKernel(INTS inputShape, INTS kernel, INTS channel, INTS pads, INTS alphas, bool speed, std::string title, bool relu = true) {
         int ic = channel[0], oc = channel[1], iw = inputShape[0], ih = inputShape[1], kx = kernel[0], ky = kernel[1], alpha2 = alphas[0] * alphas[1];
-        
-        VARP x = _Input({1, ic, ih, iw}, NCHW);
-        auto xPtr  = x->writeMap<float>();
-        float xMin = std::numeric_limits<float>::max(), xMax = std::numeric_limits<float>::lowest();
-        for (int i = 0; i < x->getInfo()->size; ++i) {
-            xPtr[i] = i % 128; // x in [0, 127], same as relu output, test asym quant
-            xMin = std::min(xMin, xPtr[i]);
-            xMax = std::max(xMax, xPtr[i]);
-        }
-        float xScale = (xMax - xMin) / (2.0 * 127), yScale = 0.5;
-        int8_t xZeroPoint = roundf((0 - xMin) / xScale - 127), yZeroPoint = 1;
+        for (int batchSize = 1; batchSize <= 3; ++batchSize) {
+            VARP x = _Input({batchSize, ic, ih, iw}, NCHW);
+            auto xPtr  = x->writeMap<float>();
+            float xMin = std::numeric_limits<float>::max(), xMax = std::numeric_limits<float>::lowest();
+            for (int i = 0; i < x->getInfo()->size; ++i) {
+                xPtr[i] = i % 128; // x in [0, 127], same as relu output, test asym quant
+                xMin = std::min(xMin, xPtr[i]);
+                xMax = std::max(xMax, xPtr[i]);
+            }
+            float xScale = (xMax - xMin) / (2.0 * 127), yScale = 0.5;
+            int8_t xZeroPoint = roundf((0 - xMin) / xScale - 127), yZeroPoint = 1;
 
-        int wMin = -3, wMax = 3;
-        std::vector<float> wScale(oc), bias(oc);
-        std::vector<int8_t> weight(oc * ic * ky * kx);
-        for (int oz = 0; oz < oc; ++oz) {
-            wScale[oz] = (oz % 11) * 0.1 + 0.5; // wScale in [0.5, 1.5]
-            bias[oz] = (oz % 5) * 0.5 - 1; // bias in [-1, 1]
-            for (int sz = 0; sz < ic; ++sz) {
-                for (int k = 0; k < ky * kx; ++k) {
-                    weight[(oz * ic + sz) * ky * kx + k] = ((oz * ic + sz) * ky * kx + k) % (wMax - wMin + 1) + wMin;
-                    //weight[(oz * ic + sz) * ky * kx + k] = (oz * oz + sz * sz + k * k) % (wMax - wMin + 1) + wMin; // w in [wMin, wMax]
+            int wMin = -3, wMax = 3;
+            std::vector<float> wScale(oc), bias(oc);
+            std::vector<int8_t> weight(oc * ic * ky * kx);
+            for (int oz = 0; oz < oc; ++oz) {
+                wScale[oz] = (oz % 11) * 0.1 + 0.5; // wScale in [0.5, 1.5]
+                bias[oz] = (oz % 5) * 0.5 - 1; // bias in [-1, 1]
+                for (int sz = 0; sz < ic; ++sz) {
+                    for (int k = 0; k < ky * kx; ++k) {
+                        weight[(oz * ic + sz) * ky * kx + k] = ((oz * ic + sz) * ky * kx + k) % (wMax - wMin + 1) + wMin;
+                        //weight[(oz * ic + sz) * ky * kx + k] = (oz * oz + sz * sz + k * k) % (wMax - wMin + 1) + wMin; // w in [wMin, wMax]
+                    }
                 }
             }
-        }
-        
-        x = _Convert(x, NC4HW4);
-        // For sse we use uint8 instead of int8, use FloatToInt8 to hidden detail
-        x = _FloatToInt8(x, _Scalar<float>(1.0 / xScale), -127, 127, xZeroPoint);
-        
-        WinogradInt8Attr attrs;
-        std::vector<float> transInputScales(alpha2, 0.9), transWeightScales(alpha2 * oc, 1.1);
-        std::vector<int> transInputZeroPoint(alpha2, 1);
-        attrs.add(0, 0, ky, kx, alphas[1] - ky + 1, alphas[0] - kx + 1, transInputScales, transWeightScales, transInputZeroPoint);
-        auto yTarget = referenceWinograd(x, weight, wScale, bias, kernel, channel, pads, attrs.attrs[0], xScale, yScale, xZeroPoint, yZeroPoint, relu);
-        auto y = _Conv(std::move(weight), std::move(bias), std::move(wScale), x, channel,
-                       kernel, CAFFE, {1, 1}, {1, 1}, 1, pads, relu, xScale, yScale, xZeroPoint, yZeroPoint,
-                       -127, 127, 127, false);
-        y = attrs.turnToWinogradConv(y);
-        
-        yTarget = _Convert(_Cast<int>(_Int8ToFloat(yTarget, _Scalar<float>(1.0))), NCHW);
-        y = _Convert(_Cast<int>(_Int8ToFloat(y, _Scalar<float>(1.0))), NCHW);
-        auto yTargetInfo = yTarget->getInfo(), yInfo = y->getInfo();
-        if (yTargetInfo == nullptr || yInfo == nullptr || yTargetInfo->size != yInfo->size) {
-            MNN_ERROR("[ConvInt8WinogradTestCommon] getInfo not match\n");
-            return false;
-        }
-        auto yTargetPtr = yTarget->readMap<int>(), yPtr = y->readMap<int>();
-        if (yTargetPtr == nullptr || yPtr == nullptr) {
-            MNN_ERROR("[ConvInt8WinogradTestCommon] result is nullptr\n");
-            return false;
-        }
-        if (!checkVector<int>(yPtr, yTargetPtr, yInfo->size, 1)) {
-            return false;
-        }
-        if (speed) {
-            x.fix(VARP::INPUT);
-            // warm up, do onResize first for shapeDirty
-            x->writeMap<float>();
-            y->readMap<float>();
-            
-            MNN::Timer _t;
-            const int LOOP = 20;
-            for (int i = 0; i < LOOP; ++i) {
+
+            x = _Convert(x, NC4HW4);
+            // For sse we use uint8 instead of int8, use FloatToInt8 to hidden detail
+            x = _FloatToInt8(x, _Scalar<float>(1.0 / xScale), -127, 127, xZeroPoint);
+
+            WinogradInt8Attr attrs;
+            std::vector<float> transInputScales(alpha2, 0.9), transWeightScales(alpha2 * oc, 1.1);
+            std::vector<int> transInputZeroPoint(alpha2, 1);
+            attrs.add(0, 0, ky, kx, alphas[1] - ky + 1, alphas[0] - kx + 1, transInputScales, transWeightScales, transInputZeroPoint);
+            auto yTarget = referenceWinograd(x, weight, wScale, bias, kernel, channel, pads, attrs.attrs[0], xScale, yScale, xZeroPoint, yZeroPoint, relu);
+            auto y = _Conv(std::move(weight), std::move(bias), std::move(wScale), x, channel,
+                           kernel, CAFFE, {1, 1}, {1, 1}, 1, pads, relu, xScale, yScale, xZeroPoint, yZeroPoint,
+                           -127, 127, 127, false);
+            y = attrs.turnToWinogradConv(y);
+
+            yTarget = _Convert(_Cast<int>(_Int8ToFloat(yTarget, _Scalar<float>(1.0))), NCHW);
+            y = _Convert(_Cast<int>(_Int8ToFloat(y, _Scalar<float>(1.0))), NCHW);
+            auto yTargetInfo = yTarget->getInfo(), yInfo = y->getInfo();
+            if (yTargetInfo == nullptr || yInfo == nullptr || yTargetInfo->size != yInfo->size) {
+                MNN_ERROR("[ConvInt8WinogradTestCommon] getInfo not match\n");
+                return false;
+            }
+            auto yTargetPtr = yTarget->readMap<int>();
+            auto yPtr = y->readMap<int>();
+            if (yTargetPtr == nullptr || yPtr == nullptr) {
+                MNN_ERROR("[ConvInt8WinogradTestCommon] result is nullptr\n");
+                return false;
+            }
+            if (!checkVector<int>(yPtr, yTargetPtr, yInfo->size, 1)) {
+                MNN_ERROR("[ConvInt8WinogradTestCommon] result error for batchSize = %d, oc=%d, oh=%d, ow=%d\n", batchSize, yInfo->dim[1], yInfo->dim[2], yInfo->dim[3]);
+                return false;
+            }
+            if (speed) {
+                x.fix(VARP::INPUT);
+                // warm up, do onResize first for shapeDirty
                 x->writeMap<float>();
                 y->readMap<float>();
+
+                MNN::Timer _t;
+                const int LOOP = 20;
+                for (int i = 0; i < LOOP; ++i) {
+                    x->writeMap<float>();
+                    y->readMap<float>();
+                }
+                auto time = (float)_t.durationInUs() / 1000.0f;
+                MNN_PRINT("ConvInt8 Winograd %s input=(1x%dx%dx%d) kernel=(%dx%dx%dx%d) avg time = %.2f\n",
+                          title.c_str(), ic, ih, iw, oc, ic, ky, kx, 1.0 * time / LOOP);
             }
-            auto time = (float)_t.durationInUs() / 1000.0f;
-            MNN_PRINT("ConvInt8 Winograd %s input=(1x%dx%dx%d) kernel=(%dx%dx%dx%d) avg time = %f\n",
-                      title.c_str(), ic, ih, iw, oc, ic, ky, kx, 1.0 * time / LOOP);
         }
         return true;
     }
@@ -553,7 +644,7 @@ public:
 
 class ConvInt8WinogradTest : public ConvInt8WinogradTestCommon {
     virtual bool run(int precision) {
-        INTS pad = {1, 1}, inputShape = {128, 128}; // {w, h}
+        INTS pad = {1, 1}, inputShape = {47, 39}; // {w, h}
         INTS channel = {32, 32}; // {ci, co}
 
         std::vector<std::vector<int>> kernels = {
@@ -586,7 +677,7 @@ class ConvSpeedInt8WinogradTest : public ConvInt8WinogradTestCommon {
         std::vector<INTS> kernels = {
             {3, 3}//, {5, 5}, {7, 1}, {1, 7} // {w, h}
         };
-        
+
         std::vector<std::string> titles = {"3x3", "5x5", "1x7", "7x1"};
         for (int i = 0; i < kernels.size(); ++i) {
             auto res = testKernel(inputShape, kernels[i], channel, pad, {4, 4}, true, titles[i] + ",alpha=4");
@@ -615,6 +706,7 @@ public:
         std::vector<std::string> titles = {
             "3x3"
         };
+        printf("Test strides=1\n");
         for (int i = 0; i < kernels.size(); ++i) {
             auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, strides, dilate, 8, false, channel, 4, MNN::SparseAlgo_RANDOM, 1, false);
             if (!res) {
@@ -624,6 +716,52 @@ public:
         }
         for (int i = 0; i < kernels.size(); ++i) {
             auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, strides, dilate, 3, true, channel, 1, MNN::SparseAlgo_RANDOM, 1, false);
+            if (!res) {
+                FUNC_PRINT(1);
+                return false;
+            }
+        }
+        printf("strides=2\n");
+        for (int i = 0; i < kernels.size(); ++i) {
+            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, {2, 2}, dilate, 8, true, channel, 1, MNN::SparseAlgo_RANDOM, 1, false);
+            if (!res) {
+                FUNC_PRINT(1);
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+class DepthwiseConvSpeedInt8Test : public ConvInt8TestCommon {
+public:
+    virtual bool run(int precision) {
+        INTS strides = {1, 1}, dilate = {1, 1}, pad = {0, 0}, inputShape = {112, 144}; // {w, h}
+        int channel = 16;
+        std::vector<std::vector<int>> kernels = {
+            {3, 3}
+        };
+        std::vector<std::string> titles = {
+            "3x3"
+        };
+        printf("Depthwise Speed Test Strides=1.\n");
+        for (int i = 0; i < kernels.size(); ++i) {
+            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, strides, dilate, 8, false, channel, 4, MNN::SparseAlgo_RANDOM, 1, false, true);
+            if (!res) {
+                FUNC_PRINT(1);
+                return false;
+            }
+        }
+        for (int i = 0; i < kernels.size(); ++i) {
+            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, strides, dilate, 3, true, channel, 1, MNN::SparseAlgo_RANDOM, 1, false, true);
+            if (!res) {
+                FUNC_PRINT(1);
+                return false;
+            }
+        }
+        printf("Depthwise Speed Test Strides=2\n");
+        for (int i = 0; i < kernels.size(); ++i) {
+            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, {2, 2}, dilate, 8, true, channel, 1, MNN::SparseAlgo_RANDOM, 1, false, true);
             if (!res) {
                 FUNC_PRINT(1);
                 return false;
@@ -639,3 +777,4 @@ MNNTestSuiteRegister(SparseConvInt8Im2colGemmTest, "op/ConvInt8/im2col_spmm");
 MNNTestSuiteRegister(ConvInt8WinogradTest, "op/ConvInt8/winograd");
 MNNTestSuiteRegister(ConvSpeedInt8WinogradTest, "speed/ConvInt8/winograd");
 MNNTestSuiteRegister(DepthwiseConvInt8Test, "op/ConvInt8/depthwise");
+MNNTestSuiteRegister(DepthwiseConvSpeedInt8Test, "speed/ConvInt8/depthwise");

@@ -11,7 +11,8 @@ def_enum(dtype, DType,
         DType_DOUBLE, "double",
         DType_INT32, "int",
         DType_INT64, "int64",
-        DType_UINT8, "uint8"
+        DType_UINT8, "uint8",
+        DType_INT8, "int8"
         )
 def_enum(Padding_Mode, PaddingMode,
         CAFFE, "CAFFE",
@@ -57,7 +58,8 @@ def_enum(PowerMode, PowerMode,
 def_enum(PrecisionMode, PrecisionMode,
         PrecisionMode::Precision_Normal, "Normal",
         PrecisionMode::Precision_High, "High",
-        PrecisionMode::Precision_Low, "Low"
+        PrecisionMode::Precision_Low, "Low",
+        PrecisionMode::Precision_Low_BF16, "Low_BF16"
         )
 // class Var
 typedef struct {
@@ -97,6 +99,9 @@ static PyObject* PyMNNVar_read(PyMNNVar *self, PyObject *args);
 #endif
 static PyObject* PyMNNVar_read_as_tuple(PyMNNVar *self, PyObject *args);
 static PyObject* PyMNNVar_write(PyMNNVar *self, PyObject *args);
+static PyObject* PyMNNVar_sync(PyMNNVar *self, PyObject *args);
+static PyObject* PyMNNVar_set_device_ptr(PyMNNVar *self, PyObject *args);
+static PyObject* PyMNNVar_copy_to_device_ptr(PyMNNVar *self, PyObject *args);
 static PyObject* PyMNNVar_add(PyMNNVar *self, PyObject *args);
 static PyGetSetDef PyMNNVar_getsetters[] = {
     {"shape", (getter)PyMNNVar_getshape, NULL, "shape", NULL},
@@ -128,6 +133,11 @@ static PyMethodDef PyMNNVar_methods[] = {
 #endif
     {"read_as_tuple", (PyCFunction)PyMNNVar_read_as_tuple, METH_VARARGS, "read data(tuple)"},
     {"write", (PyCFunction)PyMNNVar_write, METH_VARARGS, "write data"},
+    {"sync", (PyCFunction)PyMNNVar_sync, METH_VARARGS, "sync var data"},
+    {"set_device_ptr", (PyCFunction)PyMNNVar_set_device_ptr, METH_VARARGS, "set_device_ptr data"},
+    {"copy_to_device_ptr", (PyCFunction)PyMNNVar_copy_to_device_ptr, METH_VARARGS, "copy_to_device_ptr data"},
+
+
     {NULL}  /* Sentinel */
 };
 static PyObject* PyMNNVar_add(PyObject*, PyObject*);
@@ -437,11 +447,6 @@ static void dealSlice(PyObject* slice, std::vector<int>& begin, std::vector<int>
             Py_ssize_t startl = 0, stopl = 0, stepl = 1;
             auto slice_res = PySlice_Unpack(item, &startl, &stopl, &stepl);
             // py2 don't check return value.
-#if PY_MAJOR_VERSION >= 3
-            if (!slice_res) {
-                PyMNN_ERROR_LOG("slice is invalid.");
-            }
-#endif
             int start = static_cast<int>(startl);
             int stop = static_cast<int>(stopl);
             int step = static_cast<int>(stepl);
@@ -625,6 +630,15 @@ static void PyMNNVar_dealloc(PyMNNVar *self) {
     Py_TYPE(self)->tp_free((PyObject *) self);
 }
 static PyObject* PyMNNVar_repr(PyObject *self) {
+    PyMNNVar* var = (PyMNNVar*)self;
+    if (var->var == nullptr) {
+        return toPyObj("None Var");
+    }
+    auto info = (*(var->var))->getInfo();
+    const void* ptr = (*(var->var))->readMap<void>();
+    if (info == nullptr || ptr == nullptr) {
+        return toPyObj((*(var->var))->name());
+    }
 #ifdef PYMNN_NUMPY_USABLE
     auto content = PyMNNVar_read((PyMNNVar*)self, NULL);
 #else
@@ -683,7 +697,7 @@ static PyObject* PyMNNVar_getsize(PyMNNVar *self, void *closure) {
         if(nullptr == info) {
             PyMNN_ERROR("getsize: unable to get variable info");
         }
-        return toPyObj(info->size);
+        return toPyObj((int)info->size);
     }
     Py_RETURN_NONE;
 }
@@ -857,6 +871,8 @@ static PyObject* PyMNNVar_read(PyMNNVar *self, PyObject *args) {
                 return PyArray_SimpleNewFromData(npy_dims.size(), npy_dims.data(), NPY_INT64, dataPtr);
             case DType_UINT8:
                 return PyArray_SimpleNewFromData(npy_dims.size(), npy_dims.data(), NPY_UINT8, dataPtr);
+            case DType_INT8:
+                return PyArray_SimpleNewFromData(npy_dims.size(), npy_dims.data(), NPY_INT8, dataPtr);
             default:
                 PyMNN_ERROR("does not support this dtype");
         }
@@ -921,6 +937,30 @@ static PyObject* PyMNNVar_write(PyMNNVar *self, PyObject *args) {
     auto dtype = htype2dtype(info->type);
     int64_t total_length = info->size;
     toPtr(data, dtype, total_length, (*(self->var))->writeMap<void>());
+    Py_RETURN_NONE;
+}
+static PyObject* PyMNNVar_sync(PyMNNVar *self, PyObject *args) {
+    ((MNN::Tensor*)(*(self->var))->getTensor())->wait(MNN::Tensor::MAP_TENSOR_READ, true);
+    Py_RETURN_NONE;
+}
+static PyObject* PyMNNVar_set_device_ptr(PyMNNVar *self, PyObject *args) {
+    uint64_t devicePtr;
+    int memoryType;
+    if (!PyArg_ParseTuple(args, "Ki", &devicePtr, &memoryType)) {
+        Py_RETURN_NONE;
+    }
+
+    (*(self->var))->setDevicePtr((const void*)devicePtr, memoryType);
+    Py_RETURN_NONE;
+}
+static PyObject* PyMNNVar_copy_to_device_ptr(PyMNNVar *self, PyObject *args) {
+    uint64_t devicePtr;
+    int memoryType;
+    if (!PyArg_ParseTuple(args, "Ki", &devicePtr, &memoryType)) {
+        Py_RETURN_NONE;
+    }
+
+    (*(self->var))->copyToDevicePtr((void*)devicePtr, memoryType);
     Py_RETURN_NONE;
 }
 // Expr methods
@@ -1005,6 +1045,27 @@ static PyObject* PyMNNExpr_lazy_eval(PyObject *self, PyObject *args) {
         return NULL;
     }
     ExecutorScope::Current()->lazyEval = lazy;
+    Py_RETURN_NONE;
+}
+
+static PyObject* PyMNNExpr_set_lazy_mode(PyObject *self, PyObject *args) {
+    int lazy = 0;
+    if (!PyArg_ParseTuple(args, "i", &lazy)) {
+        return NULL;
+    }
+    ExecutorScope::Current()->setLazyComputeMode((Executor::LazyMode)lazy);
+    Py_RETURN_NONE;
+}
+static PyObject* PyMNNExpr_set_global_executor_config(PyObject *self, PyObject *args) {
+    int numberThread, backendType, precisionType;
+    if (!PyArg_ParseTuple(args, "iii", &backendType, &precisionType, &numberThread)) {
+        Py_RETURN_NONE;
+    }
+
+    auto exe = ExecutorScope::Current();
+    BackendConfig config;
+    config.precision = (BackendConfig::PrecisionMode)precisionType;
+    exe->setGlobalExecutorConfig((MNNForwardType)backendType, config, numberThread);
     Py_RETURN_NONE;
 }
 
@@ -1234,10 +1295,10 @@ static PyObject* PyMNNExpr_const(PyObject *self, PyObject *args, PyObject *kwarg
     PyObject *value, *shapes, *format = nullptr /* NCHW */, *type = nullptr /* DType_FLOAT */;
     static char *kwlist[] = { "value_list", "shape", "data_format", "dtype", NULL };
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|OO", kwlist, &value, &shapes, &format, &type)) {
-        PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule, [ints], |data_format, dtype)");
+        PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule/int_addr, [ints], |data_format, dtype)");
     }
-    if (!isVals(value) || !isInts(shapes) || (format != nullptr && !isdata_format(format)) || (type != nullptr && !isdtype(type))) {
-        PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule, [ints], |data_format, dtype)");
+    if ((!isVals(value) && !isInt(value)) || !isInts(shapes) || (format != nullptr && !isdata_format(format)) || (type != nullptr && !isdtype(type))) {
+        PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule/int_addr, [ints], |data_format, dtype)");
     }
     auto data_format = (format == nullptr ? NCHW : toEnum<Dimensionformat>(format));
     auto dtype = (type == nullptr ? DType_FLOAT : toEnum<DType>(type));
@@ -1259,6 +1320,12 @@ static PyObject* PyMNNExpr_const(PyObject *self, PyObject *args, PyObject *kwarg
         bool need_free = false;
         if (PyCapsule_CheckExact(value)) {
             data = PyCapsule_GetPointer(value, NULL);
+        } else if (isInt(value)) {
+            data = PyLong_AsVoidPtr(value);
+        } else if (PyBytes_Check(value)) {
+            int64_t bytesize = PyBytes_Size(value);
+            data = toPtr(value, DType_UINT8, bytesize);
+            need_free = true;
         } else {
             data = toPtr(value, dtype, total_length);
             need_free = true;
@@ -1464,6 +1531,13 @@ static PyObject* PyMNNExpr_transpose(PyObject *self, PyObject *args) {
     }
     PyMNN_ERROR("transpose require args: (Var, [int]|Var)");
 }
+static PyObject* PyMNNExpr_reverse(PyObject *self, PyObject *args) {
+    PyObject *x, *y;
+    if (PyArg_ParseTuple(args, "OO", &x, &y) && isVar(x) && isVar(y)) {
+        return toPyObj(Express::_Reverse(toVar(x), toVar(y)));
+    }
+    PyMNN_ERROR("reverse require args: (Var, Var)");
+}
 static PyObject* PyMNNExpr_reverse_sequence(PyObject *self, PyObject *args) {
     PyObject *x, *y;
     int batchDim, seqDim;
@@ -1519,7 +1593,7 @@ static PyObject* PyMNNExpr_crop_and_resize(PyObject *self, PyObject *args) {
              *method = nullptr /* BILINEAR */;
     float extrapolation_value = 0.0f;
     if (PyArg_ParseTuple(args, "OOOO|Of", &image, &boxes, &box_ind,
-                         &crop_size, &method, extrapolation_value)
+                         &crop_size, &method, &extrapolation_value)
         && isVar(image) && isVar(boxes) && isVar(box_ind)
         && isVar(crop_size)
         && (method == nullptr || isInterp_Method(method))) {
@@ -1591,6 +1665,22 @@ static PyObject* PyMNNExpr_raster(PyObject *self, PyObject *args) {
     }
     PyMNN_ERROR("raster require args: ([Var], [int], [int])");
 }
+static PyObject* PyMNNExpr_quant(PyObject *self, PyObject *args) {
+    PyObject *var, *scale;
+    int min = -128, max = 127, zero = 0;
+    if (PyArg_ParseTuple(args, "OO|ii", &var, &scale, &min, &max, &zero) && isVar(var) && isVar(scale)) {
+        return toPyObj(Express::_FloatToInt8(toVar(var), toVar(scale), min, max, zero));
+    }
+    PyMNN_ERROR("quant require args: (Var, Var, |int, int)");
+}
+static PyObject* PyMNNExpr_dequant(PyObject *self, PyObject *args) {
+    PyObject *var, *scale;
+    int zero;
+    if (PyArg_ParseTuple(args, "OOi", &var, &scale, &zero) && isVar(var) && isVar(scale)) {
+        return toPyObj(Express::_Int8ToFloat(toVar(var), toVar(scale), zero));
+    }
+    PyMNN_ERROR("dequant require args: (Var, Var, int)");
+}
 static PyObject* PyMNNExpr_nms(PyObject *self, PyObject *args) {
     PyObject *boxes, *scores;
     int max_detections;
@@ -1619,19 +1709,53 @@ static PyObject* PyMNNExpr_detection_post_process(PyObject *self, PyObject *args
     }
     PyMNN_ERROR("detection_post_process require args: (Var, Var, Var, int, int, int, int, float, float, bool, [float])");
 }
+static PyObject* PyMNNExpr_roi_pooling(PyObject *self, PyObject *args) {
+    PyObject *input, *roi;
+    int pooledHeight, pooledWidth;
+    float spatialScale;
+    int outputGrad = 0;
+    PyObject *backwardDiff = nullptr;
+    if (PyArg_ParseTuple(args, "OOiifpO", &input, &roi, &pooledHeight, &pooledWidth,
+        &spatialScale, &outputGrad, &backwardDiff) && isVar(input) && isVar(roi) && isVar(backwardDiff)) {
+        auto res = Express::_ROIPooling(toVar(input), toVar(roi), pooledHeight, pooledWidth, spatialScale, outputGrad, toVar(backwardDiff));
+        return toPyObj(res);
+    }
+    PyMNN_ERROR("roi_pooling require args: (Var, Var, int, int, float, [bool, Var])");
+}
+static PyObject* PyMNNExpr_roi_align(PyObject *self, PyObject *args) {
+    PyObject *input, *roi;
+    int pooledHeight, pooledWidth;
+    float spatialScale;
+    int samplingRatio;
+    int aligned;
+    PyObject *poolType;
+    int outputGrad = 0;
+    PyObject *backwardDiff = nullptr;
+    if (PyArg_ParseTuple(args, "OOiifipOpO", &input, &roi, &pooledHeight, &pooledWidth,
+        &spatialScale, &samplingRatio, &aligned, &poolType, &outputGrad, &backwardDiff)
+        && isVar(input) && isVar(roi) && isPooling_Mode(poolType) && isVar(backwardDiff)) {
+        auto res = Express::_ROIAlign(toVar(input), toVar(roi), pooledHeight, pooledWidth, spatialScale,
+                                    samplingRatio, aligned, toEnum<PoolingMode>(poolType),
+                                    outputGrad, toVar(backwardDiff));
+        return toPyObj(res);
+    }
+    PyMNN_ERROR("roi_align require args: (Var, Var, int, int, float, int, bool, PoolingMode, [bool, Var])");
+}
 static PyMethodDef PyMNNExpr_methods[] = {
     register_methods_kw(Expr,
         const, "build const var."
     )
     register_methods(Expr,
         // Var methods
-        set_thread_number, "set threan number of expr.",
+        set_thread_number, "set thread number of expr.",
         load_as_list, "load file as var list.",
         save, "save vars to file.",
         load_as_dict, "load file as var dict.",
         get_inputs_and_outputs, "get input and output of var dict.",
         gc, "do gc full or part.",
-        lazy_eval, "expr do lazy evaluation or not."
+        lazy_eval, "expr do lazy evaluation or not.",
+        set_lazy_mode, "set lazy compute mode, content: 0 or full: 1.",
+        set_global_executor_config, "set global executor config for expr."
     )
     register_methods(Expr,
         // unary expr
@@ -1731,7 +1855,9 @@ static PyMethodDef PyMNNExpr_methods[] = {
         conv2d, "build conv2d expr",
         conv2d_transpose, "build conv2d_transpose expr",
         max_pool, "build max_pool expr",
-        avg_pool, "build avg_pool expr"
+        avg_pool, "build avg_pool expr",
+        quant, "build quant expr",
+        dequant, "build dequant expr"
     )
     {"reshape",  PyMNNExpr_reshape, METH_VARARGS, "build reshape: (Var, [int], |data_format)"},
     register_methods(Expr,
@@ -1752,6 +1878,7 @@ static PyMethodDef PyMNNExpr_methods[] = {
     {"transpose",  PyMNNExpr_transpose, METH_VARARGS, "build transpose: (Var, [int]/Var)"},
     register_methods(Expr,
         channel_shuffle, "build channel_shuffle expr",
+        reverse, "build reverse expr",
         reverse_sequence, "build reverse_sequence expr",
         crop, "build crop expr",
         resize, "build resize expr",
@@ -1787,7 +1914,9 @@ static PyMethodDef PyMNNExpr_methods[] = {
         sort, "build sort expr",
         raster, "build raster expr",
         nms, "build nms expr",
-        detection_post_process, "build detection_post_process expr"
+        detection_post_process, "build detection_post_process expr",
+        roi_pooling, "build roi_pooling expr",
+        roi_align, "build roi_align expr"
     )
 };
 // Expr Module End

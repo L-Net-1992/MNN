@@ -22,25 +22,26 @@ ErrorCode NPUConcat::onResize(const std::vector<Tensor *> &inputs, const std::ve
     auto opName = mOp->name()->str();
     auto param  = mOp->main_as_Axis();
 
-    shared_ptr<ge::op::Concat> concat(new ge::op::Concat(opName));
-
+    shared_ptr<hiai::op::ConcatD> concatD(new hiai::op::ConcatD(opName));
+    auto xOp = mNpuBackend->getInputOps(mOp);
     auto inputSize = mOp->inputIndexes()->size();
-    (*concat).create_dynamic_input_x(inputSize).set_attr_axis(axisFormat(inputs[0], param->axis()));
+    int32_t axis = param->axis();
+    (*concatD).create_dynamic_input_x(inputSize).set_attr_concat_dim(axis);
 
     for (int i = 0; i < inputSize; ++i) {
         auto inputIndex = mOp->inputIndexes()->data()[i];
         auto iops       = mNpuBackend->mGrapMap[inputIndex]; // x
-        auto xOp        = iops.back().first;
-
-        ge::Operator *px = (ge::Operator *)xOp.get();
-        (*concat).set_dynamic_input_x(i + 1, *px);
+        xOp        = iops.back().first;
+        if (mNpuBackend->mSclipMap.find(inputIndex) == mNpuBackend->mSclipMap.end()) {
+            (*concatD).set_dynamic_input_x(i + 1, *xOp.get());
+        } else {
+            (*concatD).set_dynamic_input_x(i + 1, xOp->GetOutput(mNpuBackend->mSclipMap[inputIndex]));
+        }
     }
-
-    mNpuBackend->setOutputOps(mOp, {concat}, outputs);
-
+    mNpuBackend->setOutputOps(mOp, {concatD}, outputs);
     return NO_ERROR;
 }
 
-NPUCreatorRegister<TypedCreator<NPUConcat>> __concat_op(OpType_Concat);
+NPUCreatorRegister<TypedCreator<NPUConcat>> __concatD_op(OpType_Concat);
 
 } // namespace MNN

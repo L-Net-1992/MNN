@@ -9,8 +9,9 @@
 #include "BinaryGrad.hpp"
 #include "core/Macro.h"
 using namespace std;
-using namespace MNN;
 using namespace MNN::Express;
+namespace MNN {
+
 class EltwiseGrad : public OpGrad {
 public:
     virtual std::vector<Express::VARP> onGrad(Express::EXPRP expr,
@@ -79,6 +80,11 @@ public:
         for (int i = 0; i < expr->outputSize(); ++i) {
             output[i] = Variable::create(expr, i);
         }
+        int activateType = op->main_as_BinaryOp()->activationType();
+        if (activateType == 1) { // relu
+            auto mask = _Cast<float>(_Greater(output[0], _Scalar(0.0f)));
+            outputDiff = mask * backwardOutput[0];
+        }
         switch (op->main_as_BinaryOp()->opType()) {
             case BinaryOpOperation_ADD: {
                 res[0] = outputDiff;
@@ -119,7 +125,7 @@ public:
             }
             case BinaryOpOperation_POW: {
                 // d (pow(x, y)) = dv * pow(x, y) / x * y , dv * pow(x, y) * ln(x)
-                res[0] = outputDiff * output[0] * _Divide(inputs[1], inputs[0]);
+                res[0] = outputDiff * output[0] * OpGrad::divideAvoidZero(inputs[1], inputs[0]);
                 res[1] = outputDiff * output[0] * _Log(inputs[0]);
                 break;
             }
@@ -139,6 +145,7 @@ public:
                 break;
             }
             default:
+                MNN_ERROR("Can't grad for binary: %d\n", op->main_as_BinaryOp()->opType());
                 return res;
         }
         for (int i = 0; i < inputs.size(); ++i) {
@@ -187,10 +194,11 @@ public:
     }
 };
 
-static const auto gRegister = []() {
+static void _create() {
     static BinaryGrad _c;
     OpGrad::insert((int)OpType_BinaryOp, &_c);
     static EltwiseGrad _d;
     OpGrad::insert((int)OpType_Eltwise, &_d);
-    return true;
-}();
+}
+REGISTER_GRAD(BinaryGrad, _create);
+};

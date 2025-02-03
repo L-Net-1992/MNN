@@ -17,28 +17,26 @@ namespace OpenCL {
 
 
 RasterExecution::RasterExecution(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend)
-    : CommonExecution(backend) {
+    : CommonExecution(backend, op) {
     mOpenCLBackend = (OpenCLBackend *)backend;
-    mOp = op;
     //nothing to do
 }
 
-ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+ErrorCode RasterExecution::onEncode(const std::vector<Tensor *> &____inputs, const std::vector<Tensor *> &outputs) {
 #ifdef LOG_VERBOSE
     MNN_PRINT("start RasterExecution onResize !\n");
 #endif
     mTempInput.clear();
     mTempOutput = nullptr;
-    MNN_ASSERT(inputs.size() == 1);
     MNN_ASSERT(outputs.size() == 1);
-    auto input = inputs[0];
     auto output = outputs[0];
-    auto des = TensorUtils::getDescribe(input);
+    OpCommonUtils::rasterInputReset(____inputs, outputs[0]);
+
+    auto des = TensorUtils::getDescribe(output);
     auto outputDes = TensorUtils::getDescribe(output);
-    mNeedZero = !TensorUtils::regionIsFull(input);
+    mNeedZero = !TensorUtils::regionIsFull(output);
     auto regionNum = des->regions.size();
     auto runtime = ((OpenCLBackend *)backend())->getOpenCLRuntime();
-    
     mFast = false;
     if (outputDes->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
         mFast = true;
@@ -66,7 +64,7 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
             auto outputShape    = tensorShapeFormat(output);
             int region[] = {outputShape[0], UP_DIV(outputShape[3], 4), outputShape[1], outputShape[2]};//nhwc
             Unit &unit          = mUnits[kernel_idx++];
-            unit.kernel         = runtime->buildKernel("raster", "image_set_zero", {});
+            unit.kernel         = runtime->buildKernel("raster", "image_set_zero", {}, output, output);
             unit.localWorkSize  = {8, 8};
             unit.globalWorkSize = {(uint32_t)UP_DIV((region[1] * region[3]), 16)*16,
                                    (uint32_t)UP_DIV((region[0] * region[2]), 16)*16};
@@ -76,13 +74,17 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
 
             uint32_t idx   = 0;
             cl_int ret = CL_SUCCESS;
-            ret |= unit.kernel.setArg(idx++, global_dim0);
-            ret |= unit.kernel.setArg(idx++, global_dim1);
-            ret |= unit.kernel.setArg(idx++, openCLImage(output));
+            ret |= unit.kernel->get().setArg(idx++, global_dim0);
+            ret |= unit.kernel->get().setArg(idx++, global_dim1);
+            ret |= unit.kernel->get().setArg(idx++, openCLImage(output));
             if(ret != CL_SUCCESS)
             {
                 MNN_PRINT("setArg err %d\n", (int)ret);
             }
+            mOpenCLBackend->recordKernel2d(unit.kernel,
+                {(uint32_t)UP_DIV((region[1] * region[3]), 16)*16,
+                (uint32_t)UP_DIV((region[0] * region[2]), 16)*16},
+                {8, 8});
         }
         
         // image raster
@@ -92,7 +94,7 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
             OpCommonUtils::turnToPackRegion(slice, C4Region, output, 4);
 
             Unit &unit          = mUnits[kernel_idx++];
-            unit.kernel         = runtime->buildKernel("raster", "raster_image", {});
+            unit.kernel         = runtime->buildKernel("raster", "raster_image", {}, output, output);
 
             const std::vector<uint32_t> gws =  {(uint32_t)C4Region.size[2],
                                                     (uint32_t)C4Region.size[1],
@@ -104,25 +106,25 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
 
             uint32_t idx   = 0;
             cl_int ret = CL_SUCCESS;
-            ret |= unit.kernel.setArg(idx++, gws[0]);
-            ret |= unit.kernel.setArg(idx++, gws[1]);
-            ret |= unit.kernel.setArg(idx++, gws[2]);
-            ret |= unit.kernel.setArg(idx++, openCLImage(slice.origin));
-            ret |= unit.kernel.setArg(idx++, C4Region.src.offset);
-            ret |= unit.kernel.setArg(idx++, C4Region.src.stride[0]);
-            ret |= unit.kernel.setArg(idx++, C4Region.src.stride[1]);
-            ret |= unit.kernel.setArg(idx++, C4Region.src.stride[2]);
-            ret |= unit.kernel.setArg(idx++, sliceShape[1]);
-            ret |= unit.kernel.setArg(idx++, sliceShape[2]);
-            ret |= unit.kernel.setArg(idx++, sliceShape[3]);
-            ret |= unit.kernel.setArg(idx++, openCLImage(output));
-            ret |= unit.kernel.setArg(idx++, C4Region.dst.offset);
-            ret |= unit.kernel.setArg(idx++, C4Region.dst.stride[0]);
-            ret |= unit.kernel.setArg(idx++, C4Region.dst.stride[1]);
-            ret |= unit.kernel.setArg(idx++, C4Region.dst.stride[2]);
-            ret |= unit.kernel.setArg(idx++, outputShape[1]);
-            ret |= unit.kernel.setArg(idx++, outputShape[2]);
-            ret |= unit.kernel.setArg(idx++, outputShape[3]);
+            ret |= unit.kernel->get().setArg(idx++, gws[0]);
+            ret |= unit.kernel->get().setArg(idx++, gws[1]);
+            ret |= unit.kernel->get().setArg(idx++, gws[2]);
+            ret |= unit.kernel->get().setArg(idx++, openCLImage(slice.origin));
+            ret |= unit.kernel->get().setArg(idx++, C4Region.src.offset);
+            ret |= unit.kernel->get().setArg(idx++, C4Region.src.stride[0]);
+            ret |= unit.kernel->get().setArg(idx++, C4Region.src.stride[1]);
+            ret |= unit.kernel->get().setArg(idx++, C4Region.src.stride[2]);
+            ret |= unit.kernel->get().setArg(idx++, sliceShape[1]);
+            ret |= unit.kernel->get().setArg(idx++, sliceShape[2]);
+            ret |= unit.kernel->get().setArg(idx++, sliceShape[3]);
+            ret |= unit.kernel->get().setArg(idx++, openCLImage(output));
+            ret |= unit.kernel->get().setArg(idx++, C4Region.dst.offset);
+            ret |= unit.kernel->get().setArg(idx++, C4Region.dst.stride[0]);
+            ret |= unit.kernel->get().setArg(idx++, C4Region.dst.stride[1]);
+            ret |= unit.kernel->get().setArg(idx++, C4Region.dst.stride[2]);
+            ret |= unit.kernel->get().setArg(idx++, outputShape[1]);
+            ret |= unit.kernel->get().setArg(idx++, outputShape[2]);
+            ret |= unit.kernel->get().setArg(idx++, outputShape[3]);
             if(ret != CL_SUCCESS)
             {
                 MNN_PRINT("setArg err %d\n", (int)ret);
@@ -135,18 +137,12 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
             unit.globalWorkSize = {ROUND_UP(gws[0], std::max((uint32_t)1, lws[0])),
                                    ROUND_UP(gws[1], std::max((uint32_t)1, lws[1])),
                                    ROUND_UP(gws[2], std::max((uint32_t)1, lws[2]))};
-        }
-        if(mNeedZero)
-        {
-            MNN_ASSERT((regionNum+1==kernel_idx));
-        }
-        else
-        {
-            MNN_ASSERT((regionNum==kernel_idx));
+            mOpenCLBackend->recordKernel3d(unit.kernel, gws, lws);
         }
         return NO_ERROR;
     }
-
+    
+    bool cancombine = CanCombine(outputs);
     // Alloc Temp buffer
     auto bufferPool     = ((OpenCLBackend *)backend())->getBufferPool();
     auto bufferUnitSize = runtime->isSupportedFP16() ? sizeof(half_float::half) : sizeof(float);
@@ -170,6 +166,9 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
     bufferPool->recycle(mTempOutput);
     
     auto originNum = mTempInput.size();
+    if(cancombine){
+        regionNum = 1;
+    }
     mUnits.resize(regionNum + originNum + 1);
     
     int kernel_idx = 0;
@@ -179,16 +178,16 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         auto outputShape    = tensorShapeFormat(output);
         int region[] = {outputShape[0], outputShape[3], outputShape[1], outputShape[2]};//nhwc
         Unit &unit          = mUnits[kernel_idx++];
-        unit.kernel         = runtime->buildKernel("raster", "buffer_set_zero", {});
+        unit.kernel         = runtime->buildKernel("raster", "buffer_set_zero", {}, output, output);
 
         std::vector<uint32_t> gws = {(uint32_t)(region[2] * region[3]),
                                      (uint32_t)(region[0] * region[1])};
         
         uint32_t idx   = 0;
         cl_int ret = CL_SUCCESS;
-        ret |= unit.kernel.setArg(idx++, gws[0]);
-        ret |= unit.kernel.setArg(idx++, gws[1]);
-        ret |= unit.kernel.setArg(idx++, *mTempOutput);
+        ret |= unit.kernel->get().setArg(idx++, gws[0]);
+        ret |= unit.kernel->get().setArg(idx++, gws[1]);
+        ret |= unit.kernel->get().setArg(idx++, *mTempOutput);
         if(ret != CL_SUCCESS)
         {
             MNN_PRINT("setArg err %d\n", (int)ret);
@@ -202,6 +201,8 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         unit.localWorkSize = {lws[0], lws[1]};
         unit.globalWorkSize = {ROUND_UP(gws[0], std::max((uint32_t)1, lws[0])),
             ROUND_UP(gws[1], std::max((uint32_t)1, lws[1]))};
+        
+        mOpenCLBackend->recordKernel2d(unit.kernel, gws, lws);
     }
 
     //image to buffer
@@ -215,11 +216,11 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         Unit &unit          = mUnits[kernel_idx++];
         if(TensorUtils::getDescribe(origin)->dimensionFormat == MNN_DATA_FORMAT_NHWC)// Image to nhwc buffer
         {
-            unit.kernel         = runtime->buildKernel("buffer_to_image", "image_to_nhwc_buffer", {});
+            unit.kernel         = runtime->buildKernel("buffer_to_image", "image_to_nhwc_buffer", {}, origin, origin);
         }
         else //Image to nchw buffer
         {
-            unit.kernel         = runtime->buildKernel("buffer_to_image", "image_to_nchw_buffer", {});
+            unit.kernel         = runtime->buildKernel("buffer_to_image", "image_to_nchw_buffer", {}, origin, origin);
         }
 
         std::vector<uint32_t> gws = {(uint32_t)(region[3] * region[1]),
@@ -227,13 +228,13 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         //MNN_CHECK_CL_SUCCESS
         uint32_t idx   = 0;
         cl_int ret = CL_SUCCESS;
-        ret |= unit.kernel.setArg(idx++, gws[0]);
-        ret |= unit.kernel.setArg(idx++, gws[1]);
-        ret |= unit.kernel.setArg(idx++, *(iter.second));
-        ret |= unit.kernel.setArg(idx++, inputWH[1]);
-        ret |= unit.kernel.setArg(idx++, inputWH[0]);
-        ret |= unit.kernel.setArg(idx++, regionShape[3]);
-        ret |= unit.kernel.setArg(idx++, openCLImage(origin));
+        ret |= unit.kernel->get().setArg(idx++, gws[0]);
+        ret |= unit.kernel->get().setArg(idx++, gws[1]);
+        ret |= unit.kernel->get().setArg(idx++, *(iter.second));
+        ret |= unit.kernel->get().setArg(idx++, inputWH[1]);
+        ret |= unit.kernel->get().setArg(idx++, inputWH[0]);
+        ret |= unit.kernel->get().setArg(idx++, regionShape[3]);
+        ret |= unit.kernel->get().setArg(idx++, openCLImage(origin));
         if(ret != CL_SUCCESS)
         {
             MNN_PRINT("setArg err %d\n", (int)ret);
@@ -247,38 +248,47 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         unit.localWorkSize = {lws[0], lws[1]};
         unit.globalWorkSize = {ROUND_UP(gws[0], std::max((uint32_t)1, lws[0])),
             ROUND_UP(gws[1], std::max((uint32_t)1, lws[1]))};
+        mOpenCLBackend->recordKernel2d(unit.kernel, gws, lws);
     }
     
     // buffer raster
-    for (auto& slice : des->regions)
-    {
+    if(cancombine){
+        auto regions = des->regions;
+        auto slice = regions[0];
+        int nums = regions.size();
+        int src_offset = regions[1].src.offset - slice.src.offset;
+        int dst_offset = regions[1].dst.offset - slice.dst.offset;
+        
         Unit &unit          = mUnits[kernel_idx++];
-        unit.kernel         = runtime->buildKernel("raster", "raster_buffer", {});
-
-        unit.globalWorkSize = {(uint32_t)slice.size[2],
-                               (uint32_t)slice.size[1],
-                               (uint32_t)slice.size[0]};
-
-        const std::vector<uint32_t> gws =  {(uint32_t)slice.size[2],
-                                                (uint32_t)slice.size[1],
-                                                (uint32_t)slice.size[0]};
+        unit.kernel         = runtime->buildKernel("raster", "raster_buffer_combine", {}, output, output);
+        
+        unit.globalWorkSize = {(uint32_t)slice.size[2] * nums,
+            (uint32_t)slice.size[1],
+            (uint32_t)slice.size[0]};
+        
+        const std::vector<uint32_t> gws =  {(uint32_t)slice.size[2] * nums,
+            (uint32_t)slice.size[1],
+            (uint32_t)slice.size[0]};
         uint32_t mMaxWorkGroupSize      = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(unit.kernel));
-
+        
         uint32_t idx   = 0;
         cl_int ret = CL_SUCCESS;
-        ret |= unit.kernel.setArg(idx++, gws[0]);
-        ret |= unit.kernel.setArg(idx++, gws[1]);
-        ret |= unit.kernel.setArg(idx++, gws[2]);
-        ret |= unit.kernel.setArg(idx++, *(mTempInput[slice.origin]));
-        ret |= unit.kernel.setArg(idx++, slice.src.offset);
-        ret |= unit.kernel.setArg(idx++, slice.src.stride[0]);
-        ret |= unit.kernel.setArg(idx++, slice.src.stride[1]);
-        ret |= unit.kernel.setArg(idx++, slice.src.stride[2]);
-        ret |= unit.kernel.setArg(idx++, *mTempOutput);
-        ret |= unit.kernel.setArg(idx++, slice.dst.offset);
-        ret |= unit.kernel.setArg(idx++, slice.dst.stride[0]);
-        ret |= unit.kernel.setArg(idx++, slice.dst.stride[1]);
-        ret |= unit.kernel.setArg(idx++, slice.dst.stride[2]);
+        ret |= unit.kernel->get().setArg(idx++, gws[0]);
+        ret |= unit.kernel->get().setArg(idx++, gws[1]);
+        ret |= unit.kernel->get().setArg(idx++, gws[2]);
+        ret |= unit.kernel->get().setArg(idx++, *(mTempInput[slice.origin]));
+        ret |= unit.kernel->get().setArg(idx++, slice.src.offset);
+        ret |= unit.kernel->get().setArg(idx++, src_offset);
+        ret |= unit.kernel->get().setArg(idx++, slice.src.stride[0]);
+        ret |= unit.kernel->get().setArg(idx++, slice.src.stride[1]);
+        ret |= unit.kernel->get().setArg(idx++, slice.src.stride[2]);
+        ret |= unit.kernel->get().setArg(idx++, *mTempOutput);
+        ret |= unit.kernel->get().setArg(idx++, slice.dst.offset);
+        ret |= unit.kernel->get().setArg(idx++, dst_offset);
+        ret |= unit.kernel->get().setArg(idx++, slice.dst.stride[0]);
+        ret |= unit.kernel->get().setArg(idx++, slice.dst.stride[1]);
+        ret |= unit.kernel->get().setArg(idx++, slice.dst.stride[2]);
+        ret |= unit.kernel->get().setArg(idx++, slice.size[2]);
         if(ret != CL_SUCCESS)
         {
             MNN_PRINT("setArg err %d\n", (int)ret);
@@ -290,8 +300,54 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         unit.localWorkSize = {lws[0], lws[1], lws[2]};
         
         unit.globalWorkSize = {ROUND_UP(gws[0], std::max((uint32_t)1, lws[0])),
-                               ROUND_UP(gws[1], std::max((uint32_t)1, lws[1])),
-                               ROUND_UP(gws[2], std::max((uint32_t)1, lws[2]))};
+            ROUND_UP(gws[1], std::max((uint32_t)1, lws[1])),
+            ROUND_UP(gws[2], std::max((uint32_t)1, lws[2]))};
+        mOpenCLBackend->recordKernel3d(unit.kernel, gws, lws);
+    }else{
+        for (auto& slice : des->regions)
+        {
+            Unit &unit          = mUnits[kernel_idx++];
+            unit.kernel         = runtime->buildKernel("raster", "raster_buffer", {}, output, output);
+            
+            unit.globalWorkSize = {(uint32_t)slice.size[2],
+                (uint32_t)slice.size[1],
+                (uint32_t)slice.size[0]};
+            
+            const std::vector<uint32_t> gws =  {(uint32_t)slice.size[2],
+                (uint32_t)slice.size[1],
+                (uint32_t)slice.size[0]};
+            uint32_t mMaxWorkGroupSize      = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(unit.kernel));
+            
+            uint32_t idx   = 0;
+            cl_int ret = CL_SUCCESS;
+            ret |= unit.kernel->get().setArg(idx++, gws[0]);
+            ret |= unit.kernel->get().setArg(idx++, gws[1]);
+            ret |= unit.kernel->get().setArg(idx++, gws[2]);
+            ret |= unit.kernel->get().setArg(idx++, *(mTempInput[slice.origin]));
+            ret |= unit.kernel->get().setArg(idx++, slice.src.offset);
+            ret |= unit.kernel->get().setArg(idx++, slice.src.stride[0]);
+            ret |= unit.kernel->get().setArg(idx++, slice.src.stride[1]);
+            ret |= unit.kernel->get().setArg(idx++, slice.src.stride[2]);
+            ret |= unit.kernel->get().setArg(idx++, *mTempOutput);
+            ret |= unit.kernel->get().setArg(idx++, slice.dst.offset);
+            ret |= unit.kernel->get().setArg(idx++, slice.dst.stride[0]);
+            ret |= unit.kernel->get().setArg(idx++, slice.dst.stride[1]);
+            ret |= unit.kernel->get().setArg(idx++, slice.dst.stride[2]);
+            if(ret != CL_SUCCESS)
+            {
+                MNN_PRINT("setArg err %d\n", (int)ret);
+            }
+            
+            std::string name = "rasterBuffer";
+            const std::vector<uint32_t> lws = localWS3DDefault(gws, mMaxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), name, unit.kernel).first;
+            
+            unit.localWorkSize = {lws[0], lws[1], lws[2]};
+            
+            unit.globalWorkSize = {ROUND_UP(gws[0], std::max((uint32_t)1, lws[0])),
+                ROUND_UP(gws[1], std::max((uint32_t)1, lws[1])),
+                ROUND_UP(gws[2], std::max((uint32_t)1, lws[2]))};
+            mOpenCLBackend->recordKernel3d(unit.kernel, gws, lws);
+        }
     }
     
     //buffer to image
@@ -303,24 +359,24 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         Unit &unit          = mUnits[kernel_idx++];
         if(outputDes->dimensionFormat == MNN_DATA_FORMAT_NHWC)//nhwc buffer to Image
         {
-            unit.kernel         = runtime->buildKernel("buffer_to_image", "nhwc_buffer_to_image", {});
+            unit.kernel         = runtime->buildKernel("buffer_to_image", "nhwc_buffer_to_image", {}, output, output);
         }
         else //nchw buffer to Image
         {
-            unit.kernel         = runtime->buildKernel("buffer_to_image", "nchw_buffer_to_image", {});
+            unit.kernel         = runtime->buildKernel("buffer_to_image", "nchw_buffer_to_image", {}, output, output);
         }
         
         std::vector<uint32_t> gws = {(uint32_t)(region[3] * region[1]),
                                      (uint32_t)(region[2] * region[0])};
         uint32_t idx   = 0;
         cl_int ret = CL_SUCCESS;
-        ret |= unit.kernel.setArg(idx++, gws[0]);
-        ret |= unit.kernel.setArg(idx++, gws[1]);
-        ret |= unit.kernel.setArg(idx++, *mTempOutput);
-        ret |= unit.kernel.setArg(idx++, wh[1]);
-        ret |= unit.kernel.setArg(idx++, wh[0]);
-        ret |= unit.kernel.setArg(idx++, outputShape[3]);
-        ret |= unit.kernel.setArg(idx++, openCLImage(output));
+        ret |= unit.kernel->get().setArg(idx++, gws[0]);
+        ret |= unit.kernel->get().setArg(idx++, gws[1]);
+        ret |= unit.kernel->get().setArg(idx++, *mTempOutput);
+        ret |= unit.kernel->get().setArg(idx++, wh[1]);
+        ret |= unit.kernel->get().setArg(idx++, wh[0]);
+        ret |= unit.kernel->get().setArg(idx++, outputShape[3]);
+        ret |= unit.kernel->get().setArg(idx++, openCLImage(output));
         if(ret != CL_SUCCESS)
         {
             MNN_PRINT("setArg err %d\n", (int)ret);
@@ -334,16 +390,7 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
         unit.localWorkSize = {lws[0], lws[1]};
         unit.globalWorkSize = {ROUND_UP(gws[0], std::max((uint32_t)1, lws[0])),
             ROUND_UP(gws[1], std::max((uint32_t)1, lws[1]))};
-    }
-    
-    //kernel num check
-    if(mNeedZero)
-    {
-        MNN_ASSERT((kernel_idx==regionNum + originNum + 2));
-    }
-    else
-    {
-        MNN_ASSERT((kernel_idx==regionNum + originNum + 1));
+        mOpenCLBackend->recordKernel2d(unit.kernel, gws, lws);
     }
     
 #ifdef LOG_VERBOSE
@@ -352,6 +399,45 @@ ErrorCode RasterExecution::onResize(const std::vector<Tensor *> &inputs, const s
     return NO_ERROR;
 }
 
-OpenCLCreatorRegister<TypedCreator<RasterExecution>> __Raster_op(OpType_Raster, IMAGE);
+bool RasterExecution::CanCombine(const std::vector<Tensor *> &outputs){
+    auto des = TensorUtils::getDescribe(outputs[0]);
+    auto regions = des->regions;
+    if(regions.size() < 2)
+        return false;
+    auto origin = regions[0].origin;
+    const int size0 = regions[0].size[0];
+    const int size1 = regions[0].size[1];
+    const int size2 = regions[0].size[2];
+    const int src_offset = regions[1].src.offset - regions[0].src.offset;
+    const int dst_offset = regions[1].dst.offset - regions[0].dst.offset;
+    const int src_sride0 = regions[0].src.stride[0];
+    const int src_sride1 = regions[0].src.stride[1];
+    const int src_sride2 = regions[0].src.stride[2];
+    const int dst_sride0 = regions[0].dst.stride[0];
+    const int dst_sride1 = regions[0].dst.stride[1];
+    const int dst_sride2 = regions[0].dst.stride[2];
+    bool res = true;
+    for(int i = 1; i < regions.size(); ++i){
+        res &= regions[i].origin == origin;
+        res &= regions[i].size[0] == size0;
+        res &= regions[i].size[1] == size1;
+        res &= regions[i].size[2] == size2;
+        res &= regions[i].src.stride[0] == src_sride0;
+        res &= regions[i].src.stride[1] == src_sride1;
+        res &= regions[i].src.stride[2] == src_sride2;
+        res &= regions[i].dst.stride[0] == dst_sride0;
+        res &= regions[i].dst.stride[1] == dst_sride1;
+        res &= regions[i].dst.stride[2] == dst_sride2;
+        res &= (regions[i].src.offset - regions[i - 1].src.offset) == src_offset;
+        res &= (regions[i].dst.offset - regions[i - 1].dst.offset) == dst_offset;
+        if(res == false){
+            return res;
+        }
+    }
+    return res;
+}
+
+using RasterCreator = TypedCreator<RasterExecution>;
+REGISTER_OPENCL_OP_CREATOR(RasterCreator, OpType_Raster, IMAGE);
 } // namespace OpenCL
 } // namespace MNN

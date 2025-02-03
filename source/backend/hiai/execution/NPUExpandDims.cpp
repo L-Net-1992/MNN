@@ -21,15 +21,27 @@ ErrorCode NPUExpandDims::onResize(const std::vector<Tensor *> &inputs, const std
     
     auto opName = mOp->name()->str();
     auto xOp = mNpuBackend->getInputOps(mOp);
-
-    shared_ptr<ge::op::Reshape> prob(new ge::op::Reshape(opName));
-
-    auto output = outputs[0];
-
-    auto shape = tensorShapeFormat(outputs[0]);
     
-    (*prob).set_input_tensor(*xOp.get()).set_attr_shape(ge::AttrValue::LIST_INT(shape));
+    auto inputIndex = mOp->inputIndexes()->data()[0];
+    auto iops = mNpuBackend->mGrapMap[inputIndex]; // x
+    xOp = iops.back().first;
     
+    auto param = mOp->main_as_ExpandDims();
+    vector<int32_t> axs = {param->axis()};
+    shapeConst = hiai::op::Const(opName + "_shape_const");
+    ge::TensorDesc fdesc(ge::Shape({1}), ge::FORMAT_NCHW,  ge::DT_INT32);
+    ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+    filter->SetTensorDesc(fdesc);
+    filter->SetData((uint8_t *)axs.data(), sizeof(int32_t));
+    shapeConst.set_attr_value(filter);
+
+    shared_ptr<hiai::op::ExpandDims> prob(new hiai::op::ExpandDims(opName));
+    if (mNpuBackend->mSclipMap.find(inputIndex) == mNpuBackend->mSclipMap.end()) {
+        (*prob).set_input_x(*xOp.get());
+    } else {
+        (*prob).set_input_x(xOp->GetOutput(mNpuBackend->mSclipMap[inputIndex]));
+    }
+    (*prob).set_input_axis(shapeConst);
     mNpuBackend->setOutputOps(mOp, {prob}, outputs);
 
     return NO_ERROR;

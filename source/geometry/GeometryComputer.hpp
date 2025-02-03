@@ -23,7 +23,7 @@ public:
     }
     class MNN_PUBLIC Context {
     public:
-        Context(std::shared_ptr<Backend> allocBackend, bool permitVirtual = true, MNNForwardType = MNN_FORWARD_CPU);
+        Context(int mask, std::shared_ptr<Backend> allocBackend, MNNForwardType type = MNN_FORWARD_CPU, BackendConfig::PrecisionMode precision = BackendConfig::Precision_Normal);
         ~Context();
 
         void clear();
@@ -38,8 +38,14 @@ public:
         inline MNNForwardType forwardType() const {
             return mForwardType;
         }
-        void pushCache(const CommandBuffer& buffer);
+        inline BackendConfig::PrecisionMode precisionType() const {
+            return mPrecision;
+        }
+        inline bool support(int option) const {
+            return mMask & option;
+        }
         std::shared_ptr<BufferStorage> mRasterOp;
+        bool mNeedRelease = true;
     private:
         void getRasterCacheCreate(Tensor* src, CommandBuffer& cmd);
         std::map<const Op*, std::vector<std::shared_ptr<Tensor>>> mConstTensors;
@@ -47,7 +53,9 @@ public:
         std::vector<std::shared_ptr<Tensor>> mTempConstTensors;
         std::shared_ptr<Backend> mBackend;
         MNNForwardType mForwardType;
-        std::vector<SharedPtr<Command>> mRasterCmdCache;
+        BackendConfig::PrecisionMode mPrecision;
+        TensorUtils::FuseWrap mFuseUtils;
+        const int mMask;
     };
     static void init();
     MNN_PUBLIC static const GeometryComputer* search(int opType, Runtime::CompilerType compType);
@@ -59,6 +67,7 @@ public:
                              Context& context, CommandBuffer& cmd) const {
         return false;
     }
+    static bool ComputePermuteRegion(Tensor* input, Tensor* output, int* newshape, int shapeDim);
 };
 
 class DefaultGeometryComputer : public GeometryComputer {

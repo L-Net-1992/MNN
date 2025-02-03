@@ -19,6 +19,7 @@
 #include <iostream>
 #include "core/Backend.hpp"
 #include <MNN/expr/Executor.hpp>
+#include <MNN/expr/ExecutorScope.hpp>
 #include "MNN_generated.h"
 /**
  * @brief dispatch payload on all available backends
@@ -46,7 +47,7 @@ bool checkVector(const T* result, const T* rightData, int size, T threshold){
     MNN_ASSERT(size >= 0);
     for(int i = 0; i < size; ++i){
         if(fabs(result[i] - rightData[i]) > threshold){
-            std::cout << "right: " << rightData[i] << ", compute: " << result[i] << std::endl;
+            std::cout << "No." << i << " error, right: " << rightData[i] << ", compute: " << result[i] << std::endl;
             return false;
         }
     }
@@ -101,10 +102,11 @@ float convertFP32ToFP16(float fp32Value);
 inline float keepFP32Precision(float fp32Value) {
     return fp32Value;
 }
+MNNForwardType getCurrentType();
 
 using ConvertFP32 = float(*)(float fp32Value);
 
-const static ConvertFP32 FP32Converter[MNN::BackendConfig::Precision_Low + 2] = {
+const static std::vector<ConvertFP32> FP32Converter = {
     keepFP32Precision,
     keepFP32Precision,
 #ifdef MNN_SUPPORT_BF16

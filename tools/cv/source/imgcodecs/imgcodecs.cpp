@@ -18,7 +18,7 @@
 #define STBI_ONLY_PNG
 #define STBI_ONLY_BMP
 #define STB_IMAGE_STATIC
-
+#define STB_IMAGE_WRITE_STATIC
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -140,10 +140,10 @@ bool imwrite(const std::string& filename, VARP img, const std::vector<int>& para
         }
         return stbi_write_jpg(filename.c_str(), width, height, channel, img->readMap<uint8_t>(), quality);
     }
-    if (ext == ".png") {
+    if (ext == "png") {
         return stbi_write_png(filename.c_str(), width, height, channel, img->readMap<uint8_t>(), 0);
     }
-    if (ext == ".bmp") {
+    if (ext == "bmp") {
         return stbi_write_bmp(filename.c_str(), width, height, channel, img->readMap<uint8_t>());
     }
     return false;

@@ -22,6 +22,12 @@ static void _MNNGetMatMulPackMode(int* eP, int *lP, int* hP) {
     *hP = ghP;
 }
 
+#ifndef MNN_USE_AVX
+bool AVX2Functions::init(int cpuFlags) {
+    return false;
+}
+#else
+
 bool AVX2Functions::init(int cpuFlags) {
     gAVX2CoreFunctions = new CoreFunctions;
     auto coreFunction = gAVX2CoreFunctions;
@@ -39,10 +45,20 @@ bool AVX2Functions::init(int cpuFlags) {
 
     coreFunction->MNNPackedMatMul       = _AVX_MNNPackedMatMul;
     coreFunction->MNNPackedMatMulRemain = _AVX_MNNPackedMatMulRemain;
+#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
+    coreFunction->MNNPackedMatMul_int8       = _AVX_MNNPackedMatMul_int8;
+    coreFunction->MNNPackedMatMulRemain_int8 = _AVX_MNNPackedMatMulRemain_int8;
+#endif
+
+#ifdef MNN_LOW_MEMORY
+    coreFunction->MNNAbsMax = _AVX_MNNAbsMaxFP32;
+#endif
     coreFunction->MNNPackC4ForMatMul_A  = _AVX_MNNPackC4ForMatMul_A;
     coreFunction->MNNPackForMatMul_B    = _AVX_MNNPackForMatMul_B;
     coreFunction->MNNComputeMatMulForE_1 = _AVX_MNNComputeMatMulForE_1;
     coreFunction->MNNComputeMatMulForH_1 = _AVX_MNNComputeMatMulForH_1;
+    // Dynamic Quant
+    coreFunction->MNNCountMaxMinValue = _AVX_MNNComputeScaleZeroScalar;
 
     // For Packed Functions
     coreFunction->pack = 8;
@@ -56,8 +72,6 @@ bool AVX2Functions::init(int cpuFlags) {
         coreFunction->MNNComputeMatMulForH_1 = _AVX_MNNComputeMatMulForH_1FMA;
         _AVX_ExtraInitFMA(coreFunction);
     }
-    // For ImageProcess Functions
-    _SSE_ImageProcessInit(coreFunction);
 #ifdef MNN_AVX512
     if ((cpuFlags & libyuv::kCpuHasAVX512VNNI)
         || (cpuFlags & libyuv::kCpuHasAVX512VL)
@@ -89,11 +103,12 @@ bool AVX2Functions::init(int cpuFlags) {
 #endif
     return true;
 }
+#endif
+
 CoreFunctions* AVX2Functions::get() {
     return gAVX2CoreFunctions;
 }
 CoreInt8Functions* AVX2Functions::getInt8() {
     return gAVX2CoreInt8Functions;
 }
-
 };

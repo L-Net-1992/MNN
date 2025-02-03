@@ -7,6 +7,7 @@
 //
 
 #include "CoreMLBinary.hpp"
+#include "core/TensorUtils.hpp"
 
 namespace MNN {
 
@@ -40,21 +41,25 @@ ErrorCode CoreMLBinary::onResize(const std::vector<Tensor *> &inputs, const std:
     bool oneInput = false;
     float constVal = 0.f;
     const Tensor* input = nullptr;
-    if (TensorUtils::getDescribe(inputs[0])->usage == Tensor::InsideDescribe::CONSTANT) {
+    if (TensorUtils::getDescribe(inputs[0])->usage == Tensor::InsideDescribe::CONSTANT && 1 == TensorUtils::getRawSize(inputs[0])) {
         constVal = inputs[0]->host<float>()[0];
         input = inputs[1];
-    } else if (TensorUtils::getDescribe(inputs[1])->usage == Tensor::InsideDescribe::CONSTANT) {
+    } else if (TensorUtils::getDescribe(inputs[1])->usage == Tensor::InsideDescribe::CONSTANT && 1 == TensorUtils::getRawSize(inputs[1])) {
         constVal = inputs[1]->host<float>()[0];
         input = inputs[0];
     }
     switch (binaryType) {
         case BinaryOpOperation_ADD:
-            mLayer_->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_ADD;
-            mLayer_->add = mCoreMLBackend->create<CoreML__Specification__AddLayerParams>();
-            core_ml__specification__add_layer_params__init(mLayer_->add);
             if (input) {
+                mLayer_->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_ADD;
+                mLayer_->add = mCoreMLBackend->create<CoreML__Specification__AddLayerParams>();
+                core_ml__specification__add_layer_params__init(mLayer_->add);
                 mLayer_->add->alpha = constVal;
                 oneInput = true;
+            } else {
+                mLayer_->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_ADD_BROADCASTABLE;
+                mLayer_->addbroadcastable = mCoreMLBackend->create<CoreML__Specification__AddBroadcastableLayerParams>();
+                core_ml__specification__add_broadcastable_layer_params__init(mLayer_->addbroadcastable);
             }
             break;
         case BinaryOpOperation_SUB:
@@ -75,12 +80,16 @@ ErrorCode CoreMLBinary::onResize(const std::vector<Tensor *> &inputs, const std:
             }
             break;
         case BinaryOpOperation_MUL:
-            mLayer_->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_MULTIPLY;
-            mLayer_->multiply = mCoreMLBackend->create<CoreML__Specification__MultiplyLayerParams>();
-            core_ml__specification__multiply_layer_params__init(mLayer_->multiply);
             if (input) {
+                mLayer_->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_MULTIPLY;
+                mLayer_->multiply = mCoreMLBackend->create<CoreML__Specification__MultiplyLayerParams>();
+                core_ml__specification__multiply_layer_params__init(mLayer_->multiply);
                 mLayer_->multiply->alpha = constVal;
                 oneInput = true;
+            } else {
+                mLayer_->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_MULTIPLY_BROADCASTABLE;
+                mLayer_->multiplybroadcastable = mCoreMLBackend->create<_CoreML__Specification__MultiplyBroadcastableLayerParams>();
+                core_ml__specification__multiply_broadcastable_layer_params__init(mLayer_->multiplybroadcastable);
             }
             break;
         case BinaryOpOperation_DIV:
@@ -182,12 +191,43 @@ ErrorCode CoreMLBinary::onResize(const std::vector<Tensor *> &inputs, const std:
             MNN_ERROR("NPU Binary not support %s\n", MNN::EnumNameBinaryOpOperation(binaryType));
             break;
     }
-    if (oneInput) {
-        setLayerInputsAndOutputs(mLayer_, {mCoreMLBackend->getTensorName(input)}, {mCoreMLBackend->getTensorName(outputs[0])});
+
+    std::string binartInputName;
+    if(oneInput) {
+        binartInputName = mCoreMLBackend->getTensorName(input);
     } else {
-        setLayerInputsAndOutputs(mLayer_, {mCoreMLBackend->getTensorName(inputs[0]), mCoreMLBackend->getTensorName(inputs[1])}, {mCoreMLBackend->getTensorName(outputs[0])});
+        binartInputName = mCoreMLBackend->getTensorName(inputs[0]);
+    }
+    std::string binaryOutputName = mCoreMLBackend->getTensorName(outputs[0]);
+    int activationType = 0;
+    if(mOp->type() == OpType_BinaryOp) {
+        activationType = mOp->main_as_BinaryOp()->activationType();
+    }
+    if (activationType == 1) {
+        binaryOutputName = binartInputName + "-" + binaryOutputName + "-Relu";
+    }
+
+    if (oneInput) {
+        setLayerInputsAndOutputs(mLayer_, {mCoreMLBackend->getTensorName(input)}, {binaryOutputName});
+    } else {
+        setLayerInputsAndOutputs(mLayer_, {mCoreMLBackend->getTensorName(inputs[0]), mCoreMLBackend->getTensorName(inputs[1])}, {binaryOutputName});
     }
     mCoreMLBackend->addLayer(mLayer_);
+
+    if (activationType == 1) {
+        auto reluLayer = mCoreMLBackend->create<CoreML__Specification__NeuralNetworkLayer>();
+        core_ml__specification__neural_network_layer__init(reluLayer);
+        mCoreMLBackend->setLayerName(reluLayer, "BinaryRelu");
+        reluLayer->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_ACTIVATION;
+        reluLayer->activation = mCoreMLBackend->create<CoreML__Specification__ActivationParams>();
+        core_ml__specification__activation_params__init(reluLayer->activation);
+        reluLayer->activation->nonlinearity_type_case = CORE_ML__SPECIFICATION__ACTIVATION_PARAMS__NONLINEARITY_TYPE_RE_LU;
+        reluLayer->activation->relu = mCoreMLBackend->create<CoreML__Specification__ActivationReLU>();
+        core_ml__specification__activation_re_lu__init(reluLayer->activation->relu);
+        setLayerInputsAndOutputs(reluLayer, {binaryOutputName}, {mCoreMLBackend->getTensorName(outputs[0])});
+        mCoreMLBackend->addLayer(reluLayer);
+    }
+
     return NO_ERROR;
 }
 

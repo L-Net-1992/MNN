@@ -9,28 +9,31 @@
 #ifndef MetalRaster_hpp
 #define MetalRaster_hpp
 
-#import "core/Execution.hpp"
-#import "MetalDefine.h"
+#import "MetalExecution.hpp"
 #include <map>
 
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-class MetalRaster : public Execution {
+class MetalRaster : public MetalExecution {
 public:
     MetalRaster(Backend *backend);
-    virtual ~MetalRaster() = default;
+    virtual ~MetalRaster();
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
+    static id<MTLComputePipelineState> getBlitPipeline(int bytes, Backend* backend, bool multiRegion);
+    struct BlitInfo {
+        std::pair<void*, size_t> blit;
+        MTLSize local;
+        MTLSize global;
+    };
 private:
-    std::map<Tensor*, std::shared_ptr<Tensor>> mTempInput;
-    std::vector<std::tuple<id<MTLBuffer>, id<MTLBuffer>, MTLSize, MTLSize, int> > mTempInputCopy;
-    std::shared_ptr<Tensor> mTempOutput;
+    std::map<Tensor*, BlitInfo> mTempInputCopy;
     bool mNeedZero = false;
-    id<MTLBuffer> mOutputPtr;
-    bool mFast = false;
-    id<MTLComputePipelineState> mBlitPipeline;
-    std::vector<id<MTLBuffer>> mShapeTemp;
+    Tensor* mOutputPtr = nullptr;
+    std::vector<id<MTLComputePipelineState>> mBlitPipeline;
+    id<MTLBuffer> mZeroCopy = nil;
+    id<MTLComputePipelineState> mZeroPipeline;
 };
 
 } // namespace MNN

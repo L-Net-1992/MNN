@@ -8,61 +8,12 @@
 
 #include "CoreMLRaster.hpp"
 #include <cmath>
+#include "core/OpCommonUtils.hpp"
 
 namespace MNN {
 
 CoreMLRaster::CoreMLRaster(MNN::Backend *b, const MNN::Op *op, const std::vector<Tensor *> &inputs, const std::vector<MNN::Tensor *> &outputs) : CoreMLCommonExecution(b, op) {
     initLayer();
-}
-
-static bool isTranspose(const Tensor::InsideDescribe::Region& region) {
-    int srcOne = -1, dstOne = -1;
-    for (int i = 0; i < 3; i++) {
-        if (region.src.stride[i] == 1 && region.size[i] != 1) {
-            if (srcOne >= 0 || region.size[i] < 4) {
-                return false;
-            }
-            srcOne = i;
-        }
-        if (region.dst.stride[i] == 1 && region.size[i] != 1) {
-            if (dstOne >= 0 || region.size[i] < 4) {
-                return false;
-            }
-            dstOne = i;
-        }
-    }
-    return srcOne >= 0 && dstOne >= 0 && srcOne != dstOne;
-}
-
-static bool isDepthToSpace(const Tensor* output) {
-    const auto& regions = TensorUtils::getDescribe(output)->regions;
-    auto input = regions[0].origin;
-    for (const auto region : regions) {
-        if (region.origin != input) {
-            return false;
-        }
-    }
-    auto ic = input->channel();
-    auto ih = input->height();
-    auto iw = input->width();
-    auto oc = output->channel();
-    auto oh = output->height();
-    auto ow = output->width();
-    if (ic * ih * iw != oc * oh * ow) {
-        return false;
-    }
-    int hblock = oh / ih;
-    int wblock = ow / iw;
-    if (hblock != wblock) {
-        return false;
-    }
-    if (hblock * wblock * oc != ic) {
-        return false;
-    }
-    if (regions.size() != hblock * wblock) {
-        return false;
-    }
-    return true;
 }
 
 bool CoreMLRaster::buildReshape(CoreML__Specification__NeuralNetworkLayer* layer, const Tensor* input, const Tensor* output) {
@@ -76,6 +27,11 @@ bool CoreMLRaster::buildReshape(CoreML__Specification__NeuralNetworkLayer* layer
     for (int i = 0; i < outputShape.size(); i++) {
         layer->reshapestatic->targetshape[i] = outputShape[i];
     }
+     if (outputShape.size() == 0) {
+         layer->reshapestatic->n_targetshape = 1;
+         layer->reshapestatic->targetshape = mCoreMLBackend->create<int64_t>(layer->reshapestatic->n_targetshape);
+         layer->reshapestatic->targetshape[0] = 1;
+     }
     mCoreMLBackend->setLayerInputs(layer, {mCoreMLBackend->getTensorName(input)});
     return true;
 }
@@ -87,29 +43,44 @@ bool CoreMLRaster::buildPermute(CoreML__Specification__NeuralNetworkLayer* layer
         core_ml__specification__neural_network_layer__init(permuteLayer);
         reshapeLayer = layer;
     }
-    mCoreMLBackend->setLayerName(permuteLayer, "Permute");
-    permuteLayer->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_PERMUTE;
-    permuteLayer->permute = mCoreMLBackend->create<CoreML__Specification__PermuteLayerParams>();
-    core_ml__specification__permute_layer_params__init(permuteLayer->permute);
-    permuteLayer->permute->n_axis = 4;
-    permuteLayer->permute->axis = mCoreMLBackend->create<uint64_t>(permuteLayer->permute->n_axis);
+    mCoreMLBackend->setLayerName(permuteLayer, "Transpose");
+    permuteLayer->layer_case = CORE_ML__SPECIFICATION__NEURAL_NETWORK_LAYER__LAYER_TRANSPOSE;
+    permuteLayer->transpose = mCoreMLBackend->create<CoreML__Specification__TransposeLayerParams>();
+    core_ml__specification__transpose_layer_params__init(permuteLayer->transpose);
+    permuteLayer->transpose->n_axes = 4;
+    permuteLayer->transpose->axes = mCoreMLBackend->create<uint64_t>(permuteLayer->transpose->n_axes);
     auto srcFormat = TensorUtils::getDescribe(input)->dimensionFormat;
     auto dstFormat = TensorUtils::getDescribe(output)->dimensionFormat;
     // NCHW -> NHWC
     if ((srcFormat == MNN_DATA_FORMAT_NC4HW4 || srcFormat == MNN_DATA_FORMAT_NCHW)
         && dstFormat == MNN_DATA_FORMAT_NHWC) {
-        permuteLayer->permute->axis[0] = 0;
-        permuteLayer->permute->axis[1] = 2;
-        permuteLayer->permute->axis[2] = 3;
-        permuteLayer->permute->axis[3] = 1;
+        permuteLayer->transpose->axes[0] = 0;
+        permuteLayer->transpose->axes[1] = 2;
+        permuteLayer->transpose->axes[2] = 3;
+        permuteLayer->transpose->axes[3] = 1;
     }
     // NHWC -> NCHW
     if ((dstFormat == MNN_DATA_FORMAT_NC4HW4 || srcFormat == MNN_DATA_FORMAT_NCHW)
         && srcFormat == MNN_DATA_FORMAT_NHWC) {
-        permuteLayer->permute->axis[0] = 0;
-        permuteLayer->permute->axis[1] = 3;
-        permuteLayer->permute->axis[2] = 1;
-        permuteLayer->permute->axis[3] = 2;
+        permuteLayer->transpose->axes[0] = 0;
+        permuteLayer->transpose->axes[1] = 3;
+        permuteLayer->transpose->axes[2] = 1;
+        permuteLayer->transpose->axes[3] = 2;
+    }
+    if (srcFormat == dstFormat) {
+        auto inputShape = input->shape();
+        auto outputShape = output->shape();
+        for (int i = 0; i < outputShape.size(); i++) {
+            auto dimVal = outputShape[i];
+            auto axis = -1;
+            for (int j = 0; j < inputShape.size(); j++) {
+                if (inputShape[j] == dimVal) {
+                    axis = j;
+                    break;
+                }
+            }
+            permuteLayer->transpose->axes[i] = axis;
+        }
     }
     mCoreMLBackend->setLayerInputs(permuteLayer, {mCoreMLBackend->getTensorName(input)});
     if (reshapeLayer) {
@@ -295,7 +266,7 @@ bool CoreMLRaster::rasterOptimization(const std::vector<Tensor *> &inputs, const
                 return buildReshape(mLayer_, region.origin, outputs[0]);
             }
             // transpose
-            if (isTranspose(region)) {
+            if (TensorUtils::isTransposeRegion(region)) {
                 return buildPermute(mLayer_, region.origin, outputs[0]);
             }
         }
@@ -312,12 +283,13 @@ bool CoreMLRaster::rasterOptimization(const std::vector<Tensor *> &inputs, const
         }
         return false;
     }
-    if (isDepthToSpace(outputs[0])) {
+    if (TensorUtils::isDepthToSpaceRegions(outputs[0])) {
         return buildDepthToSpace(mLayer_, region.origin, outputs[0]);
     }
     // region_size > 1: concat
     {
         int dim = outputs[0]->dimensions();
+
         if (region.origin->dimensions() != dim) {
             return false;
         }
@@ -370,9 +342,10 @@ static void dumpRegion(const Tensor::InsideDescribe::Region& reg) {
     printf("src: { stride: [%d, %d, %d], offset: %d }\n", reg.src.stride[0],reg.src.stride[1],reg.src.stride[2],reg.src.offset);
     printf("dst: { stride: [%d, %d, %d], offset: %d }\n}\n", reg.dst.stride[0],reg.dst.stride[1],reg.dst.stride[2],reg.dst.offset);
 }
-ErrorCode CoreMLRaster::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-    MNN_ASSERT(inputs.size() == 1 && outputs.size() == 1);
-    if (!rasterOptimization(inputs, outputs)) {
+ErrorCode CoreMLRaster::onResize(const std::vector<Tensor *> &____inputs, const std::vector<Tensor *> &outputs) {
+    OpCommonUtils::rasterInputReset(____inputs, outputs[0]);
+    MNN_ASSERT(outputs.size() == 1);
+    if (!rasterOptimization(outputs, outputs)) {
         /*
         printf(">>> start\n");
         for (const auto& reg : TensorUtils::getDescribe(inputs[0])->regions) {
@@ -386,7 +359,7 @@ ErrorCode CoreMLRaster::onResize(const std::vector<Tensor *> &inputs, const std:
         mLayer_->custom = mCoreMLBackend->create<CoreML__Specification__CustomLayerParams>();
         core_ml__specification__custom_layer_params__init(mLayer_->custom);
         mCoreMLBackend->copyName(&(mLayer_->custom->classname), "RasterLayer");
-        const auto& regions = TensorUtils::getDescribe(inputs[0])->regions;
+        const auto& regions = TensorUtils::getDescribe(outputs[0])->regions;
         mLayer_->custom->n_weights = regions.size() + 1;
         mLayer_->custom->weights = mCoreMLBackend->create<CoreML__Specification__WeightParams*>(mLayer_->custom->n_weights);
         std::vector<std::string> inputNames;

@@ -39,6 +39,35 @@ static void _computeGather(const std::vector<Tensor*>& inputs, const std::vector
     for (int i = axis + 1; i < params->dimensions(); ++i) {
         inside *= params->length(i);
     }
+    const int limit = 3;
+    if (TensorUtils::getDescribe(indices)->usage == Tensor::InsideDescribe::CONSTANT && N < limit) {
+        // Use Raster instead of loop
+        auto outDes = TensorUtils::getDescribe(output);
+        outDes->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
+        outDes->regions.clear();
+        outDes->regions.reserve(N);
+        auto indicePtr = indices->host<int>();
+        auto axisLen = params->length(axis);
+        for (int i=0; i<N; ++i) {
+            if (indicePtr[i] < 0 || indicePtr[i] >= axisLen) {
+                continue;
+            }
+            Tensor::InsideDescribe::Region reg;
+            reg.origin = inputs[0];
+            reg.size[0] = 1;
+            reg.size[1] = outside;
+            reg.size[2] = inside;
+            reg.src.offset = indicePtr[i] * inside;
+            reg.src.stride[0] = 0;
+            reg.src.stride[1] = inside * axisLen;
+            reg.src.stride[2] = 1;
+            reg.dst.offset = i * inside;
+            reg.dst.stride[1] = inside * N;
+            reg.dst.stride[2] = 1;
+            outDes->regions.emplace_back(std::move(reg));
+        }
+        return;
+    }
     flatbuffers::FlatBufferBuilder builder;
     OpBuilder unaryOp(builder);
     unaryOp.add_type(OpType_UnaryOp);
@@ -167,8 +196,11 @@ public:
         P_MAX
     };
     static bool buildGatherND(const Op* op, Tensor* params, Tensor* indice, Tensor* output,
-                              int N, int D, int S, Context& context, CommandBuffer& res) {
-        auto paramSize = params->elementSize();
+                              int N, int D, int S, Context& context, CommandBuffer& res, int B) {
+        int paramSize = 1;
+        for (int i=B; i<params->dimensions(); ++i) {
+            paramSize *= params->length(i);
+        }
         std::array<std::shared_ptr<Tensor>, 5> midTensors;
         std::shared_ptr<Tensor> constStride(Tensor::createDevice<int>({D}));
         if (!context.allocTensor(constStride.get())) {
@@ -176,7 +208,7 @@ public:
         }
         midTensors[P_constStride] = constStride;
         for (int i=0; i<D; ++i) {
-            int dimCount = paramSize / params->length(i);
+            int dimCount = paramSize / params->length(i + B);
             constStride->host<int>()[i] = dimCount;
             paramSize = dimCount;
         }
@@ -284,14 +316,22 @@ public:
         auto output = outputs[0];
         int mSliceN    = 1;
         int mSliceSize = 1;
+        int batchDim = 0;
+        if (nullptr != op->main_as_Axis()) {
+            batchDim = op->main_as_Axis()->axis();
+        }
+
         for (int i = 0; i < indice->dimensions() - 1; ++i) {
             mSliceN *= indice->length(i);
         }
         auto indiceNd = indice->length(indice->dimensions() - 1);
-        for (int i = indiceNd; i < params->dimensions(); ++i) {
+        for (int i = indiceNd + batchDim; i < params->dimensions(); ++i) {
             mSliceSize *= params->length(i);
         }
-        auto paramSize = params->elementSize();
+        int paramSize = 1;
+        for (int i=batchDim; i<params->dimensions(); ++i) {
+            paramSize *= params->length(i);
+        }
         auto constStride = cmd.extras[P_constStride];
         auto reshapeIndice = cmd.extras[P_reshapeIndice];
         auto broadcastStride = cmd.extras[P_broadcastStride];
@@ -315,25 +355,19 @@ public:
             }
         }
         for (int i=0; i<indiceNd; ++i) {
-            int dimCount = paramSize / params->length(i);
+            int dimCount = paramSize / params->length(i + batchDim);
             constStride->host<int>()[i] = dimCount;
             paramSize = dimCount;
         }
         // recompute reshape
-        reshapeIndice->buffer().device = 0;
-        reshapeIndice->buffer().host = 0;
         auto des = TensorUtils::getDescribe(reshapeIndice.get());
         des->extra.offset = 0;
         des->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
-        des->backend = nullptr;
         des->regions = {GeometryComputerUtils::makeRawAddressRef(indice, 0, mSliceN * indiceNd)};
         // recompute broadcast
-        broadcastStride->buffer().device = 0;
-        broadcastStride->buffer().host = 0;
         des = TensorUtils::getDescribe(broadcastStride.get());
         des->extra.offset = 0;
         des->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
-        des->backend = nullptr;
         des->regions[0].origin = constStride.get();
         des->regions[0].size[0] = 1;
         des->regions[0].size[1] = mSliceN;
@@ -367,6 +401,10 @@ public:
         auto params = inputs[0];
         auto indice = inputs[1];
         auto output = outputs[0];
+        int batchDim = 0;
+        if (nullptr != op->main_as_Axis()) {
+            batchDim = op->main_as_Axis()->axis();
+        }
 
         int N = 1;
         int S = 1;
@@ -374,10 +412,10 @@ public:
             N *= indice->length(i);
         }
         auto D = indice->length(indice->dimensions() - 1);
-        for (int i = D; i < params->dimensions(); ++i) {
+        for (int i = D + batchDim; i < params->dimensions(); ++i) {
             S *= params->length(i);
         }
-        return buildGatherND(op, params, indice, output, N, D, S, context, res);
+        return buildGatherND(op, params, indice, output, N, D, S, context, res, batchDim);
     }
 };
 
@@ -438,7 +476,7 @@ public:
             }
             res.extras.emplace_back(newIndice);
         }
-        return GeometryGatherND::buildGatherND(op, data, newIndice.get(), output, N, D, 1, context, res);
+        return GeometryGatherND::buildGatherND(op, data, newIndice.get(), output, N, D, 1, context, res, 0);
     }
 };
 

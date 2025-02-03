@@ -45,3 +45,7 @@ def norm(x, ord=None, axis=None, keepdims=False):
 def svd(a, full_matrices=True, compute_uv=True, hermitian=False):
     w, u, vt = _F.svd(a)
     return (u, w, vt)
+
+def solve(a, b):
+    import _mnncengine.cv as _cv
+    return _cv.solve(a, b)[1]

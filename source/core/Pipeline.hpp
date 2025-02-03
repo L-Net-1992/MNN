@@ -21,16 +21,17 @@ struct OperatorInfo::Info {
 };
 class SizeComputer;
 /** pipeline. one session may contains multiple pipeline, and one pipeline may contains more than one unit. */
-typedef std::map<const Op*, std::pair<std::shared_ptr<Execution>, DataType>> CacheExecutionMap;
 class Pipeline : public NonCopyable {
 public:
     struct TuningAttr {
         bool autoSetOpType;
         int maxTuningNumber;
     };
-    Pipeline(std::vector<Schedule::PipelineInfo>&& info, std::shared_ptr<Backend> major,
-             std::shared_ptr<Backend> backup, std::shared_ptr<Backend> constBackend, bool allocInput, bool outputStatic, const TuningAttr& tune, const Runtime* rt, const Runtime* cpuRt, CacheExecutionMap& cache);
+    Pipeline(const std::string& externalFile, Schedule::PipelineInfo&& info, bool allocInput, bool outputStatic, const TuningAttr& tune, const Runtime* rt, const Runtime* cpuRt, int geometryMask);
     ~Pipeline();
+    ErrorCode fixResizeCache();
+    void openResizeCheck();
+
     class UnitInfo : public OperatorInfo {
     public:
         UnitInfo()          = default;
@@ -44,41 +45,50 @@ public:
        3. copy op, inputs and outputs tensor info to mBuffer
        static_model:  3; dynamic_model: 1,2,3
     */
-    ErrorCode encode(bool isStatic = false, bool supportDebug = false);
+    ErrorCode encode(bool supportDebug = false, bool permitCodegen = false);
     /** allocMemory: create Execution and alloc memory for every op */
-    ErrorCode allocMemory(bool firstMalloc);
+    ErrorCode allocMemory(bool firstMalloc, bool permitCodegen);
     /** execute this pipline */
     ErrorCode execute();
     ErrorCode executeCallBack(const TensorCallBackWithInfo& before, const TensorCallBackWithInfo& after);
-    std::vector<Schedule::PipelineInfo>& getPipelineInfo();
+    Schedule::PipelineInfo& getPipelineInfo() {
+        return mInfo;
+    }
 
     float flops() const {
         return mFlops;
     }
     friend class Session;
     MNNForwardType getMainForwardType() const  {
-        return mBackend->type();
+        return mInfo.first.cache.first->type();
     }
+    typedef std::map<std::pair<Tensor::InsideDescribe::NativeInsideDescribe*, Backend*>, std::pair<std::weak_ptr<Tensor::InsideDescribe::NativeInsideDescribe>, std::shared_ptr<Tensor>>> WrapTensorCache;
 private:
-    void _pushTuningTask(std::vector<Schedule::PipelineInfo>&& initInfos);
+    ErrorCode _allocForTensor(int index, bool allocInput);
+    ErrorCode _enterExecute();
+    void _exitExecute();
+    void _copyInputs();
+    void _pushTuningTask(std::vector<Schedule::OpCacheInfo>&& initInfos);
     void _recycleDynamicMemory(Command* command);
-    std::shared_ptr<Backend> mBackend, mBackupBackend, mConstBackend;
-    std::vector<Schedule::PipelineInfo> mInfo;
+    Schedule::PipelineInfo mInfo;
     bool mAllocInput;
     bool mOutputStatic;
     TuningAttr mTuneAttr;
     float mFlops = 0.0f;
     bool mIsQuantModel = false;
-    CacheExecutionMap& mOriginExecution;
 
     // For gpu or other backend
     std::map<Tensor*, std::shared_ptr<Tensor>> mCacheConstTensors;
+    WrapTensorCache mWrapTensors;
 #ifndef MNN_BUILD_MINI
     GeometryComputer::Context mContext;
     Runtime::CompilerType mUseGeometry;
+    bool mGeometryNeedRelease = true;
 #endif
     const Runtime* mRuntime;
     const Runtime* mCpuRuntime;
+    std::string mExternalFile;
+    std::vector<std::shared_ptr<BufferStorage>> mExternalStorage;
 };
 } // namespace MNN
 

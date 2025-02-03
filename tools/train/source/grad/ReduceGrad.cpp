@@ -8,7 +8,7 @@
 
 #include "OpGrad.hpp"
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 
 class ReduceGrad : public OpGrad {
@@ -45,9 +45,9 @@ public:
         }
 
         if (forwardOp->main.AsReductionParam()->operation == ReductionType_MEAN) {
-            float gradCount  = outputDiff->getInfo()->size;
-            float inputCount = inputs[0]->getInfo()->size;
-            outputDiff       = _Multiply(outputDiff, _Scalar<float>((float)gradCount / (float)inputCount));
+            auto gradCount = _Size(outputDiff);
+            auto inputCount = _Size(inputs[0]);
+            outputDiff = _Multiply(outputDiff, _Cast<float>(gradCount) / _Cast<float>(inputCount));
         }
 
         if (forwardOp->main.AsReductionParam()->operation == ReductionType_MAXIMUM) {
@@ -93,10 +93,14 @@ public:
     }
 };
 
-static const auto gRegister = []() {
+static void _create() {
     static ReduceGrad _c;
     OpGrad::insert(OpType_Reduction, &_c);
     static FillGrad _d;
     OpGrad::insert(OpType_Fill, &_d);
-    return true;
-}();
+
+}
+
+REGISTER_GRAD(ReduceGrad_cpp, _create);
+};
+

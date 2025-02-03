@@ -59,6 +59,9 @@ VulkanCommandPool::Buffer::Buffer(const VulkanCommandPool* pool) : mPool(pool) {
 VulkanCommandPool::Buffer::~Buffer() {
     mPool->mFreeBuffers.emplace_back(mBuffer);
 }
+void VulkanCommandPool::Buffer::barrierSource(std::tuple<VkBuffer, VkDeviceSize, VkDeviceSize> fuse, BarrierType type) const {
+    barrierSource(std::get<0>(fuse), std::get<2>(fuse), std::get<1>(fuse), type);
+}
 
 void VulkanCommandPool::Buffer::barrierSource(VkBuffer source, size_t start, size_t size, BarrierType type) const {
     VkBufferMemoryBarrier barrier;
@@ -76,6 +79,10 @@ void VulkanCommandPool::Buffer::barrierSource(VkBuffer source, size_t start, siz
             break;
         case WRITE_WRITE:
             barrier.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            break;
+        case WRITE_READ:
+            barrier.srcAccessMask       = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
             barrier.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             break;
         default:

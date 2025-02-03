@@ -36,19 +36,16 @@ class InterpComputer : public SizeComputer {
             if(shape->length(0) == input.dimensions) {
                 // For Onnx's Resize
                 // Don't support batch / channel resize
-                for (int i=0; i<2; ++i) {
-                    output.dim[i].extent = input.dim[i].extent;
-                }
                 if (shape->getType().code == halide_type_int) {
                     // Width / Height
                     auto shapePtr = shape->host<int>();
-                    for (int i=2; i<input.dimensions; ++i) {
+                    for (int i=0; i<input.dimensions; ++i) {
                         output.dim[i].extent = shapePtr[i];
                     }
                 } else {
                     // Scale
                     auto scalePtr = shape->host<float>();
-                    for (int i=2; i<input.dimensions; ++i) {
+                    for (int i=0; i<input.dimensions; ++i) {
                         output.dim[i].extent = (scalePtr[i] * (float)input.dim[i].extent);
                     }
                 }
@@ -56,6 +53,7 @@ class InterpComputer : public SizeComputer {
             }
         }
         if (1 == inputSize) {
+            // For old mnn model from onnx
             auto interp = op->main_as_Interp();
             // get output dims
             w = interp->outputWidth();
@@ -65,6 +63,7 @@ class InterpComputer : public SizeComputer {
                 h = ih * interp->heightScale();
             }
         } else {
+            // For mnn model from tensorflow
             auto shape = inputs[1]; // input shape(shape)
             // Tensorflow's interp: h, w
             if(2 != shape->buffer().dim[0].extent) {
@@ -98,15 +97,18 @@ class InterpComputer : public SizeComputer {
         auto elementInM = (float)outputs[0]->elementSize() / 1024.0f / 1024.0f;
         auto interp     = op->main_as_Interp();
         auto unit       = 0;
+        int dimensions = inputs[0]->dimensions();
+        int interpDims = dimensions - 2;
         switch (interp->resizeType()) {
             case 1:
+            case 4:
                 unit = 1;
                 break;
             case 2:
-                unit = 4;
+                unit = (1 << interpDims);
                 break;
             case 3:
-                unit = 16;
+                unit = (4 << interpDims);
                 break;
             default:
                 break;

@@ -6,11 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
+#include "core/SimdHeader.h"
+
 #include <stdint.h>
 #include "backend/cpu/compute/Int8FunctionsOpt.h"
 #include "backend/cpu/compute/CommonOptFunction.h"
@@ -36,8 +33,8 @@ extern "C" {
 void _AVX512_MNNPackForMatMul_B(float* dest, const float* source, size_t h, size_t l, bool transpose);
 void _AVX512_MNNPackC8ForMatMul_A(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el);
 
-void _AVX512_MNNPackedMatMul(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias);
-void _AVX512_MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias);
+void _AVX512_MNNPackedMatMul(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
+void _AVX512_MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 
 void _AVX512_MNNGetSparseMatMulPackMode(int* eP, int *lP, int* hP);
 void _AVX512_MNNPackedSparseMatMulEpx8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter,
@@ -49,7 +46,6 @@ void _AVX512_MNNPackedSparseMatMulEpx4(float* C, const float* A, const float* B,
 void _AVX512_MNNPackedSparseMatMulEpx1(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter,
                                     const float* postParameters, const float* bias, unsigned int* NNZMap,
                                     int* dataOffsetMap);
-
 
 void _AVX512_ReorderInit(void* functions);
 void _AVX512_ExtraInit(void* functions);

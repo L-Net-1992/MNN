@@ -14,6 +14,7 @@
 #include "GLBackend.hpp"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
+#include "core/BufferAllocator.hpp"
 #include <mutex>
 #include <MNN/Tensor.hpp>
 
@@ -438,7 +439,7 @@ bool GLBackend::isCreateError() const {
 }
 
 
-Backend* GLRuntime::onCreate(const BackendConfig* config) const {
+Backend* GLRuntime::onCreate(const BackendConfig* config, Backend* origin) const {
     BackendConfig::PrecisionMode precision = BackendConfig::Precision_Normal;
     BackendConfig::PowerMode power         = BackendConfig::Power_Normal;
     if (nullptr != mInfo.user) {
@@ -476,7 +477,7 @@ class GLRuntimeCreator : public RuntimeCreator {
 public:
     virtual Runtime *onCreate(const Backend::Info &info) const override {
         auto rt = new GLRuntime(info);
-        auto bn = (GLBackend*)(rt->onCreate(nullptr));
+        auto bn = (GLBackend*)(rt->onCreate(nullptr, nullptr));
         if (bn->isCreateError()) {
             delete bn;
             delete rt;
@@ -490,7 +491,7 @@ public:
 bool placeholder = []() {
     static std::once_flag createOnce;
     std::call_once(createOnce, []() {
-        MNNInsertExtraRuntimeCreator(MNN_FORWARD_OPENGL, new GLRuntimeCreator, true);
+        MNNInsertExtraRuntimeCreator(MNN_FORWARD_OPENGL, new GLRuntimeCreator, false);
     });
     return true;
 }();

@@ -13,6 +13,25 @@
 #include "TestUtils.h"
 #include "MNN_generated.h"
 using namespace MNN::Express;
+class ZeroShapeResizeTest : public MNNTestCase {
+public:
+    virtual ~ZeroShapeResizeTest() = default;
+    virtual bool run(int precision) {
+        auto input = _Input({1, 1, 4, 1}, NHWC);
+        input->setName("input");
+        input->writeMap<float>();
+        auto output    = _Reshape(input, {-1});
+        auto outputPtr = output->readMap<float>();
+        input->resize({1, 0, 4, 1});
+        input->writeMap<float>();
+        auto info = output->getInfo();
+        outputPtr = output->readMap<float>();
+        if (info->size != 0) {
+            return false;
+        }
+        return true;
+    }
+};
 class ZeroShapeTest : public MNNTestCase {
 public:
     virtual ~ZeroShapeTest() = default;
@@ -56,6 +75,7 @@ public:
         auto output = Variable::create(expr, 0);
         auto info   = output->getInfo();
         if (nullptr != info) {
+            FUNC_PRINT(1);
             return false;
         }
         auto sliceOutput = _Split(input, {4}, 2);
@@ -63,10 +83,12 @@ public:
         for (auto s : sliceOutput) {
             auto info = s->getInfo();
             if (info->dim != dstDims) {
+                FUNC_PRINT(1);
                 return false;
             }
             auto ptr = s->readMap<float>();
             if (nullptr != ptr) {
+                FUNC_PRINT(1);
                 return false;
             }
         }
@@ -75,12 +97,18 @@ public:
         auto padOutput = _Pad(input, paddings);
         auto padinfo = padOutput->getInfo();
         if (padinfo->dim != std::vector<int>{1, 1, 4, 1}) {
+            FUNC_PRINT(1);
             return false;
         }
         input->writeMap<float>();
         auto ptr = padOutput->readMap<float>();
+        if (nullptr == ptr) {
+            FUNC_PRINT(1);
+            return false;
+        }
         for (int i = 0; i < padinfo->size; ++i) {
             if (ptr[i] > 0.000001f) {
+                FUNC_PRINT(1);
                 return false;
             }
         }
@@ -103,6 +131,7 @@ public:
         return true;
     }
 };
+MNNTestSuiteRegister(ZeroShapeResizeTest, "expr/zeroshaperesize");
 MNNTestSuiteRegister(ZeroShapeTest, "expr/zeroshape");
 MNNTestSuiteRegister(ZeroShapeTest2, "expr/zeroshape2");
 MNNTestSuiteRegister(ZeroShapeTest3, "expr/zeroshape3");

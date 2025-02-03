@@ -13,7 +13,7 @@ namespace MNN {
 namespace CV {
 
 // Helper Function //////////////////////////////////////////////////////////////
-static VARP PadForConv(VARP& src, int kh, int kw, int padMode) {
+static VARP PadForConv(VARP src, int kh, int kw, int padMode) {
     int padh = (kh - 1) / 2;
     int padw = (kw - 1) / 2;
     std::vector<int> padVals { 0, 0, padh, padh, padw, padw, 0, 0};
@@ -32,7 +32,7 @@ static halide_type_t formatInput(VARP& src, bool fp = true) {
             src = _Convert(_Reshape(src, {1, channel, height, width}), NHWC);
         }
     }
-    if (fp) {
+    if (fp && src->getInfo() && src->getInfo()->type.code != halide_type_float) {
         src = _Cast(src, halide_type_of<float>());
     }
     return info->type;
@@ -46,13 +46,18 @@ static VARP formatOutput(VARP src, halide_type_t type) {
     if (channel == 1) {
         squeeze_dims.push_back(-1);
     }
-    if (!squeeze_dims.empty()) {
-        src = _Squeeze(src, squeeze_dims);
-    }
+    src = _Squeeze(src, squeeze_dims);
     if (type == halide_type_of<uint8_t>()) {
+        src = _Minimum(src, _Scalar<float>(255));
         src = _Maximum(src, _Scalar<float>(0));
     }
-    return _Cast(src, type);
+    if (src->getInfo()) {
+        auto srctype = src->getInfo()->type;
+        if (srctype.code == type.code && srctype.bits == type.bits) {
+            return src;
+        }
+    }
+    return _Cast(src, type); // if same type, do not need.
 }
 
 template <typename T>
@@ -69,14 +74,18 @@ static std::vector<T> VARP2Vec(const VARP& var, int ddepth) {
 static std::pair<VARP, VARP> getScharrKernels(int dx, int dy, bool normalize) {
     MNN_ASSERT( dx >= 0 && dy >= 0 && dx + dy == 1 );
     float K[2][3] = {{ 3, 10, 3 }, { -1, 0, 1 }};
-    VARP kx = _Const(&K[dx], {1, 3});
-    VARP ky = _Const(&K[dy], {1, 3});
     if (normalize && dx) {
-        kx = kx * _Scalar<float>(1 / 32.f);
+        for (int i = 0; i < 3; ++i) {
+            K[dx][i] /= 32.f;
+        }
     }
     if (normalize && dy) {
-        ky = ky * _Scalar<float>(1 / 32.f);
+        for (int i = 0; i < 3; ++i) {
+            K[dy][i] /= 32.f;
+        }
     }
+    VARP kx = _Const(&K[dx], {1, 3});
+    VARP ky = _Const(&K[dy], {1, 3});
     return { kx, ky };
 }
 
@@ -89,8 +98,18 @@ static std::pair<VARP, VARP> getSobelKernels(int dx, int dy, int ksize, bool nor
     if (ksize == 1 || ksize == 3) {
         ksize = 3;
         float K[3][3] = {{ 1, 2, 1 }, { -1, 0, 1 }, {1, -2, 1}};
-        kx = _Const(&K[dx > 2 ? 2 : dx], {1, 3});
-        ky = _Const(&K[dy > 2 ? 2 : dy], {1, 3});
+        int jx = dx > 2 ? 2 : dx;
+        int jy = dy > 2 ? 2 : dy;
+        float scalex = 1./(1 << (ksize - dx -1));
+        float scaley = 1./(1 << (ksize - dy -1));
+        if (normalize) {
+            for (int i = 0; i < 3; ++i) {
+                K[jx][i] *= scalex;
+                K[jy][i] *= scaley;
+            }
+        }
+        kx = _Const(&K[jx], {1, 3});
+        ky = _Const(&K[jy], {1, 3});
     } else {
         auto getKernel = [&ksize](int order) {
             std::vector<float> kernel(ksize + 1);
@@ -119,13 +138,21 @@ static std::pair<VARP, VARP> getSobelKernels(int dx, int dy, int ksize, bool nor
             }
             return kernel;
         };
-        kx = _Const(getKernel(dx).data(), {1, ksize});
-        ky = _Const(getKernel(dy).data(), {1, ksize});
+        std::vector<float> dxKernel, dyKernel;
+        dxKernel = getKernel(dx);
+        dyKernel = getKernel(dy);
+        if (normalize) {
+            float scalex = 1./(1 << (ksize - dx -1));
+            float scaley = 1./(1 << (ksize - dy -1));
+            for (int i = 0; i < ksize; ++i) {
+                dxKernel[i] *= scalex;
+                dyKernel[i] *= scaley;
+            }
+        }
+        kx = _Const(dxKernel.data(), {1, ksize});
+        ky = _Const(dyKernel.data(), {1, ksize});
     }
-    if (normalize) {
-        kx = kx * _Scalar<float>(1./(1 << (ksize - dx -1)));
-        ky = ky * _Scalar<float>(1./(1 << (ksize - dy -1)));
-    }
+    
     return { kx, ky };
 }
 
@@ -143,10 +170,104 @@ static VARP pyr(VARP src, int borderType) {
 
 // Helper Function //////////////////////////////////////////////////////////////
 
-MNN_PUBLIC void bilateralFilter(VARP src, VARP& dst, int d, double sigmaColor,
-                                double sigmaSpace, int borderType) {
-    // TODO
-    MNN_ERROR("TODO: bilateralFilter");
+VARP filter2DImpl(VARP src, int ddepth, VARP kernel, double delta, int borderType) {
+    int channel = getVARPChannel(src);
+    const auto ksize = kernel->getInfo()->dim;
+    int kheight, kwidth, kchannel;
+    getVARPSize(kernel, &kheight, &kwidth, &kchannel);
+    auto padSrc = PadForConv(src, kheight, kwidth, borderType);
+    ddepth = ddepth < 0 ? channel : ddepth;
+    std::vector<float> bias(ddepth, delta);
+    return _Conv(std::move(VARP2Vec<float>(kernel, ddepth)), std::move(bias), padSrc,
+                 {channel, ddepth}, {kwidth, kheight}, VALID, {1, 1}, {1, 1}, channel);
+}
+
+VARP bilateralFilter(VARP src, int d, double sigmaColor, double sigmaSpace, int borderType) {
+    double space_coeff = -0.5 / (sigmaSpace * sigmaSpace);
+    double color_coeff = -0.5 / (sigmaColor * sigmaColor);
+    int radius;
+    if (d <= 0) {
+        radius = roundf(sigmaSpace * 1.5);
+    } else {
+        radius = d / 2;
+    }
+    radius = std::max(radius, 1);
+    d = radius * 2 + 1;
+
+    auto dst = _Clone(src, true);
+    src = PadForConv(_Unsqueeze(src, {0}), d, d, REFLECT);
+    dst.fix(Express::VARP::CONSTANT);
+    src.fix(Express::VARP::CONSTANT);
+    int src_row, src_col, dst_row, dst_col, channel;
+    getVARPSize(src, &src_row, &src_col, &channel);
+    getVARPSize(dst, &dst_row, &dst_col, &channel);
+
+    std::vector<double> _color_weight(channel * 256);
+    std::vector<double> _space_weight(d * d);
+    std::vector<int> _space_ofs(d * d);
+
+    double *color_weight = &_color_weight[0];
+    double *space_weight = &_space_weight[0];
+    int    *space_ofs = &_space_ofs[0];
+    for (int i = 0; i < channel * 256; i++) {
+        color_weight[i] = exp(i * i * color_coeff);
+    }
+
+    int maxk = 0;
+    for (int i = -radius; i <= radius; i++) {
+        for (int j = -radius; j <= radius; j++) {
+            double r = sqrt(i * i + j * j);
+            if (r > radius) {
+                continue;
+            }
+            space_weight[maxk] = exp(r * r * space_coeff);
+            space_ofs[maxk++] = i * src_col * channel + j * channel;
+        }
+    }
+
+    for (int i = 0; i < dst_row; i++) {
+        const uchar *sptr = src->readMap<uchar>() + (i + radius) * src_col * channel + radius * channel;
+        uchar *dptr = dst->writeMap<uchar>() + i * dst_col * channel;
+        if (channel == 1) {
+            for (int j = 0; j < dst_col; j++) {
+                double sum = 0, wsum = 0;
+                int val0 = sptr[j];
+                for (int k = 0; k < maxk; k++) {
+                    int val = sptr[j + space_ofs[k]];
+                    double w = space_weight[k] * color_weight[abs(val - val0)];
+                    sum += val * w;
+                    wsum += w;
+                }
+                dptr[j] = (uchar)roundf(sum / wsum);
+            }
+        } else if (channel == 3) {
+            for (int j = 0; j < dst_col * 3; j+=3) {
+                double sum_b = 0, sum_g = 0, sum_r = 0, wsum = 0;
+                int b0 = sptr[j];
+                int g0 = sptr[j + 1];
+                int r0 = sptr[j + 2];
+                for (int k = 0; k < maxk; k++) {
+                    const uchar *sptr_k = sptr + j + space_ofs[k];
+                    int b = sptr_k[0];
+                    int g = sptr_k[1];
+                    int r = sptr_k[2];
+                    double w = space_weight[k] * color_weight[abs(b - b0) + abs(g - g0) + abs(r - r0)];
+                    sum_b += b * w;
+                    sum_g += g * w;
+                    sum_r += r * w;
+                    wsum += w;
+                }
+                wsum = 1.0f / wsum;
+                b0 = roundf(sum_b * wsum);
+                g0 = roundf(sum_g * wsum);
+                r0 = roundf(sum_r * wsum);
+                dptr[j]     = (uchar)b0;
+                dptr[j + 1] = (uchar)g0;
+                dptr[j + 2] = (uchar)r0;
+            }
+        }
+    }
+    return dst;
 }
 
 VARP blur(VARP src, Size ksize, int borderType) {
@@ -164,21 +285,24 @@ VARP dilate(VARP src, VARP kernel, int iterations, int borderType) {
     int kheight, kwidth, kchannel;
     getVARPSize(kernel, &kheight, &kwidth, &kchannel);
     auto padSrc = PadForConv(src, kheight, kwidth, borderType);
-    return _Squeeze(_MaxPool(padSrc, {kheight, kwidth}), {0});
     return formatOutput(_MaxPool(padSrc, {kheight, kwidth}), type);
+}
+
+VARP erode(VARP src, VARP kernel, int iterations, int borderType) {
+    auto type = formatInput(src);
+    int kheight, kwidth, kchannel;
+    getVARPSize(kernel, &kheight, &kwidth, &kchannel);
+    // borderType set CONSTANT is zero, change to REFLECT.
+    borderType = REFLECT;
+    auto padSrc = PadForConv(src, kheight, kwidth, borderType);
+    auto res = _Negative(_MaxPool(_Negative(padSrc), {kheight, kwidth}));
+    return formatOutput(res, type);
 }
 
 VARP filter2D(VARP src, int ddepth, VARP kernel, double delta, int borderType) {
     auto type = formatInput(src);
-    int channel = getVARPChannel(src);
-    const auto ksize = kernel->getInfo()->dim;
-    int kheight, kwidth, kchannel;
-    getVARPSize(kernel, &kheight, &kwidth, &kchannel);
-    auto padSrc = PadForConv(src, kheight, kwidth, borderType);
-    ddepth = ddepth < 0 ? channel : ddepth;
-    std::vector<float> bias(ddepth, delta);
-    return formatOutput(_Conv(std::move(VARP2Vec<float>(kernel, ddepth)), std::move(bias), padSrc, {channel, ddepth},
-                              {kwidth, kheight}, VALID, {1, 1}, {1, 1}, channel), type);
+    auto dst = filter2DImpl(src, ddepth, kernel, delta, borderType);
+    return formatOutput(dst, type);
 }
 
 std::pair<VARP, VARP> getDerivKernels(int dx, int dy, int ksize, bool normalize) {
@@ -313,14 +437,18 @@ VARP Laplacian(VARP src, int ddepth, int ksize, double scale, double delta, int 
 }
 
 VARP pyrDown(VARP src, Size dstsize, int borderType) {
-    return _Convert(_Resize(_Convert(pyr(src, borderType), NC4HW4), 0.5, 0.5), NHWC);
+    auto type = formatInput(src);
+    auto res = _Convert(_Resize(_Convert(pyr(src, borderType), NC4HW4), 0.5, 0.5), NHWC);
+    return formatOutput(res, type);
 }
 
 VARP pyrUp(VARP src, Size dstsize, int borderType) {
     if (src->getInfo()->dim.size() == 3) {
         src = _Unsqueeze(src, {0});
     }
-    return pyr(_Convert(_Resize(_Convert(src, NC4HW4), 2, 2), NHWC), borderType);
+    auto type = formatInput(src);
+    auto res = pyr(_Convert(_Resize(_Convert(src, NC4HW4), 2, 2), NHWC), borderType);
+    return formatOutput(res, type);
 }
 
 VARP Scharr(VARP src, int ddepth, int dx, int dy, double scale, double delta, int borderType) {
@@ -330,8 +458,10 @@ VARP Scharr(VARP src, int ddepth, int dx, int dy, double scale, double delta, in
 VARP sepFilter2D(VARP src, int ddepth, VARP& kernelX, VARP& kernelY, double delta, int borderType) {
     auto dims = kernelY->getInfo()->dim;
     kernelY = _Reshape(kernelY, {dims[1], dims[0]});
-    VARP tmp = filter2D(src, ddepth, kernelX, 0, borderType);
-    return filter2D(tmp, ddepth, kernelY, delta, borderType);
+    auto type = formatInput(src);
+    VARP mid = filter2DImpl(src, ddepth, kernelX, 0, borderType);
+    VARP dst = filter2DImpl(mid, ddepth, kernelY, delta, borderType);
+    return formatOutput(dst, type);
 }
 
 VARP Sobel(VARP src, int ddepth, int dx, int dy, int ksize, double scale, double delta, int borderType) {
@@ -353,7 +483,8 @@ std::pair<VARP, VARP> spatialGradient(VARP src, int ksize, int borderType) {
 }
 
 VARP sqrBoxFilter(VARP src, int ddepth, Size ksize, bool normalize, int borderType) {
-    return boxFilter(src * src, ddepth, ksize, normalize, borderType);
+    auto srcf = _Cast<float>(src);
+    return boxFilter(srcf * srcf, ddepth, ksize, normalize, borderType);
 }
 
 } // CV

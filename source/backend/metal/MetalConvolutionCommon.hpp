@@ -11,34 +11,39 @@
 
 #import "core/ConvolutionCommon.hpp"
 #import "MetalBackend.hpp"
+#import "MetalExecution.hpp"
 #import "MNNMetalContext.h"
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-class MetalConvolutionCommon : public Execution {
+class MetalConvolutionCommon : public MetalExecution {
 public:
-    MetalConvolutionCommon(Backend *backend, const MNN::Op *op);
+    MetalConvolutionCommon(Backend *backend, const MNN::Op *op, std::shared_ptr<MNN::Tensor> bias);
     virtual ~MetalConvolutionCommon() = default;
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
 protected:
-    void loadWeight(const MNN::Convolution2D *conv);
+    void loadWeight(const MNN::Op *op, bool loadWeightInt8 = false);
 
-    virtual ErrorCode onFloat(const Tensor *input, const Tensor *output)     = 0;
-    virtual id<MTLBuffer> weightForFloat(int group, int oc, int ic, int kh, int kw, const float *src);
-
-private:
-    id<MTLBuffer> weightForConv(const Convolution2D *, ConvolutionCommon::Int8Common *, bool);
+    virtual std::shared_ptr<MNN::Tensor> weightTransform(int group, int oc, int ic, int kh, int kw, const float *src, bool int8Weight = false, bool int4Weight = false);
 
 protected:
-    bool mDepthwise     = false;
-    int mGroups         = 0;
+    struct Param {
+        int input_size;
+        int input_slice;
+        int output_width;
+        int output_height;
+        int output_size;
+        int output_slice;
+        int output_channel;
+        int batch;
+        int block_size;
+        int activation;
+        float scale_coef;
+    };
+    
+protected:
     int mKernelX        = 0;
     int mKernelY        = 0;
-    PadMode mPadMode    = PadMode_CAFFE;
-    int mPadX           = 0;
-    int mPadY           = 0;
     int mStrideX        = 0;
     int mStrideY        = 0;
     int mDilateX        = 0;
@@ -46,8 +51,11 @@ protected:
     int mActivationType = 0;
     const MNN::Op *mOp  = nullptr;
 
-    id<MTLBuffer> mWeight      = nil;
-    id<MTLBuffer> mBias        = nil;
+    std::shared_ptr<MNN::Tensor> mWeight;
+    std::shared_ptr<MNN::Tensor> mBias;
+    std::shared_ptr<MNN::Tensor> mDequantScaleBias;
+    int mDequantBits;
+    float mScaleCoef;
     id<MTLBuffer> mConstBuffer = nil;
 };
 

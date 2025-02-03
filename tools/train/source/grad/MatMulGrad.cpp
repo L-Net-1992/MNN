@@ -8,7 +8,7 @@
 
 #include "MatMulGrad.hpp"
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 class BatchMatMulGrad : public OpGrad {
 public:
@@ -67,6 +67,20 @@ public:
             {
                 // BT' = ATT * C'  ==>  B' = CT' * AT
                 res[1] = _BatchMatMul(outputDiff, inputs[0], true, true);
+            }
+        }
+
+        for (int i = 0; i < 2; i++) {
+            int inputDims = inputs[i]->getInfo()->dim.size();
+            int resDims = res[i]->getInfo()->dim.size();
+            MNN_ASSERT(resDims >= inputDims);
+
+            std::vector<int> reduceDims;
+            if (resDims > inputDims) {
+                for (int j = 0; j < (resDims - inputDims); j++) {
+                    reduceDims.push_back(j);
+                }
+                res[i] = _ReduceSum(res[i], reduceDims, false);
             }
         }
 
@@ -190,13 +204,31 @@ public:
             }
         }
 
+        for (int i = 0; i < 2; i++) {
+            int inputDims = inputs[i]->getInfo()->dim.size();
+            int resDims = res[i]->getInfo()->dim.size();
+            MNN_ASSERT(resDims >= inputDims);
+
+            std::vector<int> reduceDims;
+            if (resDims > inputDims) {
+                for (int j = 0; j < (resDims - inputDims); j++) {
+                    reduceDims.push_back(j);
+                }
+                res[i] = _ReduceSum(res[i], reduceDims, false);
+            }
+        }
+
         return res;
     }
 };
-static const auto gRegister = []() {
+static void _create() {
     static MatMulGrad _c;
     OpGrad::insert(OpType_MatMul, &_c);
     static BatchMatMulGrad _d;
     OpGrad::insert(OpType_BatchMatMul, &_d);
-    return true;
-}();
+
+}
+
+REGISTER_GRAD(MatMulGrad_cpp, _create);
+};
+

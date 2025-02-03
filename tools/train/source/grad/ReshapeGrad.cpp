@@ -9,7 +9,7 @@
 #include "ReshapeGrad.hpp"
 #include "core/Macro.h"
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 
 class ReshapeGrad : public OpGrad {
@@ -29,16 +29,25 @@ public:
         } else {
             // NC4HW4 don't support dynamic shape grad
             // Create Reshape Op
-            result[0] = _Reshape(backwardOutput[0], _Const(info->dim.data(), {(int)info->dim.size()}, NCHW, halide_type_of<int32_t>()));
+            // result[0] = _Reshape(backwardOutput[0], _Const(info->dim.data(), {(int)info->dim.size()}, NCHW, halide_type_of<int32_t>()));
+            auto temp1 = _Convert(inputs[0], NCHW);
+            auto temp2 = _Convert(backwardOutput[0], NCHW);
+            auto shape = _Shape(temp1);
+            auto temp3 = _Reshape(temp2, shape);
+            result[0] = _Convert(temp3, NC4HW4);
         }
         return result;
     }
 };
 
-static const auto gRegister = []() {
+static void _create() {
     static ReshapeGrad _c;
     OpGrad::insert(OpType_Reshape, &_c);
     OpGrad::insert(OpType_Squeeze, &_c);
     OpGrad::insert(OpType_Unsqueeze, &_c);
-    return true;
-}();
+
+}
+
+REGISTER_GRAD(ReshapeGrad_cpp, _create);
+};
+

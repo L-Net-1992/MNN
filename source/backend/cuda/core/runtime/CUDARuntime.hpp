@@ -49,16 +49,6 @@ typedef enum {
         cuda_check(cudaGetLastError()); \
     } while (0)
 
-#define cutlass_check(status)                                                                    \
-  {                                                                                              \
-    cutlass::Status error = status;                                                              \
-    if (error != cutlass::Status::kSuccess) {                                                    \
-        printf("File:%s Line %d: failed: %s\n", __FILE__, __LINE__,\
-            cutlassGetStatusString(error)); \
-        abort();                                              \
-    }                                                                                            \
-  }
-
 #ifdef DEBUG
 #define checkKernelErrors\
   do {                                                      \
@@ -70,8 +60,20 @@ typedef enum {
       abort();                                              \
     }                                                       \
   } while (0)
+
+
+#define cutlass_check(status)                                                                    \
+  {                                                                                              \
+    cutlass::Status error = status;                                                              \
+    if (error != cutlass::Status::kSuccess) {                                                    \
+        printf("File:%s Line %d: failed: %s\n", __FILE__, __LINE__,\
+            cutlassGetStatusString(error)); \
+        abort();                                              \
+    }                                                                                            \
+  }
 #else
 #define checkKernelErrors
+#define cutlass_check
 #endif
 
 namespace MNN {
@@ -101,9 +103,13 @@ public:
 
     void memcpy(void *dst, const void *src, size_t size_in_bytes, MNNMemcpyKind_t kind, bool sync = false);
     void memset(void *dst, int value, size_t size_in_bytes);
-
+    void device_sync();
+    
     size_t threads_num() {
         return mThreadPerBlock;
+    }
+    const cudaDeviceProp& prop() const {
+        return mProp;
     }
     int major_sm() const {
         return mProp.major;
@@ -112,15 +118,22 @@ public:
         return mProp.major * 10 + mProp.minor;
     }
     size_t blocks_num(const size_t total_threads);
-    const cudaDeviceProp& prop() const {
-        return mProp;
+    const int smemPerBlock() {
+        return mProp.sharedMemPerBlock;
     }
+
+    std::map<std::pair<std::vector<int32_t>, std::vector<uint32_t>>, std::pair<std::string, uint32_t>> & getTunedBlockWarpShape() {
+        return mTunedBlockWarpShape;
+    };
+    std::pair<const void*, size_t> makeCache();
+    bool setCache(std::pair<const void*, size_t> cache);
 
     int selectDeviceMaxFreeMemory();
 
 private:
     cudaDeviceProp mProp;
     int mDeviceId;
+    int mDeviceCount;
 
     bool mIsSupportedFP16   = false;
     bool mSupportDotInt8    = false;
@@ -128,6 +141,12 @@ private:
     float mFlops            = 4.0f;
     bool mIsCreateError{false};
     size_t mThreadPerBlock = 128;
+
+private:
+    std::map<std::pair<std::vector<int32_t>, std::vector<uint32_t>>, std::pair<std::string, uint32_t>> mTunedBlockWarpShape;
+    std::vector<uint8_t> mBuffer;
+    const void* mCacheOutside = nullptr;
+    size_t mCacheOutsideSize = 0;
 };
 
 } // namespace MNN

@@ -18,18 +18,53 @@ NPUSqueeze::NPUSqueeze(Backend *b, const Op *op, const std::vector<Tensor *> &in
 
 ErrorCode NPUSqueeze::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     mNpuBackend->setNetworkInput(inputs, mOp);
-
     auto opName = mOp->name()->str();
-
-    shared_ptr<ge::op::Reshape> prob(new ge::op::Reshape(opName));
-
+    auto param = mOp->main_as_SqueezeParam();
+    auto axis = param->squeezeDims();
+    vector<int64_t> ax;
+    if (axis != nullptr) {
+        for (int32_t i = 0; i < axis->size(); i++) {
+            ax.push_back(axis->Get(i));
+        }
+    } else {
+        ax = {0};
+    }
     auto xOp = mNpuBackend->getInputOps(mOp);
-
-    auto shape = tensorShapeFormat(outputs[0]);
-
-    (*prob).set_input_tensor(*xOp.get()).set_attr_shape(ge::AttrValue::LIST_INT(shape));
-    
-    mNpuBackend->setOutputOps(mOp, {prob}, outputs);
+    auto inputIndex = mOp->inputIndexes()->data()[0];
+    auto iops       = mNpuBackend->mGrapMap[inputIndex]; // x
+    xOp        = iops.back().first;
+    if (mOp->type() == OpType_Squeeze) {
+        shared_ptr<hiai::op::Squeeze> squeeze(new hiai::op::Squeeze(opName));
+        if (mNpuBackend->mSclipMap.find(inputIndex) == mNpuBackend->mSclipMap.end()) {
+            (*squeeze).set_input_x(*xOp.get());
+        } else {
+            (*squeeze).set_input_x(xOp->GetOutput(mNpuBackend->mSclipMap[inputIndex]));
+        }
+        (*squeeze).set_attr_axis(ax);
+        mNpuBackend->setOutputOps(mOp, {squeeze}, outputs);
+    } else {
+        shapeConst = hiai::op::Const(opName + "_axis_const");
+        if (ax.size() > 1) {
+            std::cout<<"unsqueeze axis only one element const, not "<< ax.size() << std::endl;
+            return NOT_SUPPORT;
+        }
+        vector<int32_t> axs = {static_cast<int32_t>(ax[0])};
+        {
+            ge::TensorDesc fdesc(ge::Shape({1}), ge::FORMAT_NCHW,  ge::DT_INT32);
+            ge::TensorPtr filter = std::make_shared<ge::Tensor>();
+            filter->SetTensorDesc(fdesc);
+            filter->SetData((uint8_t *)axs.data(), sizeof(int32_t));
+            shapeConst.set_attr_value(filter);
+        }
+        shared_ptr<hiai::op::ExpandDims> prob(new hiai::op::ExpandDims(opName));
+        if (mNpuBackend->mSclipMap.find(inputIndex) == mNpuBackend->mSclipMap.end()) {
+            (*prob).set_input_x(*xOp.get());
+        } else {
+            (*prob).set_input_x(xOp->GetOutput(mNpuBackend->mSclipMap[inputIndex]));
+        }
+        (*prob).set_input_axis(shapeConst);
+        mNpuBackend->setOutputOps(mOp, {prob}, outputs);
+    }
     return NO_ERROR;
 }
 

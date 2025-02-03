@@ -22,6 +22,8 @@
 #include "core/Backend.hpp"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
+#define MNN_USER_SET_DEVICE
+#include "MNN/MNNSharedContext.h"
 
 #define NONE "\e[0m"
 #define RED "\e[0;31m"
@@ -77,6 +79,7 @@ int main(int argc, const char* argv[]) {
     if (argc > 6) {
         precision = (MNN::BackendConfig::PrecisionMode)stringConvert<int>(argv[6]);
     }
+    
     std::shared_ptr<MNN::Interpreter> net =
     std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromFile(modelPath), [](void* net) {
         MNN::Interpreter::destroy((MNN::Interpreter*)net);
@@ -87,6 +90,20 @@ int main(int argc, const char* argv[]) {
     config.type = type;
     MNN::BackendConfig backendConfig;
     backendConfig.precision = precision;
+    
+    MNNDeviceContext gpuDeviceConfig;
+    // CUDA Backend support user set device_id
+    if(type == MNN_FORWARD_CUDA) {
+        gpuDeviceConfig.deviceId = 0;
+        backendConfig.sharedContext = &gpuDeviceConfig;
+    }
+    // OpenCL Backend support user set platform_size, platform_id, device_id
+    if(type == MNN_FORWARD_OPENCL) {
+        gpuDeviceConfig.platformSize = 1;// GPU Cards number
+        gpuDeviceConfig.platformId = 0;  // Execute on Which GPU Card
+        gpuDeviceConfig.deviceId = 0;    // Execute on Which GPU device
+        backendConfig.sharedContext = &gpuDeviceConfig;
+    }
     config.backendConfig = &backendConfig;
     auto session         = net->createSession(config);
     
@@ -130,7 +147,8 @@ int main(int argc, const char* argv[]) {
         
         void* host = inputTensor->map(MNN::Tensor::MAP_TENSOR_WRITE,  inputTensor->getDimensionType());
         if(host != nullptr) {
-            ::memset(host, 0, inputTensor->size());
+            // TODO: Find better way to memset zero
+            ::memset(host, 0, MNN::TensorUtils::getRawSize(inputTensor) * inputTensor->getType().bytes());
         }
         inputTensor->unmap(MNN::Tensor::MAP_TENSOR_WRITE,  inputTensor->getDimensionType(), host);
     }

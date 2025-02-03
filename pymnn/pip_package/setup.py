@@ -2,27 +2,44 @@
 # Created by ruhuan on 2019.08.31
 """ setup tool """
 from __future__ import print_function
+import os
+
+def get_version():
+    root_dir = os.getenv('PROJECT_ROOT', os.path.dirname(os.path.dirname(os.getcwd())))
+    version_header = os.path.join(root_dir, 'include/MNN/MNNDefine.h')
+    version_major = version_minor = version_patch = 'x'
+    for line in open(version_header, 'rt').readlines():
+        if '#define MNN_VERSION_MAJOR' in line:
+            version_major = int(line.strip().split(' ')[-1])
+        if '#define MNN_VERSION_MINOR' in line:
+            version_minor = int(line.strip().split(' ')[-1])
+        if '#define MNN_VERSION_PATCH' in line:
+            version_patch = int(line.strip().split(' ')[-1])
+    return '{}.{}.{}'.format(version_major, version_minor, version_patch)
 
 import sys
 import argparse
 parser = argparse.ArgumentParser(description='build pymnn wheel')
 parser.add_argument('--x86', dest='x86', action='store_true', default=False,
                     help='build wheel for 32bit arch, only usable on windows')
-parser.add_argument('--version', dest='version', type=str, required=True,
+parser.add_argument('--version', dest='version', type=str, default=get_version(),
                     help='MNN dist version')
 parser.add_argument('--serving', dest='serving', action='store_true', default=False,
                     help='build for internal serving, default False')
+parser.add_argument('--deps', dest='deps', type=str, required=False,
+                    help='MNN library deps')
 parser.add_argument('--env', dest='env', type=str, required=False,
                     help='build environment, e.g. :daily/pre/production')
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown
 
-import os
 import platform
+has_numpy = True
 try:
    import numpy as np
 except:
    print("import numpy failed")
+   has_numpy = False
 from setuptools import setup, Extension, find_packages
 from distutils import core
 from distutils.core import Distribution
@@ -45,28 +62,55 @@ def report(*args):
     print(*args)
 
 package_name = 'MNN'
-USE_TRT=check_env_flag('USE_TRT')
-IS_INTERNAL_BUILD = False
+USE_INTERNAL = False
+USE_TRT      = False
+USE_CUDA     = False
+USE_OPENCL   = False
+USE_VULKAN   = False
+USE_RENDER   = False
 
-print ("USE_TRT ", USE_TRT)
+if args.deps != None:
+    if "trt" in args.deps:
+        USE_TRT = True
+    if "cuda" in args.deps:
+        USE_CUDA = True
+    if "opencl" in args.deps:
+        USE_OPENCL = True
+    if "vulkan" in args.deps:
+        USE_VULKAN = True
+    if "internal" in args.deps:
+        USE_INTERNAL = True
+    if "render" in args.deps:
+        USE_RENDER = True
+
+print ("USE_INTERNAL:", USE_INTERNAL)
+print ("USE_TRT:", USE_TRT)
+print ("USE_CUDA:", USE_CUDA)
+print ("USE_OPENCL:", USE_OPENCL)
+print ("USE_VULKAN:", USE_VULKAN)
+print ("USE_RENDER:", USE_RENDER)
 
 if os.path.isdir('../../schema/private'):
-    IS_INTERNAL_BUILD = True
-    if USE_TRT:
-        print("Build Internal NNN with TRT")
-        package_name = 'MNN_Internal_TRT'
-    else:
-        print("Build Internal NNN")
-        package_name = 'MNN_Internal'
+    package_name += '_Internal'
+else:
+    USE_INTERNAL = False
+
+if USE_TRT:
+    package_name += '_TRT'
+if USE_CUDA:
+    package_name += '_CUDA'
+if USE_VULKAN:
+    package_name += '_VULKAN'
+if USE_OPENCL:
+    package_name += '_OPENCL'
+if USE_RENDER:
+    package_name += '_RENDER'
 
 print ('Building with python wheel with package name ', package_name)
 
 version = args.version
-depend_pip_packages = ['flatbuffers', 'numpy', 'aliyun-log-python-sdk']
-if package_name == 'MNN':
-    README = os.path.join(os.getcwd(), "README.md")
-else:
-    README = os.path.join(os.getcwd(), "README_Internal.md")
+depend_pip_packages = ['numpy']
+README = os.path.join(os.getcwd(), "README.md")
 with open(README) as f:
     long_description = f.read()
 
@@ -92,7 +136,7 @@ def configure_extension_build():
         # structured exception handling (SEH)
         # /DNOMINMAX removes builtin min/max functions
         # /wdXXXX disables warning no. XXXX
-        # Some macro (related with __VA_ARGS__) defined in pymnn/src/util.h can not be process correctly 
+        # Some macro (related with __VA_ARGS__) defined in pymnn/src/util.h can not be process correctly
         # becase of MSVC bug, enable /experimental:preprocessor fix it (And Windows SDK >= 10.0.18362.1)
         extra_compile_args = ['/MT', '/Zi',
                               '/EHa', '/DNOMINMAX',
@@ -124,8 +168,10 @@ def configure_extension_build():
         ]
         if check_env_flag('WERROR'):
             extra_compile_args.append('-Werror')
-    extra_compile_args += ['-DPYMNN_EXPR_API', '-DPYMNN_NUMPY_USABLE', '-DPYMNN_OPENCV_API']
-    if IS_LINUX and IS_INTERNAL_BUILD and args.serving:
+    extra_compile_args += ['-DPYMNN_EXPR_API', '-DPYMNN_OPENCV_API', '-DPYMNN_AUDIO_API']
+    if has_numpy:
+        extra_compile_args += ['-DPYMNN_NUMPY_USABLE']
+    if IS_LINUX and USE_INTERNAL:
         extra_compile_args += ['-DPYMNN_INTERNAL_SERVING']
         if args.env == 'daily':
             extra_compile_args += ['-DPYMNN_INTERNAL_SERVING_DAILY']
@@ -135,19 +181,21 @@ def configure_extension_build():
     engine_library_dirs = [os.path.join(root_dir, BUILD_DIR)]
     engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "tools", "train")]
     engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "tools", "cv")]
+    engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "tools", "audio")]
     engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "source", "backend", "tensorrt")]
-    if USE_TRT:
+    engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "source", "backend", "cuda")]
+    if USE_TRT or USE_CUDA:
         # Note: TensorRT-5.1.5.0/lib should be set in $LIBRARY_PATH of the build system.
         engine_library_dirs += ['/usr/local/cuda/lib64/']
 
     # Logging is enabled on Linux. Add the dependencies.
-    if IS_LINUX and IS_INTERNAL_BUILD:
+    if IS_LINUX and USE_INTERNAL:
         engine_library_dirs += ['/usr/include/curl/']
 
     print(engine_library_dirs)
     engine_link_args = []
     engine_sources = [os.path.join(root_dir, "pymnn", "src", "MNN.cc")]
-    if IS_LINUX and IS_INTERNAL_BUILD and args.serving:
+    if IS_LINUX and USE_INTERNAL:
         engine_sources += [os.path.join(root_dir, "pymnn", "src", "internal", "monitor_service.cc")]
         engine_sources += [os.path.join(root_dir, "pymnn", "src", "internal", "verify_service.cc")]
         engine_sources += [os.path.join(root_dir, "pymnn", "src", "internal", "http_util.cc")]
@@ -167,21 +215,36 @@ def configure_extension_build():
     engine_include_dirs += [os.path.join(root_dir, "schema", "current")]
     engine_include_dirs += [os.path.join(root_dir, "3rd_party",\
                                           "flatbuffers", "include")]
-    if IS_LINUX and IS_INTERNAL_BUILD and args.serving:
+    if IS_LINUX and USE_INTERNAL:
         engine_include_dirs += [os.path.join(root_dir, "3rd_party", "rapidjson")]
     # cv include
     engine_include_dirs += [os.path.join(root_dir, "tools", "cv", "include")]
-    engine_include_dirs += [np.get_include()]
+    # audio include
+    engine_include_dirs += [os.path.join(root_dir, "tools", "audio", "include")]
+    # llm include
+    engine_include_dirs += [os.path.join(root_dir, "transformers", "llm", "engine", "include")]
+    engine_include_dirs += [os.path.join(root_dir, "3rd_party")]
+    if has_numpy:
+        engine_include_dirs += [np.get_include()]
 
+    lib_files = []
     trt_depend = ['-lTRT_CUDA_PLUGIN', '-lnvinfer', '-lnvparsers', '-lnvinfer_plugin', '-lcudart']
+    cuda_depend = ['-lMNN_Cuda_Main']
     engine_depend = ['-lMNN']
 
     # enable logging & model authentication on linux.
-    if IS_LINUX and IS_INTERNAL_BUILD:
+    if IS_LINUX and USE_INTERNAL:
         engine_depend += ['-lcurl', '-lssl', '-lcrypto']
 
     if USE_TRT:
         engine_depend += trt_depend
+    if IS_DARWIN:
+        lib_files += [('lib', [os.path.join(root_dir, BUILD_DIR, "libMNN.dylib")])]
+        lib_files += [('lib', [os.path.join(root_dir, BUILD_DIR, "tools","converter", "libMNNConvertDeps.dylib")])]
+
+    if USE_CUDA:
+        engine_depend += cuda_depend
+        lib_files += [('lib', [os.path.join(root_dir, BUILD_DIR, "source", "backend", "cuda", "libMNN_Cuda_Main.so")])]
 
     tools_compile_args = []
     tools_libraries = []
@@ -189,12 +252,18 @@ def configure_extension_build():
     tools_library_dirs = [os.path.join(root_dir, BUILD_DIR)]
     tools_library_dirs += [os.path.join(root_dir, BUILD_DIR, "tools", "converter")]
     tools_library_dirs += [os.path.join(root_dir, BUILD_DIR, "source", "backend", "tensorrt")]
+    tools_library_dirs += [os.path.join(root_dir, BUILD_DIR, "source", "backend", "cuda")]
     tools_library_dirs += [os.path.join(root_dir, BUILD_DIR, "3rd_party", "protobuf", "cmake")]
 
     # add libTorch dependency
-    lib_files = []
     torch_lib = None
     cmakecache = os.path.join(root_dir, BUILD_DIR, 'CMakeCache.txt')
+    # llm
+    for line in open(cmakecache, 'rt').readlines():
+        if 'MNN_BUILD_LLM' in line:
+            if 'ON' in line:
+                extra_compile_args += ['-DPYMNN_LLM_API']
+    # torch lib
     for line in open(cmakecache, 'rt').readlines():
         if 'TORCH_LIBRARY' in line:
             torch_lib = os.path.dirname(line[line.find('=')+1:])
@@ -206,14 +275,19 @@ def configure_extension_build():
         elif IS_DARWIN:
             torch_path = os.path.dirname(torch_lib)
             tools_library_dirs += [torch_lib]
-            lib_files = [('lib', [os.path.join(torch_lib, 'libtorch.dylib'), os.path.join(torch_lib, 'libtorch_cpu.dylib'),
+            lib_files += [('lib', [os.path.join(torch_lib, 'libtorch.dylib'), os.path.join(torch_lib, 'libtorch_cpu.dylib'),
+                                  os.path.join(torch_lib, 'libc10.dylib')]),
+                         ('.dylibs', [os.path.join(torch_lib, 'libiomp5.dylib')])]
+            '''
+            lib_files += [('lib', [os.path.join(torch_lib, 'libtorch.dylib'), os.path.join(torch_lib, 'libtorch_cpu.dylib'),
                                   os.path.join(torch_lib, 'libc10.dylib')]),
                          ('.dylibs', [os.path.join(torch_path, '.dylibs', 'libiomp5.dylib')])]
-    if USE_TRT:
+            '''
+    if USE_TRT or USE_CUDA:
         # Note: TensorRT-5.1.5.0/lib should be set in $LIBRARY_PATH of the build system.
         tools_library_dirs += ['/usr/local/cuda/lib64/']
 
-    if IS_LINUX and IS_INTERNAL_BUILD:
+    if IS_LINUX and USE_INTERNAL:
         tools_library_dirs += ['/usr/include/curl/']
 
     tools_link_args = []
@@ -242,20 +316,22 @@ def configure_extension_build():
     tools_include_dirs += [os.path.join(root_dir, "source", "core")]
     tools_include_dirs += [os.path.join(root_dir, "schema", "current")]
     tools_include_dirs += [os.path.join(root_dir, "source")]
-    tools_include_dirs += [np.get_include()]
+    if has_numpy:
+        tools_include_dirs += [np.get_include()]
 
     # enable logging and model authentication on linux.
-    if IS_LINUX and IS_INTERNAL_BUILD:
+    if IS_LINUX and USE_INTERNAL:
         tools_depend += ['-lcurl', '-lssl', '-lcrypto']
 
     if USE_TRT:
         tools_depend += trt_depend
 
+    if USE_CUDA:
+        tools_depend += cuda_depend
+
     if IS_DARWIN:
         engine_link_args += ['-stdlib=libc++']
-        engine_link_args += ['-Wl,-all_load']
         engine_link_args += engine_depend
-        engine_link_args += ['-Wl,-noall_load']
     if IS_LINUX:
         engine_link_args += ['-Wl,--whole-archive']
         engine_link_args += engine_depend
@@ -264,9 +340,7 @@ def configure_extension_build():
     if IS_WINDOWS:
         engine_link_args += ['/WHOLEARCHIVE:MNN.lib']
     if IS_DARWIN:
-        tools_link_args += ['-Wl,-all_load']
         tools_link_args += tools_depend
-        tools_link_args += ['-Wl,-noall_load']
     if IS_LINUX:
         tools_link_args += ['-Wl,--whole-archive']
         tools_link_args += tools_depend
@@ -299,7 +373,9 @@ def configure_extension_build():
     def make_relative_rpath(path):
         """ make rpath """
         if IS_DARWIN:
-            return ['-Wl,-rpath,@loader_path/' + path]
+            # conda: dylibs install at site-packages/MNN_*/lib/
+            # not conda: dylibs instal at .../lib/ for .../lib/python*/site-packages/_mnncengine.cpython-*-darwin.so
+            return ['-Wl,-rpath,@loader_path/../../../'+path+',-rpath,@loader_path/'+path]
         elif IS_WINDOWS:
             return []
         else:
@@ -372,6 +448,7 @@ if __name__ == '__main__':
     extensions, cmdclass, packages, entry_points, lib_files = configure_extension_build()
 
     setup(
+        zip_safe=False,
         name=package_name,
         version=version,
         description=("C methods for MNN Package"),

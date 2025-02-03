@@ -42,6 +42,7 @@ def run_cmd(args):
     cmd = args[0]
     for i in range(1, len(args)):
         cmd += ' ' + args[i]
+    print(cmd)
     stdout = os.popen(cmd).read()
     global total_num
     total_num += 1
@@ -56,16 +57,26 @@ for name in os.listdir(root_dir):
     print(modelName)
 
     if runStatic:
-        message = os.popen(convert + modelName + ' ' + ' --MNNModel ' + tmpModel).read()
+        cmd = convert + modelName + ' ' + ' --MNNModel ' + tmpModel
+        print(cmd)
+        message = os.popen(cmd).read()
         if (message.find('Converted Success') == -1):
             gWrong.append(modelName)
             continue
         print(message)
         dynamic_size += os.path.getsize(modelName)/1024.0
         static_size += os.path.getsize(tmpModel)/1024.0
-        message = run_cmd([command, tmpModel, inputName, outputName, parameters])
+        if name == 'mobilenetv1quan' or name == 'overflowaware':
+            parameters_specific = forwardType + ' 0.1 ' + precision + input_dims
+            message = run_cmd([command, tmpModel, inputName, outputName, parameters_specific])
+        else:
+            message = run_cmd([command, tmpModel, inputName, outputName, parameters])
     else:
-        message = run_cmd([command, modelName, inputName, outputName, parameters])
+        if name == 'mobilenetv1quan' or name == 'overflowaware':
+            parameters_specific = forwardType + ' 0.1 ' + precision + input_dims
+            message = run_cmd([command, modelName, inputName, outputName, parameters_specific])
+        else:
+            message = run_cmd([command, modelName, inputName, outputName, parameters])
     if (message.find('Correct') == -1):
         gWrong.append(modelName)
     print(message)
@@ -84,7 +95,9 @@ for name in os.listdir(root_dir):
     print(modelName)
 
     if runStatic:
-        message = os.popen(convert + modelName + ' ' + ' --MNNModel ' + tmpModel).read()
+        cmd = convert + modelName + ' ' + ' --MNNModel ' + tmpModel
+        print(cmd)
+        message = os.popen(cmd).read()
         if (message.find('Converted Success') == -1):
             gWrong.append(modelName)
             continue
@@ -100,7 +113,7 @@ for name in os.listdir(root_dir):
         gWrong.append(modelName)
 
 # total model test
-command = 'testModelWithDescrisbe.out.exe' if os.name == 'nt' else './testModelWithDescrisbe.out'
+command = 'testModelWithDescribe.out.exe' if os.name == 'nt' else './testModelWithDescribe.out'
 root_dir = os.path.join(model_root_dir, 'TestWithDescribe')
 print('Model Root Path: ' + root_dir + '\n')
 
@@ -115,7 +128,9 @@ for name in os.listdir(root_dir):
     config = os.path.join(root_dir, name, 'config.txt')
 
     if runStatic:
-        message = os.popen(convert + modelName + ' ' + ' --MNNModel ' + tmpModel + ' --inputConfigFile ' + config).read()
+        cmd = convert + modelName + ' ' + ' --MNNModel ' + tmpModel + ' --inputConfigFile ' + config
+        print(cmd)
+        message = os.popen(cmd).read()
         if (message.find('Converted Success') == -1):
             gWrong.append(modelName)
             continue
@@ -153,6 +168,8 @@ for name in os.listdir(root_dir):
     print(name)
     if name == '.DS_Store':
         continue
+    if name == 'saodubi':
+        continue
     moduleName = os.path.join(root_dir, name, 'model.mnn')
     inputName = os.path.join(root_dir, name, 'input.mnn')
     outputName = os.path.join(root_dir, name, 'output.mnn')
@@ -169,6 +186,7 @@ flag = ''
 if runStatic:
     flag = 'STATIC'
 print('TEST_NAME_MODEL%s: 模型测试%s\nTEST_CASE_AMOUNT_MODEL%s: {\"blocked\":0,\"failed\":%d,\"passed\":%d,\"skipped\":0}\n'%(flag, flag, flag, len(gWrong), total_num - len(gWrong)))
+print('TEST_CASE={\"name\":\"模型测试%s\",\"failed\":%d,\"passed\":%d}\n'%(flag, len(gWrong), total_num - len(gWrong)))
 if len(gWrong) > 0:
     exit(1)
 

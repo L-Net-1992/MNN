@@ -20,13 +20,14 @@ namespace MNN {
 Tensor::Tensor(int dimSize, DimensionType type) {
     MNN_ASSERT(dimSize <= MNN_MAX_TENSOR_DIM);
     mDescribe          = new InsideDescribe;
-    mDescribe->mContent = new InsideDescribe::NativeInsideDescribe;
+    mDescribe->mContent.reset(new InsideDescribe::NativeInsideDescribe);
     auto nativeDescribe = mDescribe->mContent.get();
     mBuffer.dimensions = dimSize;
     mBuffer.type       = halide_type_of<float>();
     mBuffer.device     = 0;
     mBuffer.host       = nullptr;
     mBuffer.dim        = &nativeDescribe->dims[0];
+    mBuffer.flags      = 0;
 
     switch (type) {
         case CAFFE:
@@ -48,13 +49,14 @@ Tensor::Tensor(const Tensor* tensor, DimensionType type, bool allocMemory) {
 
     auto buffer        = tensor->buffer();
     mDescribe          = new InsideDescribe;
-    mDescribe->mContent = new InsideDescribe::NativeInsideDescribe;
+    mDescribe->mContent.reset(new InsideDescribe::NativeInsideDescribe);
     auto nativeDescribe = mDescribe->mContent.get();
     mBuffer.dimensions = buffer.dimensions;
     mBuffer.type       = buffer.type;
     mBuffer.device     = 0;
     mBuffer.host       = nullptr;
     mBuffer.dim        = &nativeDescribe->dims[0];
+    mBuffer.flags      = 0;
     for (int i = 0; i < buffer.dimensions; ++i) {
         mBuffer.dim[i].extent = buffer.dim[i].extent;
     }
@@ -75,7 +77,7 @@ Tensor::Tensor(const Tensor* tensor, DimensionType type, bool allocMemory) {
 
     // format mapping
     auto originType = tensor->getDimensionType();
-    if (originType != type && buffer.dimensions >= 4) {
+    if (originType != type && buffer.dimensions >= 3) {
         std::vector<int> axisMap;
         // NCHW -> NHWC
         if (originType == CAFFE) {
@@ -115,14 +117,18 @@ Tensor::Tensor(const Tensor* tensor, DimensionType type, bool allocMemory) {
 Tensor::Tensor(bool deepCopy, const Tensor* tensor) {
     mDescribe = new InsideDescribe;
     mDescribe->mContent = tensor->mDescribe->mContent;
+    mDescribe->setBackend(tensor->mDescribe->getBackend());
+    mDescribe->mem = tensor->mDescribe->mem;
     mBuffer.dim = TensorUtils::getDescribe(tensor)->dims;
     mBuffer.type = tensor->getType();
     mBuffer.device = tensor->deviceId();
     mBuffer.host = tensor->buffer().host;
     mBuffer.dimensions = tensor->buffer().dimensions;
+    mBuffer.flags = tensor->buffer().flags;
 }
 
 Tensor::~Tensor() {
+    // MNN_PRINT("free tensor:%p\n", this);
     auto nativeDescribe = mDescribe->mContent.get();
     if (nativeDescribe->memoryType == InsideDescribe::MEMORY_HOST) {
         if (nullptr != mBuffer.host) {
@@ -160,9 +166,9 @@ Tensor* Tensor::clone(const Tensor* src, bool deepCopy) {
     return new Tensor(deepCopy, src);
 }
 
+
 bool Tensor::copyFromHostTensor(const Tensor* hostTensor) {
-    auto nativeDescribe = mDescribe->mContent.get();
-    auto bn = nativeDescribe->backend;
+    auto bn = mDescribe->getBackend();
     if (nullptr == bn) {
         return false;
     }
@@ -171,8 +177,7 @@ bool Tensor::copyFromHostTensor(const Tensor* hostTensor) {
 }
 
 bool Tensor::copyToHostTensor(Tensor* hostTensor) const {
-    auto nativeDescribe = mDescribe->mContent.get();
-    auto bn = nativeDescribe->backend;
+    auto bn = mDescribe->getBackend();
     if (nullptr == bn) {
         return false;
     }
@@ -210,7 +215,7 @@ void Tensor::setType(int type) {
             mBuffer.type = halide_type_of<float>();
             break;
         case DataType_DT_BFLOAT16:
-            mBuffer.type = halide_type_t(halide_type_float, 16);
+            mBuffer.type = halide_type_t(halide_type_bfloat, 16);
             break;
         case DataType_DT_QINT32:
         case DataType_DT_INT32:
@@ -235,7 +240,7 @@ void Tensor::setType(int type) {
             mBuffer.type = halide_type_of<int16_t>();
             break;
         default:
-            MNN_PRINT("Unsupported data type!");
+            MNN_PRINT("Unsupported data type! %d\n", type);
             MNN_ASSERT(false);
             break;
     }
@@ -389,8 +394,8 @@ void Tensor::printShape() const {
     MNN_PRINT("\n");
 }
 
-int Tensor::size() const {
-    auto dataSize = mBuffer.type.bytes();
+size_t Tensor::usize() const {
+    size_t dataSize = mBuffer.type.bytes();
     MNN_ASSERT(dataSize >= 1);
     auto nativeDescribe = mDescribe->mContent.get();
     for (int i = 0; i < this->buffer().dimensions; i++) {
@@ -403,19 +408,23 @@ int Tensor::size() const {
     return dataSize;
 }
 
+int Tensor::size() const {
+    return static_cast<int>(usize());
+}
+
 void* Tensor::map(MapType mtype, DimensionType dtype) {
-    auto nativeDescribe = mDescribe->mContent.get();
-    auto bn = nativeDescribe->backend;
+    auto nativeDescribe = mDescribe;
+    auto bn = nativeDescribe->getBackend();
     if (nullptr == bn) {
-        return nullptr;
+        return mBuffer.host;
     }
-    
+
     auto mapPtr = bn->onMapTensor(mtype, dtype, this);
     if(mapPtr != nullptr) {
         // Get mapPtr in specific backend
         return mapPtr;
     }
-    
+
     /* Common backend */
     auto needSize = this->size();
     void* hostPtr = malloc(needSize);
@@ -424,7 +433,7 @@ void* Tensor::map(MapType mtype, DimensionType dtype) {
         //tmpTensor alloc
         MNN::Tensor tmpTensor(this, dtype, false);
         tmpTensor.buffer().host = (uint8_t *)hostPtr;
-        
+
         //use onCopyBuffer
         bn->onCopyBuffer(this, &tmpTensor);
     }
@@ -432,18 +441,18 @@ void* Tensor::map(MapType mtype, DimensionType dtype) {
 }
 
 void Tensor::unmap(MapType mtype, DimensionType dtype, void *mapPtr) {
-    auto nativeDescribe = mDescribe->mContent.get();
-    auto bn = nativeDescribe->backend;
+    auto nativeDescribe = mDescribe;
+    auto bn = nativeDescribe->getBackend();
     if (nullptr == bn) {
         return;
     }
-    
+
     bool ret = bn->onUnmapTensor(mtype, dtype, this, mapPtr);
     if(true == ret) {
         //do unmap already, just return
         return;
     }
-    
+
     if(mtype == Tensor::MAP_TENSOR_WRITE) {
         //srcTensor alloc
         MNN::Tensor srcTensor(this, dtype, false);
@@ -458,18 +467,35 @@ void Tensor::unmap(MapType mtype, DimensionType dtype, void *mapPtr) {
     }
 }
 int Tensor::wait(MapType mtype, bool finish) {
-    auto nativeDescribe = mDescribe->mContent.get();
-    auto bn = nativeDescribe->backend;
+    auto nativeDescribe = mDescribe;
+    auto bn = nativeDescribe->getBackend();
     if (nullptr == bn) {
         return 0;
     }
     return bn->onSync(mtype, finish, this);
 }
 
+bool Tensor::setDevicePtr(const void* devicePtr, int memoryType) {
+    mBuffer.flags = memoryType;
+    mBuffer.device = (uint64_t)devicePtr;
+    // To use memoryType afterwards
+    return true;
+}
+
 void Tensor::destroy(Tensor* tensor) {
     if (nullptr != tensor) {
         delete tensor;
     }
+}
+bool Tensor::getDeviceInfo(void* dst, int type) const {
+    auto nativeDescribe = mDescribe;
+    if (nullptr == nativeDescribe->getBackend()) {
+        return false;
+    }
+    if (nativeDescribe->getBackend()->type() != type) {
+        return false;
+    }
+    return nativeDescribe->getBackend()->onGetTensorInfo(this, dst);
 }
 
 } // namespace MNN

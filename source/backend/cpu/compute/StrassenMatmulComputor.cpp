@@ -7,6 +7,7 @@
 //
 
 #include "StrassenMatmulComputor.hpp"
+#include "DenseConvolutionTiledExecutor.hpp"
 #include "CommonOptFunction.h"
 #include "backend/cpu/CPUBackend.hpp"
 #include <string.h>
@@ -14,6 +15,7 @@
 #include "core/AutoStorage.h"
 #include "core/Macro.h"
 #include "core/Concurrency.h"
+#include "core/TensorUtils.hpp"
 //#define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include "math/Vec.hpp"
@@ -28,21 +30,23 @@ public:
         mAllocator = allocator;
     }
     ~ AutoMemory() {
-        if (nullptr != mContent.first) {
+        if (!mContent.invalid()) {
             mAllocator->free(mContent);
         }
     }
-    const std::pair<void*, int>& get() const {
+    const MemChunk& get() const {
         return mContent;
     }
 private:
-    std::pair<void*, int> mContent;
+    MemChunk mContent;
     BufferAllocator* mAllocator;
 };
 
 StrassenMatrixComputor::StrassenMatrixComputor(Backend* bn, bool multithread, int maxDepth) : mBackend(bn) {
     mMaxDepth = maxDepth;
     mSupportMultiThread = multithread;
+    auto core = static_cast<CPUBackend*>(backend())->functions();
+    mWeightBytes = core->bytes;
 };
 StrassenMatrixComputor::~StrassenMatrixComputor() {
     // Do nothing
@@ -59,43 +63,46 @@ ErrorCode StrassenMatrixComputor::_generateTrivalMatMul(int e, int l, int h, con
     int eP, lP, hP;
     core->MNNGetMatMulPackMode(&eP, &lP, &hP);
     auto numberThread = mSupportMultiThread ? ((CPUBackend*)backend())->threadNumber() : 1;
-    auto bExtraStride = bStride - UP_DIV(l, lP)*lP*hP * core->bytes;
+    auto bExtraStride = bStride - UP_DIV(l, lP)*lP*hP * mWeightBytes;
     MNN_ASSERT(bExtraStride >= 0);
     auto tileBufferBasic = static_cast<CPUBackend*>(backend())->getBufferAllocator()->alloc(numberThread * UP_DIV(l, lP) * eP * lP * bytes);
-    if (nullptr == tileBufferBasic.first) {
+    if (tileBufferBasic.invalid()) {
         return OUT_OF_MEMORY;
     }
-    auto tileHostOrigin  = (uint8_t*)tileBufferBasic.first + tileBufferBasic.second;
+
     int unitNumber = e / eP;
     int xCount     = e - unitNumber * eP;
     auto eReal = aStride / core->bytes / core->pack;
+    auto matmulUnit = core->MNNPackedMatMul;
+    auto matmulRemain = core->MNNPackedMatMulRemain;
     mFunctions.emplace_back(
-        std::make_pair([cStride, l, h, xCount, AT, BT, CT, COT, tileHostOrigin, unitNumber, bExtraStride, numberThread, eReal, eP, active, this](int tId) {
+        std::make_pair([cStride, l, h, xCount, AT, BT, CT, COT, tileBufferBasic, unitNumber, bExtraStride, numberThread, eReal, eP, active, matmulUnit, matmulRemain, this](int tId) {
             auto core = static_cast<CPUBackend*>(backend())->functions();
-            size_t parameters[6];
+            size_t parameters[7];
             parameters[0] = xCount * core->bytes;
             parameters[1] = l;
             parameters[2] = h;
             parameters[3] = cStride;
             parameters[4] = 0;
             parameters[5] = bExtraStride;
-            auto tileHost = tileHostOrigin + eP * parameters[1] * tId * core->bytes;
+            parameters[6] = 0;
+            auto tileHost = tileBufferBasic.ptr() + eP * parameters[1] * tId * core->bytes;
             const float* postParametersPtr = nullptr;
             if (!active.empty()) {
                 postParametersPtr = active.data();
             }
-            auto aHost = mStack[AT.stackIndex] + AT.offsetBytes;
-            auto bHost = mStack[BT.stackIndex] + BT.offsetBytes;
-            auto cHost = mStack[CT.stackIndex] + CT.offsetBytes;
+            auto aHost = mStack[AT.stackIndex].ptr() + AT.offsetBytes;
+            auto bHost = mStack[BT.stackIndex].ptr() + BT.offsetBytes;
+            auto cHost = mStack[CT.stackIndex].ptr() + CT.offsetBytes;
             const uint8_t* biasPtr = nullptr;
             if (-1 != COT.stackIndex) {
-                biasPtr = mStack[COT.stackIndex] + COT.offsetBytes;
+                biasPtr = mStack[COT.stackIndex].ptr() + COT.offsetBytes;
             }
             auto packUnit = core->bytes * core->pack;
             int32_t info[4];
             int32_t stride[4];
             stride[0] = eP;
-            stride[1] = parameters[1];
+            stride[1] = (int32_t)parameters[1];
             stride[2] = 0;
             stride[3] = 0;
             info[0] = 1;
@@ -106,21 +113,21 @@ ErrorCode StrassenMatrixComputor::_generateTrivalMatMul(int e, int l, int h, con
                 int xStart    = i * eP;
                 auto aStart   = aHost + xStart * packUnit;
                 core->MNNPackC4ForMatMul_A((float*)(tileHost), (const float**)(&aStart), info, stride);
-                core->MNNPackedMatMul((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, parameters, postParametersPtr, (const float*)biasPtr);
+                matmulUnit((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, parameters, postParametersPtr, (const float*)biasPtr, nullptr, nullptr);
             }
             if (tId != numberThread -1) {
                 return;
             }
             if (xCount > 0) {
                 stride[0] = xCount;
-                stride[1] = parameters[1];
+                stride[1] = (int32_t)parameters[1];
                 info[2] = xCount;
 
                 int xStart    = unitNumber * eP;
                 auto aStart   = aHost + xStart * packUnit;
                 // Copy
                 core->MNNPackC4ForMatMul_A((float*)(tileHost), (const float**)(&aStart), info, stride);
-                core->MNNPackedMatMulRemain((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, xCount, parameters, postParametersPtr, (const float*)biasPtr);
+                matmulRemain((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, xCount, parameters, postParametersPtr, (const float*)biasPtr, nullptr, nullptr);
             }
         }, numberThread));
     static_cast<CPUBackend*>(backend())->getBufferAllocator()->free(tileBufferBasic);
@@ -166,7 +173,7 @@ ErrorCode StrassenMatrixComputor::_generateBasicMatMul(int e, int l, int h, cons
     CTemp.stackIndex = (int)mStack.size();
     CTemp.offsetBytes = 0;
     CTemp.lineStrideBytes = e * core->bytes * core->pack;
-    mStack.emplace_back((uint8_t*)CAddr.get().first + CAddr.get().second);
+    mStack.emplace_back(CAddr.get());
 
     MatrixInfo Empty;
     Empty.stackIndex = -1;
@@ -190,15 +197,16 @@ ErrorCode StrassenMatrixComputor::_generateBasicMatMul(int e, int l, int h, cons
         MatrixInfo tempA = AT;
         MatrixInfo tempB = BT;
         tempA.offsetBytes = AT.offsetBytes + lS / core->pack * AT.lineStrideBytes;
-        tempB.offsetBytes = BT.offsetBytes + lS * hP * core->bytes;
+        // tempB.offsetBytes = BT.offsetBytes + lS * hP * core->bytes;
+        tempB.offsetBytes = BT.offsetBytes + lS * hP * mWeightBytes;
         auto code = _generateTrivalMatMul(e, lE-lS, h, tempA, tempB, CTemp, Empty, {});
         if (NO_ERROR != code) {
             return code;
         }
         // Add CTemp to C
         auto f1 = [CT, CTemp, e, cHeight, numberThread, core, this](int tId) {
-            auto c11Ptr = mStack[CT.stackIndex] + CT.offsetBytes;
-            auto xAddr = mStack[CTemp.stackIndex] + CTemp.offsetBytes;
+            auto c11Ptr = mStack[CT.stackIndex].ptr() + CT.offsetBytes;
+            auto xAddr = mStack[CTemp.stackIndex].ptr() + CTemp.offsetBytes;
             MNNMATRIX_ADD_MULTITHREAD(c11Ptr, c11Ptr, xAddr, e, CT.lineStrideBytes, CT.lineStrideBytes, CTemp.lineStrideBytes, cHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f1, numberThread));
@@ -206,10 +214,10 @@ ErrorCode StrassenMatrixComputor::_generateBasicMatMul(int e, int l, int h, cons
     if (!postParameters.empty() && COT.stackIndex >= 0) {
         if (1 == numberThread) {
             auto postFunction = [CT, COT, e, cHeight, numberThread, postParameters, core, this](int tId) {
-                auto biasPtr = (const float*)(mStack[COT.stackIndex] + COT.offsetBytes);
+                auto biasPtr = (const float*)(mStack[COT.stackIndex].ptr() + COT.offsetBytes);
                 auto width = e;
                 auto height = cHeight;
-                auto c11Ptr = mStack[CT.stackIndex] + CT.offsetBytes;
+                auto c11Ptr = mStack[CT.stackIndex].ptr() + CT.offsetBytes;
                 core->MNNAxByClampBroadcastUnit((float*)c11Ptr, (float*)c11Ptr, biasPtr, width, CT.lineStrideBytes / core->bytes, CT.lineStrideBytes / core->bytes, height, postParameters.data());
             };
             mFunctions.emplace_back(std::make_pair(postFunction, 1));
@@ -217,8 +225,8 @@ ErrorCode StrassenMatrixComputor::_generateBasicMatMul(int e, int l, int h, cons
             auto postFunction = [CT, COT, e, cHeight, numberThread, postParameters, core, this](int tId) {
                 auto width = e;
                 auto height = cHeight;
-                auto c11Ptr = mStack[CT.stackIndex] + CT.offsetBytes;
-                auto biasPtr = mStack[COT.stackIndex] + COT.offsetBytes;
+                auto c11Ptr = mStack[CT.stackIndex].ptr() + CT.offsetBytes;
+                auto biasPtr = mStack[COT.stackIndex].ptr() + COT.offsetBytes;
                 for (int y = tId; y < height; y+=numberThread) {
                     core->MNNAxByClampBroadcastUnit((float*)(c11Ptr + y * CT.lineStrideBytes), (float*)(c11Ptr + y * CT.lineStrideBytes), (const float*)(biasPtr + y * core->bytes * core->pack), width, 0, 0, 1, postParameters.data());
                 }
@@ -276,21 +284,21 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
     auto allocator = static_cast<CPUBackend*>(backend())->getBufferAllocator();
     currentDepth += 1;
     auto maxlH = std::max(lSub, hSub);
-    AutoMemory YAddr(hSub * lSub * core->bytes, allocator);
+    AutoMemory YAddr(hSub * lSub * mWeightBytes, allocator);
     AutoMemory XAddr(maxlH * eSub * core->bytes, allocator);
-    if (nullptr == XAddr.get().first || nullptr == YAddr.get().first) {
+    if (XAddr.get().invalid() || YAddr.get().invalid()) {
         return OUT_OF_MEMORY;
     }
     MatrixInfo Y;
     Y.stackIndex = (int)mStack.size();
-    mStack.emplace_back((uint8_t*)YAddr.get().first + YAddr.get().second);
+    mStack.emplace_back(YAddr.get());
     Y.offsetBytes = 0;
-    Y.lineStrideBytes = lSub * core->bytes * hP;
+    Y.lineStrideBytes = lSub * mWeightBytes * hP;
     MatrixInfo X;
     X.stackIndex = (int)mStack.size();
     X.offsetBytes = 0;
     X.lineStrideBytes = eSub * core->bytes * core->pack;
-    mStack.emplace_back((uint8_t*)XAddr.get().first + XAddr.get().second);
+    mStack.emplace_back(XAddr.get());
 
     MatrixInfo CX;
     CX.stackIndex = X.stackIndex;
@@ -309,9 +317,9 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
     MatrixInfo b12 = BT;
     b12.offsetBytes = BT.offsetBytes + BT.lineStrideBytes * (hSub / hP);
     MatrixInfo b21 = BT;
-    b21.offsetBytes = BT.offsetBytes + lSub * hP * core->bytes;
+    b21.offsetBytes = BT.offsetBytes + lSub * hP * mWeightBytes;
     MatrixInfo b22 = BT;
-    b22.offsetBytes = BT.offsetBytes + BT.lineStrideBytes * (hSub / hP) + lSub * hP * core->bytes;
+    b22.offsetBytes = BT.offsetBytes + BT.lineStrideBytes * (hSub / hP) + lSub * hP * mWeightBytes;
     
     MatrixInfo c11 = CT;
     MatrixInfo c12 = CT;
@@ -327,12 +335,12 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
     {
         // S3=A11-A21, T3=B22-B12, P7=S3*T3
         auto f = [a11, a21, b22, b12, X, Y, eSub, lSub, hSub, numberThread, core, hP, this, bWidth, aHeight, bHeight](int tId) {
-            auto xAddr = mStack[X.stackIndex] + X.offsetBytes;
-            auto yAddr = mStack[Y.stackIndex] + Y.offsetBytes;
-            auto a11Ptr = mStack[a11.stackIndex] + a11.offsetBytes;
-            auto a21Ptr = mStack[a21.stackIndex] + a21.offsetBytes;
+            auto xAddr = mStack[X.stackIndex].ptr() + X.offsetBytes;
+            auto yAddr = mStack[Y.stackIndex].ptr() + Y.offsetBytes;
+            auto a11Ptr = mStack[a11.stackIndex].ptr() + a11.offsetBytes;
+            auto a21Ptr = mStack[a21.stackIndex].ptr() + a21.offsetBytes;
             MNNMATRIX_SUB_MULTITHREAD(xAddr, a11Ptr, a21Ptr, eSub, X.lineStrideBytes, a11.lineStrideBytes, a21.lineStrideBytes, aHeight, core);
-            MNNMATRIX_SUB_MULTITHREAD(yAddr, mStack[b22.stackIndex] + b22.offsetBytes, mStack[b12.stackIndex] + b12.offsetBytes, bWidth, Y.lineStrideBytes, b22.lineStrideBytes, b12.lineStrideBytes, bHeight, core);
+            MNNMATRIX_SUB_MULTITHREAD(yAddr, mStack[b22.stackIndex].ptr() + b22.offsetBytes, mStack[b12.stackIndex].ptr() + b12.offsetBytes, bWidth, Y.lineStrideBytes, b22.lineStrideBytes, b12.lineStrideBytes, bHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f, numberThread));
         auto code = _generateMatMul(eSub, lSub, hSub, X, Y, c21, Empty, currentDepth, {});
@@ -343,8 +351,8 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
     {
         // S1=A21+A22, T1=B12-B11, P5=S1T1
         auto f = [a22, a21, b11, b12, X, Y, eSub, lSub, hSub, numberThread, hP, core, this, bWidth, aHeight, bHeight](int tId) {
-            MNNMATRIX_ADD_MULTITHREAD(mStack[X.stackIndex] + X.offsetBytes, mStack[a21.stackIndex] + a21.offsetBytes, mStack[a22.stackIndex] + a22.offsetBytes , eSub, X.lineStrideBytes, a21.lineStrideBytes, a22.lineStrideBytes, aHeight, core);
-            MNNMATRIX_SUB_MULTITHREAD(mStack[Y.stackIndex] + Y.offsetBytes, mStack[b12.stackIndex] + b12.offsetBytes, mStack[b11.stackIndex] + b11.offsetBytes, bWidth, Y.lineStrideBytes, b12.lineStrideBytes, b11.lineStrideBytes, bHeight, core);
+            MNNMATRIX_ADD_MULTITHREAD(mStack[X.stackIndex].ptr() + X.offsetBytes, mStack[a21.stackIndex].ptr() + a21.offsetBytes, mStack[a22.stackIndex].ptr() + a22.offsetBytes , eSub, X.lineStrideBytes, a21.lineStrideBytes, a22.lineStrideBytes, aHeight, core);
+            MNNMATRIX_SUB_MULTITHREAD(mStack[Y.stackIndex].ptr() + Y.offsetBytes, mStack[b12.stackIndex].ptr() + b12.offsetBytes, mStack[b11.stackIndex].ptr() + b11.offsetBytes, bWidth, Y.lineStrideBytes, b12.lineStrideBytes, b11.lineStrideBytes, bHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f, numberThread));
         auto code = _generateMatMul(eSub, lSub, hSub, X, Y, c22, Empty, currentDepth, {});
@@ -355,10 +363,10 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
     {
         // S2=S1-A11, T2=B22-T1, P6=S2T2
         auto f = [a11, b22, X, Y, eSub, lSub, hSub, numberThread, hP, core, this, bWidth, aHeight, bHeight](int tId) {
-            auto xAddr = mStack[X.stackIndex] + X.offsetBytes;
-            auto yAddr = mStack[Y.stackIndex] + Y.offsetBytes;
-            MNNMATRIX_SUB_MULTITHREAD(xAddr, xAddr, mStack[a11.stackIndex] + a11.offsetBytes, eSub, X.lineStrideBytes, X.lineStrideBytes, a11.lineStrideBytes, aHeight, core);
-            MNNMATRIX_SUB_MULTITHREAD(yAddr, mStack[b22.stackIndex] + b22.offsetBytes, yAddr, bWidth, Y.lineStrideBytes, b22.lineStrideBytes, Y.lineStrideBytes, bHeight, core);
+            auto xAddr = mStack[X.stackIndex].ptr() + X.offsetBytes;
+            auto yAddr = mStack[Y.stackIndex].ptr() + Y.offsetBytes;
+            MNNMATRIX_SUB_MULTITHREAD(xAddr, xAddr, mStack[a11.stackIndex].ptr() + a11.offsetBytes, eSub, X.lineStrideBytes, X.lineStrideBytes, a11.lineStrideBytes, aHeight, core);
+            MNNMATRIX_SUB_MULTITHREAD(yAddr, mStack[b22.stackIndex].ptr() + b22.offsetBytes, yAddr, bWidth, Y.lineStrideBytes, b22.lineStrideBytes, Y.lineStrideBytes, bHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f, numberThread));
         auto code = _generateMatMul(eSub, lSub, hSub, X, Y, c12, Empty, currentDepth, {});
@@ -369,8 +377,8 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
     {
         // S4=A12-S2, P3=S4*B22, P1=A11*B11
         auto f = [a12, X, eSub, aHeight, numberThread, core, this](int tId) {
-            auto xAddr = mStack[X.stackIndex] + X.offsetBytes;
-            MNNMATRIX_SUB_MULTITHREAD(xAddr, mStack[a12.stackIndex] + a12.offsetBytes, xAddr, eSub, X.lineStrideBytes, a12.lineStrideBytes, X.lineStrideBytes, aHeight, core);
+            auto xAddr = mStack[X.stackIndex].ptr() + X.offsetBytes;
+            MNNMATRIX_SUB_MULTITHREAD(xAddr, mStack[a12.stackIndex].ptr() + a12.offsetBytes, xAddr, eSub, X.lineStrideBytes, a12.lineStrideBytes, X.lineStrideBytes, aHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f, numberThread));
         auto code = _generateMatMul(eSub, lSub, hSub, X, b22, c11, Empty, currentDepth, {});
@@ -387,10 +395,10 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
         // U5=U4+P3, T4=T2-B21, P4=A22*T4
         auto f = [c11, c12, c21, c22, b21, X, Y, eSub, bWidth, cHeight, bHeight, numberThread, core, this](int tId) {
             for (int y = tId; y < cHeight; y+=numberThread) {
-                core->MNNStrassenMergeCFunction((float*)(mStack[c11.stackIndex] + c11.offsetBytes + y * c11.lineStrideBytes), (float*)(mStack[c12.stackIndex] + c12.offsetBytes + y * c12.lineStrideBytes), (float*)(mStack[c21.stackIndex] + c21.offsetBytes + y * c21.lineStrideBytes), (float*)(mStack[c22.stackIndex] + c22.offsetBytes + y * c22.lineStrideBytes), (float*)(mStack[X.stackIndex] + X.offsetBytes + y * X.lineStrideBytes), 0, eSub, 1);
+                core->MNNStrassenMergeCFunction((float*)(mStack[c11.stackIndex].ptr() + c11.offsetBytes + y * c11.lineStrideBytes), (float*)(mStack[c12.stackIndex].ptr() + c12.offsetBytes + y * c12.lineStrideBytes), (float*)(mStack[c21.stackIndex].ptr() + c21.offsetBytes + y * c21.lineStrideBytes), (float*)(mStack[c22.stackIndex].ptr() + c22.offsetBytes + y * c22.lineStrideBytes), (float*)(mStack[X.stackIndex].ptr() + X.offsetBytes + y * X.lineStrideBytes), 0, eSub, 1);
             }
-            auto yAddr = mStack[Y.stackIndex] + Y.offsetBytes;
-            MNNMATRIX_SUB_MULTITHREAD(yAddr, yAddr, mStack[b21.stackIndex] + b21.offsetBytes, bWidth, Y.lineStrideBytes, Y.lineStrideBytes, b21.lineStrideBytes, bHeight, core);
+            auto yAddr = mStack[Y.stackIndex].ptr() + Y.offsetBytes;
+            MNNMATRIX_SUB_MULTITHREAD(yAddr, yAddr, mStack[b21.stackIndex].ptr() + b21.offsetBytes, bWidth, Y.lineStrideBytes, Y.lineStrideBytes, b21.lineStrideBytes, bHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f, numberThread));
         auto code = _generateMatMul(eSub, lSub, hSub, a22, Y, c11, Empty, currentDepth, {});
@@ -402,8 +410,8 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
         // U6=U3-P4, P2=A12*B21, U1=P1+P2
         auto f0 = [c11, c21, eSub, cHeight, numberThread, core, this](int tId) {
             auto cw = eSub;
-            auto c21Addr = mStack[c21.stackIndex] + c21.offsetBytes;
-            MNNMATRIX_SUB_MULTITHREAD(c21Addr, c21Addr, mStack[c11.stackIndex] + c11.offsetBytes, cw, c21.lineStrideBytes, c21.lineStrideBytes, c11.lineStrideBytes, cHeight, core);
+            auto c21Addr = mStack[c21.stackIndex].ptr() + c21.offsetBytes;
+            MNNMATRIX_SUB_MULTITHREAD(c21Addr, c21Addr, mStack[c11.stackIndex].ptr() + c11.offsetBytes, cw, c21.lineStrideBytes, c21.lineStrideBytes, c11.lineStrideBytes, cHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f0, numberThread));
         auto code = _generateMatMul(eSub, lSub, hSub, a12, b21, c11, Empty, currentDepth, {});
@@ -412,18 +420,18 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
         }
         auto f1 = [c11, X, eSub, cHeight, numberThread, core, this](int tId) {
             auto cw = eSub;
-            auto c11Ptr = mStack[c11.stackIndex] + c11.offsetBytes;
-            auto xAddr = mStack[X.stackIndex] + X.offsetBytes;
+            auto c11Ptr = mStack[c11.stackIndex].ptr() + c11.offsetBytes;
+            auto xAddr = mStack[X.stackIndex].ptr() + X.offsetBytes;
             MNNMATRIX_ADD_MULTITHREAD(c11Ptr, c11Ptr, xAddr, cw, c11.lineStrideBytes, c11.lineStrideBytes, X.lineStrideBytes, cHeight, core);
         };
         mFunctions.emplace_back(std::make_pair(f1, numberThread));
         if (!postParameters.empty() && COT.stackIndex >= 0) {
             if (1 == numberThread) {
                 auto postFunction = [c11, COT, eSub, cHeight, numberThread, postParameters, core, this](int tId) {
-                    auto biasPtr = (const float*)(mStack[COT.stackIndex] + COT.offsetBytes);
+                    auto biasPtr = (const float*)(mStack[COT.stackIndex].ptr() + COT.offsetBytes);
                     auto width = eSub * 2;
                     auto height = cHeight * 2;
-                    auto c11Ptr = mStack[c11.stackIndex] + c11.offsetBytes;
+                    auto c11Ptr = mStack[c11.stackIndex].ptr() + c11.offsetBytes;
                     core->MNNAxByClampBroadcastUnit((float*)c11Ptr, (float*)c11Ptr, biasPtr, width, c11.lineStrideBytes / core->bytes, c11.lineStrideBytes / core->bytes, height, postParameters.data());
                 };
                 mFunctions.emplace_back(std::make_pair(postFunction, numberThread));
@@ -431,8 +439,8 @@ ErrorCode StrassenMatrixComputor::_generateMatMul(int e, int l, int h, const Mat
                 auto postFunction = [c11, COT, eSub, cHeight, numberThread, postParameters, core, this](int tId) {
                     auto width = eSub * 2;
                     auto height = cHeight * 2;
-                    auto c11Ptr = mStack[c11.stackIndex] + c11.offsetBytes;
-                    auto biasPtr = mStack[COT.stackIndex] + COT.offsetBytes;
+                    auto c11Ptr = mStack[c11.stackIndex].ptr() + c11.offsetBytes;
+                    auto biasPtr = mStack[COT.stackIndex].ptr() + COT.offsetBytes;
                     for (int y = tId; y < height; y+=numberThread) {
                         core->MNNAxByClampBroadcastUnit((float*)(c11Ptr + y * c11.lineStrideBytes), (float*)(c11Ptr + y * c11.lineStrideBytes), (const float*)(biasPtr + y * core->bytes * core->pack), width, 0, 0, 1, postParameters.data());
                     }
@@ -477,6 +485,7 @@ void StrassenMatrixComputor::onReset() {
 
 ErrorCode StrassenMatrixComputor::onEncode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const std::vector<float>& postParameters, int inputL, int inputH) {
     auto core = static_cast<CPUBackend*>(backend())->functions();
+    mWeightBytes = core->bytes;
     MNN_ASSERT(inputs.size() == 2 || inputs.size() == 3);
     MNN_ASSERT(outputs.size() == 1);
     auto A  = inputs[0];
@@ -496,32 +505,32 @@ ErrorCode StrassenMatrixComputor::onEncode(const std::vector<Tensor*>& inputs, c
     core->MNNGetMatMulPackMode(&eP, &lP, &hP);
     int bs = UP_DIV(l, lP) * lP * hP;
     int cs = C->stride(0);
-    uint8_t* bias = nullptr;
+    MemChunk bias;
     bool useBias = false;
     if (inputs.size() > 2) {
-        bias = inputs[2]->host<uint8_t>();
+        bias = TensorUtils::getDescribeOrigin(inputs[2])->mem->chunk();
         useBias = true;
     }
-    return onEncode(e, l, h, as, bs, cs, A->host<uint8_t>(), B->host<uint8_t>(), C->host<uint8_t>(), useBias, bias, postParameters);
+    return onEncode(e, l, h, as, bs, cs, TensorUtils::getDescribeOrigin(A)->mem->chunk(), TensorUtils::getDescribeOrigin(B)->mem->chunk(), TensorUtils::getDescribeOrigin(C)->mem->chunk(), useBias, bias, postParameters);
 }
 
-ErrorCode StrassenMatrixComputor::onEncode(int e, int l, int h, int as, int bs, int cs, const uint8_t* AT, const uint8_t* BT, uint8_t* CT, bool useBias, const uint8_t* Bias, const std::vector<float>& postParameters) {
+ErrorCode StrassenMatrixComputor::onEncode(int e, int l, int h, int as, int bs, int cs, const MemChunk AT, const MemChunk BT, MemChunk CT, bool useBias, const MemChunk Bias, const std::vector<float>& postParameters) {
     auto core = static_cast<CPUBackend*>(backend())->functions();
     MatrixInfo a,b,c,bias;
     bias.stackIndex = -1;
     mFunctions.clear();
-    mStack = {(uint8_t*)AT, (uint8_t*)BT, CT};
+    mStack = {AT, BT, CT};
     if (useBias) {
         bias.stackIndex = 3;
         bias.offsetBytes = 0;
-        mStack.emplace_back((uint8_t*)Bias);
+        mStack.emplace_back(Bias);
     }
     a.stackIndex = 0;
     a.lineStrideBytes = as * core->bytes;
     a.offsetBytes = 0;
 
     b.stackIndex = 1;
-    b.lineStrideBytes = bs * core->bytes;
+    b.lineStrideBytes = bs * mWeightBytes;
     b.offsetBytes = 0;
     
     c.stackIndex = 2;

@@ -7,14 +7,15 @@
 
 
 #include "SparseConvInt8TiledExecutor.hpp"
+#include "ConvolutionTiledExecutor.hpp"
+#include "core/BufferAllocator.hpp"
 #include "core/Macro.h"
 
 #include <math.h>
-#include "backend/cpu/CPUBackend.hpp"
-#include "backend/cpu/compute/CommonOptFunction.h"
+#include "CommonOptFunction.h"
 #include "core/Concurrency.h"
 #include "core/TensorUtils.hpp"
-#include "common/MemoryFormater.h"
+#include "core/MemoryFormater.h"
 #include "MNN/AutoTime.hpp"
 #include <math.h>
 #ifdef MNN_USE_SSE
@@ -63,12 +64,13 @@ bool SparseConvInt8TiledExecutor::reorderWeight(Backend* b, const Convolution2DC
     return true;
 }
 
-SparseConvInt8TiledExecutor::SparseConvInt8TiledExecutor(Backend* backend, const Convolution2D* convOp, std::shared_ptr<ResourceInt8> res) : ConvInt8TiledExecutor(backend, convOp, res) {
+SparseConvInt8TiledExecutor::SparseConvInt8TiledExecutor(Backend* backend, const Op* op, std::shared_ptr<ResourceInt8> res) : ConvInt8TiledExecutor(backend, op, res) {
 
+    auto convOp = op->main_as_Convolution2D();
     std::shared_ptr<Tensor> weightOrigin;
-    weightOrigin.swap(mResource->mWeightInt8);
+    weightOrigin.swap(mResourceInt8->mWeightInt8);
     const SparseCommon* sparseCommon = convOp->sparseParameter();
-    mValid = reorderWeight(backend, convOp->common(), weightOrigin, mResource->mWeightInt8, sparseCommon);
+    mValid = reorderWeight(backend, convOp->common(), weightOrigin, mResourceInt8->mWeightInt8, sparseCommon);
     if(!mValid) {
         return;
     }
@@ -80,9 +82,9 @@ SparseConvInt8TiledExecutor::SparseConvInt8TiledExecutor(Backend* backend, const
 
 }
 
-SparseConvInt8TiledExecutor::SparseConvInt8TiledExecutor(Backend* backend, const Convolution2DCommon* common,
+SparseConvInt8TiledExecutor::SparseConvInt8TiledExecutor(Backend* backend, const Op* op,
                                                          const SparseConvInt8TiledExecutor& exe)
-    : ConvInt8TiledExecutor(backend, common, exe),
+    : ConvInt8TiledExecutor(backend, op, exe.mResourceInt8),
       mNNZMap(exe.mNNZMap),
       mDataOffsetMap(exe.mDataOffsetMap),
       mSparseBlockOC(exe.mSparseBlockOC),
@@ -97,7 +99,7 @@ bool SparseConvInt8TiledExecutor::onClone(Backend* bn, const Op* op, Execution**
     if (nullptr == dst) {
         return true;
     }
-    auto exe = new SparseConvInt8TiledExecutor(bn, op->main_as_Convolution2D()->common(), *this);
+    auto exe = new SparseConvInt8TiledExecutor(bn, op, *this);
     if (!exe->valid()) {
         return false;
     }
@@ -119,6 +121,13 @@ ErrorCode SparseConvInt8TiledExecutor::onResize(const std::vector<Tensor*>& inpu
     auto core = static_cast<CPUBackend*>(backend())->int8Functions();
     getPackParameter(&lP, &hP, &eP, core);
     int lSize = mIm2ColParamter.icDiv4 * mIm2ColParamter.packCUnit * mCommon->kernelX() * mCommon->kernelY();
+    mIm2ColCount = 1;
+    auto output = outputs[0];
+    auto planeSize = output->width() * output->height() * output->batch();
+    auto DynamicDestUnit = eP * mIm2ColCount;
+    mTileCount        = UP_DIV(planeSize, DynamicDestUnit);
+    const int threads = std::max(static_cast<CPUBackend*>(backend())->threadNumber(), 1);
+    mThreadNums       = std::min(threads, mTileCount);
 
     mIm2ColParamter.destICStride = mIm2ColParamter.icDiv4 * mIm2ColParamter.packCUnit * eP;
 
@@ -133,6 +142,15 @@ ErrorCode SparseConvInt8TiledExecutor::onResize(const std::vector<Tensor*>& inpu
     if (!success) {
         return OUT_OF_MEMORY;
     }
+    auto bufferAlloc = static_cast<CPUBackend*>(backend())->getBufferAllocator();
+    auto blitInfoSize = ConvolutionTiledExecutor::computeBlitInfoSize(eP, mIm2ColParamter.ow, mIm2ColParamter.kernelX * mIm2ColParamter.kernelY, mThreadNums);
+    mBlitInfo = bufferAlloc->alloc(blitInfoSize.first);
+    if (mBlitInfo.invalid()) {
+        return OUT_OF_MEMORY;
+    }
+    bufferAlloc->free(mBlitInfo);
+    mBlitInfoStride = blitInfoSize.second;
+
     backend()->onReleaseBuffer(mTempIm2ColBuffer.get(), Backend::DYNAMIC);
 
     // MNN_PRINT("sparse conv2d int8 resize: cost time: %llu us\n", kernelTimer.durationInUs());
@@ -146,54 +164,70 @@ ErrorCode SparseConvInt8TiledExecutor::onExecute(const std::vector<Tensor*>& inp
     auto core = static_cast<CPUBackend*>(backend())->int8Functions();
 
     int PackUnit = static_cast<CPUBackend*>(backend())->functions()->pack;
-    auto sparseQuantIm2col = core->MNNSparseQuantIm2col;
-    const int outputPlaneLen = output->height() * output->width();
-    const int inputPlaneLen = input->width() * input->height();
+    auto blitProc = core->MNNPackC4Int8ForMatMul_ASparse;
+    const int outputPlaneLen = output->height() * output->width() * output->batch();
 
     const int batch = input->batch();
     const int ocDivPack = UP_DIV(output->channel(), PackUnit);
 
     const auto inputDataPtr = input->host<int8_t>();
-    const auto weightDataPtr = mResource->mWeightInt8->host<int8_t>();
+    const auto weightDataPtr = mResourceInt8->mWeightInt8->host<int8_t>();
     const auto NNZMapPtr     = mNNZMap->host<unsigned int>();
     const auto dataOffsetPtr = mDataOffsetMap->host<int>();
     auto im2colPtr           = mTempIm2ColBuffer->host<int8_t>();
     auto outputDataPtr       = output->host<int8_t>();
     QuanPostTreatParameters quanParam;
-    quanParam.bias = mResource->mBiasInt32->host<int32_t>();
-    quanParam.scale = mResource->mScaleFloat->host<float>();
-    quanParam.maxValue = mResource->mClampMax;
-    if (mResource->mRelu) {
-        quanParam.minValue = mResource->mOutputZeroPoint;
+    quanParam.bias = mMutableResource->mBiasInt32->host<int32_t>();
+    quanParam.scale = mMutableResource->mScaleFloat->host<float>();
+    quanParam.maxValue = mMutableResource->mClampMax;
+    if (mResourceInt8->mRelu) {
+        quanParam.minValue = mMutableResource->mOutputZeroPoint;
     } else {
-        quanParam.minValue = mResource->mClampMin;
+        quanParam.minValue = mMutableResource->mClampMin;
     }
     // MNN_PRINT("outputPlaneLen: %d, reduce l:%zu, minValue:%d, maxValue:%d, mTileCount:%d\n", outputPlaneLen, mSparseQuantParam.l, quanParam.minValue, quanParam.maxValue, mTileCount);
+    const int col_buffer_size = mTempIm2ColBuffer->stride(0);
+
     auto threadFunction = [&](int tId) {
         auto colAddr        = im2colPtr + tId * mTempIm2ColBuffer->stride(0);
-        for (int bIndex = 0; bIndex < batch; ++bIndex) {
-            const auto srcPtr = inputDataPtr + bIndex * PackUnit * inputPlaneLen;
-            auto dstPtr       = outputDataPtr + bIndex * PackUnit * outputPlaneLen;
+        int32_t info[4];
+        info[1] = mIm2ColParamter.iw * mIm2ColParamter.ih * batch;
+        info[2] = (int)mSparseQuantParam.eP;
+        info[3] = mIm2ColParamter.strideX;
+        auto srcPtr     = (int8_t const **)(mBlitInfo.ptr() + tId * mBlitInfoStride.first);
+        auto el         = (int32_t *)(srcPtr + mBlitInfoStride.second);
 
-            for (int tIndex = tId; tIndex < mTileCount; tIndex += mThreadNums) {
-                SparseQuantMatMulParam sparseQuantParam = mSparseQuantParam;
-                const int xIndexStart  = tIndex * sparseQuantParam.eP;
-                const int realDstCount = ALIMIN(outputPlaneLen - xIndexStart, sparseQuantParam.eP);
-                sparseQuantParam.eSize = realDstCount;
-                // im2col
-                sparseQuantIm2col(colAddr, srcPtr, mResource->mInputZeroPoint, &mIm2ColParamter, (size_t*)&sparseQuantParam, xIndexStart);
-                // MNN_PRINT("batch:%d, realDstCount:%d, InputZeroPoint:%d, inputdata matrix im2col:\n", bIndex, realDstCount, mResource->mInputZeroPoint);
-                // formatMatrix(colAddr, {static_cast<int>(UP_DIV(realDstCount, sparseQuantParam.eP)), static_cast<int>(sparseQuantParam.l), static_cast<int>(sparseQuantParam.eP)});
+        for (int tIndex = tId; tIndex < mTileCount; tIndex += mThreadNums) {
+            SparseQuantMatMulParam sparseQuantParam = mSparseQuantParam;
+            const int xIndexStart  = tIndex * sparseQuantParam.eP;
+            const int realDstCount = ALIMIN(outputPlaneLen - xIndexStart, sparseQuantParam.eP);
+            sparseQuantParam.eSize = realDstCount;
+            // im2col
+            auto res = ConvolutionTiledExecutor::turnIm2ColToBlitInfo((const float**)srcPtr, el, xIndexStart, realDstCount, mIm2ColParamter, (const uint8_t*)inputDataPtr, 1);
+            int number = res.first;
+            bool needZero = res.second;
+            if (needZero) {
+#ifdef MNN_USE_SSE
+                ::memset(colAddr, mMutableResource->mInputZeroPoint + 128, col_buffer_size);
+#else
+                ::memset(colAddr, mMutableResource->mInputZeroPoint, col_buffer_size);
+#endif
+            }
+            info[0] = number;
+            if (number > 0) {
+                blitProc(colAddr, srcPtr, info, el);
+            }
+            // MNN_PRINT("batch:%d, realDstCount:%d, InputZeroPoint:%d, inputdata matrix im2col:\n", bIndex, realDstCount, mResource->mInputZeroPoint);
+            // formatMatrix(colAddr, {static_cast<int>(UP_DIV(realDstCount, sparseQuantParam.eP)), static_cast<int>(sparseQuantParam.l), static_cast<int>(sparseQuantParam.eP)});
 
 #ifdef MNN_USE_SSE
-                const int col_buffer_size = sparseQuantParam.aStride * sizeof(int8_t);
-                MNNInt8ToUInt8(colAddr, col_buffer_size);
+            const int col_buffer_size = sparseQuantParam.aStride * sizeof(int8_t);
+            MNNInt8ToUInt8(colAddr, col_buffer_size);
 #endif
-                auto outputInTilePtr = dstPtr + xIndexStart * PackUnit;
-                // MNN_PRINT("bIndex:%d, offset:%zu, spmm sparseMatmul tile:\n", bIndex, outputInTilePtr - outputDataPtr);
-                mSparseQuantMatMulKernel(outputInTilePtr, colAddr, weightDataPtr, (size_t*)&sparseQuantParam, &quanParam, NNZMapPtr, dataOffsetPtr);
-                // formatMatrix(outputInTilePtr, {static_cast<int>(UP_DIV(sparseQuantParam.h, PackUnit)), realDstCount, PackUnit});
-            }
+            auto outputInTilePtr = outputDataPtr + xIndexStart * PackUnit;
+            // MNN_PRINT("bIndex:%d, offset:%zu, spmm sparseMatmul tile:\n", bIndex, outputInTilePtr - outputDataPtr);
+            mSparseQuantMatMulKernel(outputInTilePtr, colAddr, weightDataPtr, (size_t*)&sparseQuantParam, &quanParam, NNZMapPtr, dataOffsetPtr);
+            // formatMatrix(outputInTilePtr, {static_cast<int>(UP_DIV(sparseQuantParam.h, PackUnit)), realDstCount, PackUnit});
         }
     };
     MNN_CONCURRENCY_BEGIN(tId, mThreadNums) {

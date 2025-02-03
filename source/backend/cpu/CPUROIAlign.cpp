@@ -13,28 +13,19 @@
 #include "CPUTensorConvert.hpp"
 #include "backend/cpu/CPUBackend.hpp"
 #include "core/TensorUtils.hpp"
-#ifdef MNN_USE_NEON
-#include <arm_neon.h>
-#endif
-#ifdef MNN_USE_SSE
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
-#endif
 
 namespace MNN {
 
 CPUROIAlign::CPUROIAlign(Backend* backend, int pooledWidth, int pooledHeight, int samplingRatio, float spatialScale,
-                         bool aligned, PoolType poolType)
+                         bool aligned, PoolType poolType, bool outputGrad)
     : Execution(backend),
       mPooledWidth(pooledWidth),
       mPooledHeight(pooledHeight),
       mSamplingRatio(samplingRatio),
       mSpatialScale(spatialScale),
       mAligned(aligned),
-      mPoolType(poolType) {
+      mPoolType(poolType),
+      mOutputGrad(outputGrad) {
     // nothing to do
 }
 
@@ -43,12 +34,28 @@ ErrorCode CPUROIAlign::onResize(const std::vector<Tensor*>& inputs, const std::v
     auto& roi = inputs[1]->buffer();
 
     mROI.buffer().dimensions = roi.dimensions;
+    mROI.buffer().type = halide_type_of<float>();
     memcpy(mROI.buffer().dim, roi.dim, sizeof(halide_dimension_t) * roi.dimensions);
     TensorUtils::getDescribe(&mROI)->dimensionFormat = MNN_DATA_FORMAT_NCHW;
     TensorUtils::setLinearLayout(&mROI);
-
-    backend()->onAcquireBuffer(&mROI, Backend::DYNAMIC);
+    auto core    = static_cast<CPUBackend*>(backend())->functions();
+    if (core->bytes < 4) {
+        mROITemp.reset(MNN::Tensor::createDevice<int32_t>({mROI.elementSize()}));
+    }
+    auto res = backend()->onAcquireBuffer(&mROI, Backend::DYNAMIC);
+    if (!res) {
+        return OUT_OF_MEMORY;
+    }
+    if (core->bytes < 4) {
+        res = backend()->onAcquireBuffer(mROITemp.get(), Backend::DYNAMIC);
+        if (!res) {
+            return OUT_OF_MEMORY;
+        }
+    }
     backend()->onReleaseBuffer(&mROI, Backend::DYNAMIC);
+    if (core->bytes < 4) {
+        backend()->onReleaseBuffer(mROITemp.get(), Backend::DYNAMIC);
+    }
 
     return NO_ERROR;
 }
@@ -62,67 +69,193 @@ ErrorCode CPUROIAlign::onExecute(const std::vector<Tensor*>& inputs, const std::
 
     // dataType of ROI must be float32.
     Tensor *roiTensor = &mROI;
+    auto roiPtrSrc = roiTensor->host<float>();
     if (core->bytes != 4) {
-        core->MNNLowpToFp32(mROI.host<int16_t>(), mROI.host<float>(), mROI.elementSize());
+        core->MNNLowpToFp32(mROI.host<int16_t>(), mROITemp->host<float>(), mROI.elementSize());
+        roiPtrSrc = mROITemp->host<float>();
     }
 
-    // get params
-    auto iw = input->width(), ih = input->height(), is = iw * ih * core->pack;   // C4
-    auto ow = output->width(), oh = output->height(), os = ow * oh * core->pack; // C4
-    auto rs           = roiTensor->stride(0);
-    auto numROI       = roiTensor->batch();
-    auto numSlice     = UP_DIV(input->channel(), core->pack);
-    float alignOffset = mAligned ? -0.5f : 0.f;
+    if (mOutputGrad == false) {
+        // get params
+        auto iw = input->width(), ih = input->height(), is = iw * ih * core->pack;   // C4
+        auto ow = output->width(), oh = output->height(), os = ow * oh * core->pack; // C4
+        auto rs           = roiTensor->stride(0);
+        auto numROI       = roiTensor->batch();
+        auto numSlice     = UP_DIV(input->channel(), core->pack);
+        float alignOffset = mAligned ? -0.5f : 0.f;
 
-    for (int n = 0; n < numROI; ++n) {
-        auto batchOutput = output->host<uint8_t>() + os * n * core->bytes;
-        auto roiPtr      = roiTensor->host<float>() + rs * n;
-        int batchIdx     = (int)roiPtr[0], idxRoi = 1;
-        if (inputs.size() == 3) {
-            batchIdx = inputs[2]->host<int>()[n];
-            idxRoi = 0;
-        }
-        float x1         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
-        float y1         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
-        float x2         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
-        float y2         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
-        MNN_ASSERT(batchIdx < input->batch());
-
-        float roiW = x2 - x1;
-        float roiH = y2 - y1;
-        if (!mAligned) {
-            roiW = std::max(roiW, 1.f);
-            roiH = std::max(roiH, 1.f);
-        }
-
-        float binSizeW = roiW / mPooledWidth;
-        float binSizeH = roiH / mPooledHeight;
-
-        int samplingRatioW = mSamplingRatio > 0 ? mSamplingRatio : static_cast<int>(ceilf(roiW / mPooledWidth));
-        int samplingRatioH = mSamplingRatio > 0 ? mSamplingRatio : static_cast<int>(ceilf(roiH / mPooledHeight));
-        MNN_ASSERT(samplingRatioH > 0 && samplingRatioW > 0);
-
-        std::vector<std::vector<int>> vecPos;
-        std::vector<std::vector<float>> vecArea;
-        preCalcBilinearInterpolate(ih, iw, mPooledHeight, mPooledWidth, y1, x1, binSizeH, binSizeW, samplingRatioH,
-                                   samplingRatioW, vecPos, vecArea);
-
-        auto batchInput = input->host<uint8_t>() + is * batchIdx * core->bytes;
-        if (mPoolType == PoolType_AVEPOOL) {
-            for (int s = 0; s < numSlice; ++s) {
-                auto sliceInput = batchInput + is * input->batch() * s * core->bytes;
-                auto rowOutput  = batchOutput + os * output->batch() * s * core->bytes;
-                core->MNNRoiAlignAvg((float *)rowOutput, (float *)sliceInput, vecPos, vecArea, samplingRatioH * samplingRatioW, mPooledHeight, mPooledWidth);
+        for (int n = 0; n < numROI; ++n) {
+            auto batchOutput = output->host<uint8_t>() + os * n * core->bytes;
+            auto roiPtr      = roiPtrSrc + rs * n;
+            int batchIdx     = (int)roiPtr[0], idxRoi = 1;
+            if (inputs.size() == 3) {
+                batchIdx = inputs[2]->host<int>()[n];
+                idxRoi = 0;
             }
-        } else if (mPoolType == PoolType_MAXPOOL) {
-            for (int s = 0; s < numSlice; ++s) {
-                auto sliceInput = batchInput + is * input->batch() * s * core->bytes;
-                auto rowOutput  = batchOutput + os * output->batch() * s * core->bytes;
-                core->MNNRoiAlignMax((float *)rowOutput, (float *)sliceInput, vecPos, vecArea, samplingRatioH * samplingRatioW, mPooledHeight, mPooledWidth);
+            float x1         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            float y1         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            float x2         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            float y2         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            MNN_ASSERT(batchIdx < input->batch());
+
+            float roiW = x2 - x1;
+            float roiH = y2 - y1;
+            if (!mAligned) {
+                roiW = std::max(roiW, 1.f);
+                roiH = std::max(roiH, 1.f);
             }
-        } else {
-            MNN_ERROR("pooling mode: %d not supported now!", mPoolType);
-            return NOT_SUPPORT;
+
+            float binSizeW = roiW / mPooledWidth;
+            float binSizeH = roiH / mPooledHeight;
+
+            int samplingRatioW = mSamplingRatio > 0 ? mSamplingRatio : static_cast<int>(ceilf(roiW / mPooledWidth));
+            int samplingRatioH = mSamplingRatio > 0 ? mSamplingRatio : static_cast<int>(ceilf(roiH / mPooledHeight));
+            MNN_ASSERT(samplingRatioH > 0 && samplingRatioW > 0);
+
+            std::vector<std::vector<int>> vecPos;
+            std::vector<std::vector<float>> vecArea;
+            preCalcBilinearInterpolate(ih, iw, mPooledHeight, mPooledWidth, y1, x1, binSizeH, binSizeW, samplingRatioH,
+                                        samplingRatioW, vecPos, vecArea);
+
+            auto batchInput = input->host<uint8_t>() + is * batchIdx * core->bytes;
+            if (mPoolType == PoolType_AVEPOOL) {
+                for (int s = 0; s < numSlice; ++s) {
+                    auto sliceInput = batchInput + is * input->batch() * s * core->bytes;
+                    auto rowOutput  = batchOutput + os * output->batch() * s * core->bytes;
+                    core->MNNRoiAlignAvg((float *)rowOutput, (float *)sliceInput, vecPos, vecArea, samplingRatioH * samplingRatioW, mPooledHeight, mPooledWidth);
+                }
+            } else if (mPoolType == PoolType_MAXPOOL) {
+                for (int s = 0; s < numSlice; ++s) {
+                    auto sliceInput = batchInput + is * input->batch() * s * core->bytes;
+                    auto rowOutput  = batchOutput + os * output->batch() * s * core->bytes;
+                    core->MNNRoiAlignMax((float *)rowOutput, (float *)sliceInput, vecPos, vecArea, samplingRatioH * samplingRatioW, mPooledHeight, mPooledWidth);
+                }
+            } else {
+                MNN_ERROR("pooling mode: %d not supported now!", mPoolType);
+                return NOT_SUPPORT;
+            }
+        }
+    } else {
+        // get params
+        auto iw = input->width(), ih = input->height(), is = iw * ih * core->pack;   // C4
+        // backward mode, output shape is the same with input[0] shape
+        // inputs[3] is backward diff
+        auto ow = inputs[3]->width(), oh = inputs[3]->height(), os = ow * oh * core->pack; // C4
+        auto rs           = roiTensor->stride(0);
+        auto numROI       = roiTensor->batch();
+        auto numSlice     = UP_DIV(input->channel(), core->pack);
+        float alignOffset = mAligned ? -0.5f : 0.f;
+        auto& bwDiff = inputs[3];
+        ::memset(output->host<uint8_t>(), 0, static_cast<CPUBackend*>(backend())->getTensorSize(output, true));
+
+        for (int n = 0; n < numROI; ++n) {
+            auto roiPtr      = roiPtrSrc + rs * n;
+            int batchIdx     = inputs[2]->host<int>()[n], idxRoi = 0;
+            float x1         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            float y1         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            float x2         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            float y2         = roiPtr[idxRoi++] * mSpatialScale + alignOffset;
+            MNN_ASSERT(batchIdx < input->batch());
+
+            float roiW = x2 - x1;
+            float roiH = y2 - y1;
+            if (!mAligned) {
+                roiW = std::max(roiW, 1.f);
+                roiH = std::max(roiH, 1.f);
+            }
+
+            float binSizeW = roiW / mPooledWidth;
+            float binSizeH = roiH / mPooledHeight;
+
+            int samplingRatioW = mSamplingRatio > 0 ? mSamplingRatio : static_cast<int>(ceilf(roiW / mPooledWidth));
+            int samplingRatioH = mSamplingRatio > 0 ? mSamplingRatio : static_cast<int>(ceilf(roiH / mPooledHeight));
+            MNN_ASSERT(samplingRatioH > 0 && samplingRatioW > 0);
+
+            std::vector<std::vector<int>> vecPos;
+            std::vector<std::vector<float>> vecArea;
+            preCalcBilinearInterpolate(ih, iw, mPooledHeight, mPooledWidth, y1, x1, binSizeH, binSizeW, samplingRatioH,
+                                    samplingRatioW, vecPos, vecArea);
+
+            auto batchInput = input->host<uint8_t>() + is * batchIdx * core->bytes;
+            auto batchOutput = output->host<uint8_t>() + is * batchIdx * core->bytes;
+            auto batchBwDiff = bwDiff->host<uint8_t>() + os * n * core->bytes;
+            if (mPoolType == PoolType_AVEPOOL) {
+                for (int s = 0; s < numSlice; ++s) {
+                    auto sliceInput = (float*)(batchInput + is * input->batch() * s * core->bytes);
+                    auto sliceOutput  = (float*)(batchOutput + is * input->batch() * s * core->bytes);
+                    auto rowBwDiff  = (float*)(batchBwDiff + os * bwDiff->batch() * s * core->bytes);
+
+                    int samplingRatioArea = samplingRatioH * samplingRatioW;
+                    float invSamplingCnt = 1.f / samplingRatioArea;
+                    for (int h = 0; h < mPooledHeight; ++h, rowBwDiff += mPooledWidth * core->pack) {
+                        int preCalcIdx = h * mPooledWidth * samplingRatioArea;
+                        for (int w = 0; w < mPooledWidth; ++w) {
+                            float* localDiff = rowBwDiff + w * core->pack;
+                            for (int i = 0; i < samplingRatioArea; ++i) {
+                                const std::vector<int>& pos    = vecPos[preCalcIdx];
+                                const std::vector<float>& area = vecArea[preCalcIdx];
+
+                                for (int k = 0; k < core->pack; k++) {
+                                    float dav = localDiff[k] * invSamplingCnt;
+                                    (sliceOutput + pos[0] * core->pack)[k] += (dav * area[0]);
+                                    (sliceOutput + pos[1] * core->pack)[k] += (dav * area[1]);
+                                    (sliceOutput + pos[2] * core->pack)[k] += (dav * area[2]);
+                                    (sliceOutput + pos[3] * core->pack)[k] += (dav * area[3]);
+                                }
+                                preCalcIdx++;
+                            }
+                        }
+                    }
+                }
+            } else if (mPoolType == PoolType_MAXPOOL) {
+                // TODO: the grad is not align with mmcv's result, but i don't find the bug
+                for (int s = 0; s < numSlice; ++s) {
+                    auto sliceInput = (float*)(batchInput + is * input->batch() * s * core->bytes);
+                    auto sliceOutput  = (float*)(batchOutput + is * input->batch() * s * core->bytes);
+                    auto rowBwDiff  = (float*)(batchBwDiff + os * bwDiff->batch() * s * core->bytes);
+
+                    int samplingRatioArea = samplingRatioH * samplingRatioW;
+                    for (int h = 0; h < mPooledHeight; ++h, rowBwDiff += mPooledWidth * core->pack) {
+                        int preCalcIdx = h * mPooledWidth * samplingRatioArea;
+                        for (int w = 0; w < mPooledWidth; ++w) {
+                            float* localDiff = rowBwDiff + w * core->pack;
+
+                            std::vector<float> maxVals(core->pack, -FLT_MAX);
+                            std::vector<int> preCalcIdxVec(core->pack, 0);
+                            for (int i = 0; i < samplingRatioArea; ++i) {
+                                const std::vector<int>& pos    = vecPos[preCalcIdx];
+                                const std::vector<float>& area = vecArea[preCalcIdx];
+
+                                for (int k = 0; k < core->pack; k++) {
+                                    float val0 = (sliceInput + pos[0] * core->pack)[k] * area[0];
+                                    float val1 = (sliceInput + pos[1] * core->pack)[k] * area[1];
+                                    float val2 = (sliceInput + pos[2] * core->pack)[k] * area[2];
+                                    float val3 = (sliceInput + pos[3] * core->pack)[k] * area[3];
+                                    float val = val0 + val1 + val2 + val3;
+                                    if (val > maxVals[k]) {
+                                        maxVals[k] = val;
+                                        preCalcIdxVec[k] = preCalcIdx;
+                                    }
+                                }
+                                preCalcIdx++;
+                            }
+
+                            for (int k = 0; k < core->pack; k++) {
+                                const std::vector<int>& pos    = vecPos[preCalcIdxVec[k]];
+                                const std::vector<float>& area = vecArea[preCalcIdxVec[k]];
+
+                                (sliceOutput + pos[0] * core->pack)[k] += (localDiff[k] * area[0]);
+                                (sliceOutput + pos[1] * core->pack)[k] += (localDiff[k] * area[1]);
+                                (sliceOutput + pos[2] * core->pack)[k] += (localDiff[k] * area[2]);
+                                (sliceOutput + pos[3] * core->pack)[k] += (localDiff[k] * area[3]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                MNN_ERROR("grad of pooling mode: %d not supported now!", mPoolType);
+                return NOT_SUPPORT;
+            }
         }
     }
 
@@ -195,8 +328,11 @@ public:
             MNN_ERROR("Don't have function for CPUROIAlign\n");
             return nullptr;
         }
+        if (core->bytes < 4 && roiAlign->outputGrad()) {
+            return nullptr;
+        }
         return new CPUROIAlign(backend, roiAlign->pooledWidth(), roiAlign->pooledHeight(), roiAlign->samplingRatio(),
-                               roiAlign->spatialScale(), roiAlign->aligned(), roiAlign->poolType());
+                               roiAlign->spatialScale(), roiAlign->aligned(), roiAlign->poolType(), roiAlign->outputGrad());
     }
 };
 

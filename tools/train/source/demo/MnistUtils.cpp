@@ -24,6 +24,7 @@
 #include "RandomGenerator.hpp"
 #include "Transformer.hpp"
 #include "OpGrad.hpp"
+#include "../../../cpp/ExprDebug.hpp"
 using namespace MNN;
 using namespace MNN::Express;
 using namespace MNN::Train;
@@ -36,7 +37,8 @@ void MnistUtils::train(std::shared_ptr<Module> model, std::string root) {
     }
     auto exe = Executor::getGlobalExecutor();
     BackendConfig config;
-    exe->setGlobalExecutorConfig(MNN_FORWARD_CUDA, config, 4);
+    exe->setGlobalExecutorConfig(MNN_FORWARD_CPU, config, 4);
+//    _initTensorStatic();
     std::shared_ptr<SGD> sgd(new SGD(model));
     sgd->setMomentum(0.9f);
     // sgd->setMomentum2(0.99f);
@@ -64,7 +66,6 @@ void MnistUtils::train(std::shared_ptr<Module> model, std::string root) {
     for (int epoch = 0; epoch < 50; ++epoch) {
         model->clearCache();
         exe->gc(Executor::FULL);
-        exe->resetProfile();
         {
             AUTOTIME;
             dataLoader->reset();
@@ -154,6 +155,5 @@ void MnistUtils::train(std::shared_ptr<Module> model, std::string root) {
         }
         auto accu = (float)correct / (float)testDataLoader->size();
         std::cout << "epoch: " << epoch << "  accuracy: " << accu << std::endl;
-        exe->dumpProfile();
     }
 }

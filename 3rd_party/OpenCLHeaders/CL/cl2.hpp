@@ -403,10 +403,6 @@
 # pragma message("cl2.hpp: USE_CL_DEVICE_FISSION is deprecated. Define CL_HPP_USE_CL_DEVICE_FISSION instead")
 # define CL_HPP_USE_CL_DEVICE_FISSION
 #endif
-#if !defined(CL_HPP_ENABLE_EXCEPTIONS) && defined(__CL_ENABLE_EXCEPTIONS)
-# pragma message("cl2.hpp: __CL_ENABLE_EXCEPTIONS is deprecated. Define CL_HPP_ENABLE_EXCEPTIONS instead")
-# define CL_HPP_ENABLE_EXCEPTIONS
-#endif
 #if !defined(CL_HPP_NO_STD_VECTOR) && defined(__NO_STD_VECTOR)
 # pragma message("cl2.hpp: __NO_STD_VECTOR is deprecated. Define CL_HPP_NO_STD_VECTOR instead")
 # define CL_HPP_NO_STD_VECTOR
@@ -805,9 +801,9 @@ static inline cl_int errHandler (cl_int err, const char * errStr = NULL)
 #define __GET_GL_OBJECT_INFO_ERR            CL_HPP_ERR_STR_(clGetGLObjectInfo)
 #if CL_HPP_TARGET_OPENCL_VERSION >= 120
 #define __CREATE_IMAGE_ERR                  CL_HPP_ERR_STR_(clCreateImage)
-#define __CREATE_GL_TEXTURE_ERR             CL_HPP_ERR_STR_(clCreateFromGLTexture)
 #define __IMAGE_DIMENSION_ERR               CL_HPP_ERR_STR_(Incorrect image dimensions)
 #endif // CL_HPP_TARGET_OPENCL_VERSION >= 120
+#define __CREATE_GL_TEXTURE_ERR             CL_HPP_ERR_STR_(clCreateFromGLTexture)
 #define __SET_MEM_OBJECT_DESTRUCTOR_CALLBACK_ERR CL_HPP_ERR_STR_(clSetMemObjectDestructorCallback)
 
 #define __CREATE_USER_EVENT_ERR             CL_HPP_ERR_STR_(clCreateUserEvent)
@@ -897,6 +893,8 @@ static inline cl_int errHandler (cl_int err, const char * errStr = NULL)
  */
 #if defined(CL_USE_DEPRECATED_OPENCL_1_2_APIS)
 #define __CREATE_COMMAND_QUEUE_ERR          CL_HPP_ERR_STR_(clCreateCommandQueue)
+#define __NEW_RECOEDING_QCOM_ERR            CL_HPP_ERR_STR_(clNewRecordingQCOM)
+#define __ENQUEUE_RECORDING_QCOM_ERR        CL_HPP_ERR_STR_(clEnqueueRecordingQCOM)
 #define __ENQUEUE_TASK_ERR                  CL_HPP_ERR_STR_(clEnqueueTask)
 #define __CREATE_SAMPLER_ERR                CL_HPP_ERR_STR_(clCreateSampler)
 #endif // #if defined(CL_USE_DEPRECATED_OPENCL_1_1_APIS)
@@ -1110,6 +1108,7 @@ inline cl_int getInfoHelper(Func f, cl_uint name, T* param, int, typename T::cl_
     F(cl_device_info, CL_DEVICE_TYPE, cl_device_type) \
     F(cl_device_info, CL_DEVICE_VENDOR_ID, cl_uint) \
     F(cl_device_info, CL_DEVICE_MAX_COMPUTE_UNITS, cl_uint) \
+    F(cl_device_info, CL_DEVICE_NUM_THREADS_PER_EU_INTEL, cl_uint) \
     F(cl_device_info, CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS, cl_uint) \
     F(cl_device_info, CL_DEVICE_MAX_WORK_GROUP_SIZE, size_type) \
     F(cl_device_info, CL_DEVICE_MAX_WORK_ITEM_SIZES, cl::vector<size_type>) \
@@ -1123,6 +1122,7 @@ inline cl_int getInfoHelper(Func f, cl_uint name, T* param, int, typename T::cl_
     F(cl_device_info, CL_DEVICE_ADDRESS_BITS, cl_uint) \
     F(cl_device_info, CL_DEVICE_MAX_READ_IMAGE_ARGS, cl_uint) \
     F(cl_device_info, CL_DEVICE_MAX_WRITE_IMAGE_ARGS, cl_uint) \
+    F(cl_device_info, CL_DEVICE_RECORDABLE_QUEUE_MAX_SIZE, cl_uint) \
     F(cl_device_info, CL_DEVICE_MAX_MEM_ALLOC_SIZE, cl_ulong) \
     F(cl_device_info, CL_DEVICE_IMAGE2D_MAX_WIDTH, size_type) \
     F(cl_device_info, CL_DEVICE_IMAGE2D_MAX_HEIGHT, size_type) \
@@ -2209,9 +2209,13 @@ private:
         {
             // If default wasn't passed ,generate one
             // Otherwise set it
-            cl_uint n = 0;
-
-            cl_int err = ::clGetPlatformIDs(0, NULL, &n);
+            // Default only check first card info
+            cl_uint n = 1;
+            cl_int err = CL_SUCCESS;
+            
+            // Ignore platform number acquire
+            #if 0
+            err = ::clGetPlatformIDs(0, NULL, &n);
             if (err != CL_SUCCESS) {
                 default_error_ = err;
                 return;
@@ -2220,7 +2224,7 @@ private:
                 default_error_ = CL_INVALID_PLATFORM;
                 return;
             }
-
+            #endif
             vector<cl_platform_id> ids(n);
             err = ::clGetPlatformIDs(n, ids.data(), NULL);
             if (err != CL_SUCCESS) {
@@ -2462,15 +2466,17 @@ public:
      *  Wraps clGetPlatformIDs().
      */
     static cl_int get(
-        vector<Platform>* platforms)
+        vector<Platform>* platforms, int platformSize = 0)
     {
-        cl_uint n = 0;
+        cl_uint n = platformSize;
 
         if( platforms == NULL ) {
             return detail::errHandler(CL_INVALID_ARG_VALUE, __GET_PLATFORM_IDS_ERR);
         }
-
-        cl_int err = ::clGetPlatformIDs(0, NULL, &n);
+        cl_int err = CL_SUCCESS;
+        if(n == 0) {
+            err = ::clGetPlatformIDs(0, NULL, &n);
+        }
         if (err != CL_SUCCESS) {
             return detail::errHandler(err, __GET_PLATFORM_IDS_ERR);
         }
@@ -2482,40 +2488,57 @@ public:
         }
 
         // more than one gpu card
+        #if defined(_WIN32) || defined(__linux__) // Windows or Linux
         if (n > 1) {
-            // first select nvidia gpu as discrete card, if multi gpu cards are available, x86_64 platform
+            // first select nvidia gpu as discrete card
             //const char* integrate_gpu = "Intel";
-            const char* discrete_gpu = "NVIDIA";
+            const char* discrete_gpu_0 = "NVIDIA";
+            bool hasFirstPriority = false;
             for (cl_uint i = 0; i < n; ++i) {
-                // get the length of platform name
-                size_t platform_name_length = 0;
-                err = clGetPlatformInfo(ids[i], CL_PLATFORM_NAME, 0, 0, &platform_name_length);
+                vector<char> platform_name(10240);
+                err = clGetPlatformInfo(ids[i], CL_PLATFORM_NAME, 10240, platform_name.data(), 0);
                 if (err != CL_SUCCESS) {
-                    return detail::errHandler(err, __GET_PLATFORM_INFO_ERR);
-                }
-                // get platform name
-                char* platform_name = new char[platform_name_length];
-                err = clGetPlatformInfo(ids[i], CL_PLATFORM_NAME, platform_name_length, platform_name, 0);
-                if (err != CL_SUCCESS) {
-                    delete[] platform_name;
                     return detail::errHandler(err, __GET_PLATFORM_INFO_ERR);
                 }
                 // if nvidia card is detected, set it as default ids[0]
-                if (strstr(platform_name, discrete_gpu)) {
+                if (strstr(platform_name.data(), discrete_gpu_0)) {
+                    hasFirstPriority = true;
                     if (i == 0) {
-                        delete[] platform_name;
                         break;
                     }
                     // swap 
                     cl_platform_id tmp = ids[0];
                     ids[0] = ids[i];
                     ids[i] = tmp;
-                    delete[] platform_name;
                     break;
                 }
-                delete[] platform_name;
+            }
+            
+            // second select amd gpu as discrete card
+            if(!hasFirstPriority) {
+                const char* discrete_gpu_1 = "AMD";
+                for (cl_uint i = 0; i < n; ++i) {
+                    vector<char> platform_name(10240);
+                    err = clGetPlatformInfo(ids[i], CL_PLATFORM_NAME, 10240, platform_name.data(), 0);
+                    if (err != CL_SUCCESS) {
+                        return detail::errHandler(err, __GET_PLATFORM_INFO_ERR);
+                    }
+                    // if amd card is detected, set it as default ids[0]
+                    if (strstr(platform_name.data(), discrete_gpu_1)) {
+                        hasFirstPriority = true;
+                        if (i == 0) {
+                            break;
+                        }
+                        // swap
+                        cl_platform_id tmp = ids[0];
+                        ids[0] = ids[i];
+                        ids[i] = tmp;
+                        break;
+                    }
+                }
             }
         }
+        #endif
      
         if (platforms) {
             platforms->resize(ids.size());
@@ -3786,6 +3809,24 @@ public:
             }
         }
     }
+
+    Buffer(
+        const Context& context,
+        cl_mem_flags flags,
+        const cl_import_properties_arm *properties,
+        void *memory,
+        size_type size,
+        cl_int* err = NULL)
+    {
+        cl_int error;
+        object_ = ::clImportMemoryARM(context(), flags, properties, memory, size, &error);
+
+        detail::errHandler(error, __CREATE_BUFFER_ERR);
+        if (err != NULL) {
+            *err = error;
+        }
+    }
+
 
     /*!
      * \brief Construct a Buffer from a host container via iterators using a specified context.
@@ -5202,7 +5243,6 @@ public:
 };
 #endif // CL_USE_DEPRECATED_OPENCL_1_1_APIS
 
-#if CL_HPP_TARGET_OPENCL_VERSION >= 120
 /*! \class ImageGL
  * \brief general image interface for GL interop.
  * We abstract the 2D and 3D GL images into a single instance here
@@ -5281,7 +5321,6 @@ public:
         return *this;
     }
 };
-#endif // CL_HPP_TARGET_OPENCL_VERSION >= 120
 
 
 
@@ -7061,6 +7100,48 @@ public:
         return param;
     }
 
+    cl_recording_qcom NewRecordingQCOM(
+        cl_int *errcode_ret)
+    {
+        cl_int error;
+        cl_recording_qcom recording = ::clNewRecordingQCOM(object_, &error);
+        detail::errHandler(error, __NEW_RECOEDING_QCOM_ERR);
+        if(errcode_ret != NULL){
+            *errcode_ret = error;
+        }
+        return recording;
+    }
+    
+    cl_int EnqueueRecordingQCOM(
+        cl_recording_qcom recording,
+        size_t num_args,
+        const cl_array_arg_qcom *arg_array,
+        size_t num_global_offsets,
+        const cl_offset_qcom *global_offset_array,
+        size_t num_global_workgroups,
+        const cl_workgroup_qcom *global_workgroup_array,
+        size_t num_local_workgroups,
+        const cl_workgroup_qcom *local_workgroups_array,
+        cl_uint num_events_in_wait_list,
+        const vector<Event>* events = NULL,
+        Event* event = NULL) const
+    {
+        cl_event tmp;
+        cl_int err = detail::errHandler(
+            ::clEnqueueRecordingQCOM(
+                object_, recording, num_args, arg_array, num_global_offsets,
+                global_offset_array, num_global_workgroups, global_workgroup_array,
+                num_local_workgroups, local_workgroups_array, num_events_in_wait_list,
+                (events != NULL && num_events_in_wait_list > 0) ? (cl_event*) &events->front() : NULL,
+                (event != NULL) ? &tmp : NULL),
+            __ENQUEUE_READ_BUFFER_ERR);
+
+        if (event != NULL && err == CL_SUCCESS)
+            *event = tmp;
+
+        return err;
+    }
+    
     cl_int enqueueReadBuffer(
         const Buffer& buffer,
         cl_bool blocking,

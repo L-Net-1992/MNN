@@ -11,16 +11,27 @@ struct Cache {
     size_t lastCacheSize = 0;
 };
 struct RuntimeAttr {
-    Session::ModeGroup modes;
+    struct Immutable {
+        Session::ModeGroup modes;
+        BackendConfig mConfig;
+        bool mUserConfig;
+        int mNumberThread;
+        std::string mExternalFile;
+    };
+    std::shared_ptr<Immutable> mContent;
     RuntimeInfo mRuntime;
     std::shared_ptr<Runtime> mInfo;
     std::shared_ptr<Cache> mCache;
-    RuntimeAttr* mInside;
-    BackendConfig mConfig;
-    bool mUserConfig;
-    int mNumberThread;
     // Use for static module to compute flops
     float mFlops;
+    mutable int mResizeStatus = 0;
+};
+struct ExecutorAttr {
+    std::shared_ptr<Backend> constantBackend;
+    MNNForwardType firstType;
+    int numThread = 1;
+    BackendConfig config;
+    std::string externalFile;
 };
 };
 };

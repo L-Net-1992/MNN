@@ -11,14 +11,17 @@
 #include <MNN/expr/Executor.hpp>
 #include <MNN/expr/ExprCreator.hpp>
 #include "Utils.hpp"
+#include "RuntimeAttr.hpp"
 #include "core/FileLoader.hpp"
 #include "core/TensorUtils.hpp"
 #include "core/WrapExecution.hpp"
-#include "MNN_generated.h"
+#include "utils/InitNet.hpp"
 //#define MNN_OPEN_TIME_TRACE
 #include "MNN/AutoTime.hpp"
 #include "MNN/expr/ExecutorScope.hpp"
 #include "half.hpp"
+#include "geometry/GeometryComputer.hpp"
+#include "geometry/GeometryComputerUtils.hpp"
 
 //#define MNN_EXPRESS_ERROR_REPORT
 static inline std::string numberToString(int index) {
@@ -63,37 +66,32 @@ bool VARP::fix(VARP::InputType type) const {
     if (nullptr == info) {
         return false;
     }
-    VARP newVar;
-    switch (type) {
-        case INPUT: {
-            newVar = _Input(info->dim, info->order, info->type);
-            auto ptr = mContent->readMap<void>();
-            if (nullptr != ptr) {
-                auto dstPtr = newVar->writeMap<void>();
-                ::memcpy(dstPtr, ptr, info->size * info->type.bytes());
-            }
-            break;
-        }
-        case CONSTANT: {
-            auto ptr = mContent->readMap<void>();
-            if (nullptr == ptr) {
-                return false;
-            }
-            newVar = _Const(ptr, info->dim, info->order, info->type);
-            break;
-        }
-        case TRAINABLE: {
-            auto ptr = mContent->readMap<void>();
-            if (nullptr == ptr) {
-                return false;
-            }
-            newVar = _TrainableParam(ptr, info->dim, info->order, info->type);
-            break;
-        }
-        default:
-            return false;
+    auto exprInfo    = mContent->expr();
+    auto inside      = exprInfo.first->inside();
+    auto mFrom = exprInfo.first;
+    auto cache = mFrom->inside()->mCache;
+    if (nullptr == cache) {
+        ExecutorScope::Current()->makeCache({mFrom}, false);
+        cache = mFrom->inside()->mCache;
     }
-    Variable::replace(VARP(mContent), newVar);
+    if (nullptr == cache) {
+        return false;
+    }
+    if (NO_ERROR != cache->compute()) {
+        return false;
+    }
+    auto inputTensor = inside->mCache->getSession()->getTensor(inside->mCacheOffset + exprInfo.second);
+    auto tensor = Tensor::clone(inputTensor);
+    VARP newVARP = Express::Variable::create(Express::Expr::create(tensor, true));
+    newVARP->expr().first->mType = type;
+    auto& pipelineInfo = inside->mCache->getSession()->getPipelineInfo(0);
+    if (TensorUtils::getDescribeOrigin(tensor)->getBackend() == pipelineInfo.first.cache.first.get()) {
+        newVARP->expr().first->inside()->mHoldBackend = pipelineInfo.first.cache.first;
+    } else if (TensorUtils::getDescribeOrigin(tensor)->getBackend() == pipelineInfo.first.cache.second.get()) {
+        newVARP->expr().first->inside()->mHoldBackend = pipelineInfo.first.cache.second;
+    }
+    Variable::replace(VARP(mContent), newVARP);
+    inputTensor->wait(MNN::Tensor::MAP_TENSOR_READ, true);
     return true;
 }
 
@@ -180,7 +178,9 @@ EXPRP Expr::create(Variable::Info&& info, const void* ptr, VARP::InputType type,
     }
     expr->mInside->mContentDirty = false;
     if (memtype == COPY) {
-        ::memcpy(expr->mInside->mOutputTensors[0]->buffer().host, originPtr, dstInfo.size * dstInfo.type.bytes());
+        size_t total_size = dstInfo.size;
+        total_size *= dstInfo.type.bytes();
+        ::memcpy(expr->mInside->mOutputTensors[0]->buffer().host, originPtr, total_size);
     } else {
         expr->mInside->mOutputTensors[0]->buffer().host = (uint8_t*)originPtr;
         if (memtype == REF) {
@@ -193,9 +193,23 @@ EXPRP Expr::create(std::shared_ptr<BufferStorage> extra, std::vector<VARP>&& inp
     EXPRP expr(new Expr(outputSize));
     expr->mStorage = extra;
     expr->mOp = flatbuffers::GetRoot<Op>(extra->buffer());
+    switch (expr->mOp->type()) {
+        case OpType_Const:
+            expr->mType = VARP::CONSTANT;
+            break;
+        case OpType_TrainableParam:
+            expr->mType = VARP::TRAINABLE;
+            break;
+        default:
+            expr->mType = VARP::INPUT;
+            break;
+    }
     expr->mInputs   = std::move(inputs);
-    expr->mInside->mReq = ExecutorScope::Current()->getRequirement(expr.get());
-    _addLinkForInputs(expr);
+    auto exe = ExecutorScope::Current();
+    expr->mInside->mReq = exe->getRequirement(expr.get());
+    if ((!(exe->getLazyMode() & Executor::LAZY_COMPUTE_ONCE)) && exe->lazyEval) {
+        _addLinkForInputs(expr);
+    }
     return expr;
 }
 
@@ -211,6 +225,16 @@ EXPRP Expr::create(const OpT* op, std::vector<VARP> inputs, int outputSize) {
         return create(std::move(info), nullptr, VARP::INPUT);
     }
     if (OpType_Const == op->type || OpType_TrainableParam == op->type) {
+        if (!op->externalPath.empty()) {
+            flatbuffers::FlatBufferBuilder builder;
+            auto offset = Op::Pack(builder, op);
+            builder.Finish(offset);
+            std::shared_ptr<BufferStorage> extra(new BufferStorage);
+            extra->storage = builder.ReleaseRaw(extra->allocated_size, extra->offset);
+            auto resExpr = Expr::create(extra, std::move(inputs), outputSize);
+            resExpr->setName(op->name);
+            return resExpr;
+        }
         Variable::Info info;
         info.dim = op->main.AsBlob()->dims;
         info.order = Utils::revertFormat(op->main.AsBlob()->dataFormat);
@@ -229,6 +253,9 @@ EXPRP Expr::create(const OpT* op, std::vector<VARP> inputs, int outputSize) {
                 break;
             case DataType_DT_FLOAT:
                 ptr = (void*)op->main.AsBlob()->float32s.data();
+                break;
+            case DataType_DT_BFLOAT16:
+                ptr = (void*)op->main.AsBlob()->uint8s.data();
                 break;
             default:
                 break;
@@ -275,6 +302,9 @@ bool Expr::requireInfo() {
     }
     if (nullptr == mOp) {
         return !HasUnknownDim(mInside->mOutputInfos[0].dim);
+    }
+    if (!mCanDecompose) {
+        return true;
     }
     bool ready     = true;
     for (int i = 0; i < mInputs.size(); ++i) {
@@ -338,9 +368,119 @@ VARP Variable::create(EXPRP expr, int index) {
 #endif
     }
 #endif
-    if (!ExecutorScope::Current()->lazyEval) {
+    auto executor = ExecutorScope::Current();
+    if (!executor->lazyEval) {
         res.fix(VARP::CONSTANT);
+        return res;
     }
+    // CONTENT Mode, Use Geometry Computer to Decompress Expr
+    do {
+        if (!(executor->getLazyMode() & Executor::LAZY_CONTENT)) {
+            break;
+        }
+        if (expr->get() == nullptr) {
+            break;
+        }
+        if (!expr->mCanDecompose) {
+            break;
+        }
+        bool res = expr->requireInfo();
+        if (!res) {
+            break;
+        }
+        std::map<Tensor*, VARP> varMap;
+        std::vector<Tensor*> inputTensors(expr->mInputs.size());
+        std::vector<Tensor*> outputTensors(expr->outputSize());
+        for (int i=0; i<inputTensors.size(); ++i) {
+            inputTensors[i] = Utils::getTensor(expr->mInputs[i]);
+            varMap.insert(std::make_pair(inputTensors[i], expr->mInputs[i]));
+        }
+        for (int i=0; i<outputTensors.size(); ++i) {
+            outputTensors[i] = expr->mInside->mOutputTensors[i];
+        }
+        auto bn = executor->getAttr()->constantBackend;
+        // TODO: Support set mask
+        GeometryComputer::Context context(Interpreter::GeometryComputeMask::GEOMETRCOMPUTEMASK_ALL, bn);
+        auto geo = GeometryComputer::search(expr->get()->type(), Runtime::Compiler_Loop);
+        CommandBuffer cmd;
+        res = geo->onCompute(expr->get(), inputTensors, outputTensors, context, cmd);
+        if (!res) {
+            break;
+        }
+        for (int i=0; i<outputTensors.size(); ++i) {
+            // Avoid release from host tensor, the memory is owned by executor's cpu runtime
+            if (TensorUtils::getDescribe(outputTensors[i])->usage == Tensor::InsideDescribe::CONSTANT) {
+                TensorUtils::getDescribe(outputTensors[i])->memoryType = Tensor::InsideDescribe::MEMORY_BACKEND;
+            }
+        }
+        if (TensorUtils::getDescribe(outputTensors[index])->usage == Tensor::InsideDescribe::CONSTANT) {
+            auto constExpr = Expr::create(Tensor::clone(outputTensors[index]), true);
+            return Variable::create(constExpr);
+        }
+        // TODO: For multi-output expr, reduce dup compute
+        CommandBuffer cmdDst;
+        GeometryComputerUtils::makeRaster(cmd, cmdDst, context);
+        for (auto t : outputTensors) {
+            context.getRasterCacheCreateRecursive(t, cmdDst);
+        }
+        // Make New Exprs
+        for (int cmdIndex=0; cmdIndex < cmdDst.command.size(); ++cmdIndex) {
+            auto& cmd = cmdDst.command[cmdIndex];
+            std::vector<VARP> cmdInputs(cmd->inputs.size());
+            for (int i=0; i<cmd->inputs.size(); ++i) {
+                auto iter = varMap.find(cmd->inputs[i]);
+                if (iter == varMap.end()) {
+                    // Extract Const Value
+                    auto constExpr = Expr::create(Tensor::clone(cmd->inputs[i]), true);
+                    VARP constVar(new Variable(constExpr, 0));
+                    varMap.insert(std::make_pair(cmd->inputs[i], constVar));
+                    cmdInputs[i] = constVar;
+                } else {
+                    cmdInputs[i] = iter->second;
+                }
+            }
+            EXPRP currentExpr;
+            if (cmd->op->type() == OpType_Raster) {
+                // Rebuild raster buffer
+                auto cmdTensor = cmd->outputs[0];
+                auto cmdDes = TensorUtils::getDescribe(cmdTensor);
+                MNN_ASSERT(cmd->inputs.size() == cmdDes->regions.size());
+                std::vector<int> regions(cmdDes->regions.size() * 11);
+                for (int j=0; j<cmdDes->regions.size(); ++j) {
+                    auto& srcReg = cmdDes->regions[j];
+                    auto dstInt = regions.data() + 11 * j;
+                    dstInt[0] = srcReg.src.offset;
+                    ::memcpy(dstInt + 1, srcReg.src.stride, 3 * sizeof(int));
+                    dstInt[4] = srcReg.dst.offset;
+                    ::memcpy(dstInt + 5, srcReg.dst.stride, 3 * sizeof(int));
+                    ::memcpy(dstInt + 8, srcReg.size, 3 * sizeof(int));
+                }
+                auto cmdExpr = Utils::makeRaster(cmdInputs, regions, cmdTensor->shape(), cmdTensor->getType(), TensorUtils::getDescribe(cmdTensor)->dimensionFormat);
+                cmdExpr->mCanDecompose = false;
+                VARP cmdVar(new Variable(cmdExpr, 0));
+                varMap.insert(std::make_pair(cmdTensor, cmdVar));
+                currentExpr = cmdVar->mFrom;
+            } else {
+                EXPRP cmdExpr;
+                if (cmd->op == expr->get()) {
+                    cmdExpr = Expr::create(expr->mStorage, std::move(cmdInputs), cmd->outputs.size());
+                } else {
+                    cmdExpr = Expr::create(cmd->buffer, std::move(cmdInputs), cmd->outputs.size());
+                }
+                currentExpr = cmdExpr;
+                cmdExpr->mCanDecompose = false;
+                for (int j=0; j<cmd->outputs.size(); ++j) {
+                    VARP cmdVar(new Variable(cmdExpr, j));
+                    varMap.insert(std::make_pair(cmd->outputs[j], cmdVar));
+                }
+            }
+            for (int j=0; j<cmd->outputs.size(); ++j) {
+                Utils::copyTensorToInfo(currentExpr->inside()->mOutputInfos.data() + j, cmd->outputs[j]);
+                TensorUtils::copyShape(cmd->outputs[j], currentExpr->inside()->mOutputTensors[j], true, true);
+            }
+        }
+        return varMap.find(expr->inside()->mOutputTensors[index])->second;
+    } while (false);
     return res;
 }
 void Expr::replace(EXPRP old, EXPRP from) {
@@ -384,6 +524,7 @@ void Expr::replace(EXPRP old, EXPRP from) {
             input->mFrom->mTo.emplace_back(WeakEXPRP(old));
         }
     }
+    old->mCanDecompose = from->mCanDecompose;
     old->mOp = from->mOp;
     old->mName = from->mName;
     old->mOutputNames = from->mOutputNames;
@@ -416,11 +557,57 @@ void Variable::setName(const std::string& name) {
         mFrom->setName(name);
     }
 }
+
+bool Variable::setDevicePtr(const void* devicePtr, int memoryType) {
+    if (nullptr != mFrom->get()) {
+        MNN_ERROR("Can't setDevicePtr to no-input op\n");
+        return false;
+    }
+    informDirty();
+    MNN_ASSERT(TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->quantAttr == nullptr || TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->type == DataType_DT_FLOAT);
+    mFrom->mInside->mContentDirty = false;
+    // Clear host address, Don't malloc hostPtr afterwards
+    Utils::releaseMemoryForHostTensor(mFrom->inside()->mOutputTensors[0]);
+    return mFrom->inside()->mOutputTensors[0]->setDevicePtr(devicePtr, memoryType);
+}
+
+bool Variable::copyToDevicePtr(void* devicePtr, int memoryType) {
+    if (nullptr != mFrom->get()) {
+        MNN_ERROR("Can't copyToDevicePtr to no-input op\n");
+        return false;
+    }
+    
+    auto inside = mFrom->inside();
+    auto originTensor = inside->mOutputTensors[mFromIndex];
+    
+    auto bn = TensorUtils::getDescribeOrigin(originTensor)->getBackend();
+    if(bn == nullptr) {
+        MNN_ERROR("Error: Varp copyToDevicePtr can't find backend\n");
+        return false;
+    }
+
+    MNN::Tensor tempTensor(originTensor->dimensions(), originTensor->getDimensionType());
+    tempTensor.setDevicePtr(devicePtr, memoryType);
+    
+    TensorUtils::getDescribeOrigin(originTensor)->getBackend()->onCopyBuffer(originTensor, &tempTensor);
+    // Sync the result
+    tempTensor.wait(Tensor::MAP_TENSOR_READ, true);
+    return true;
+}
+
 const std::string& Variable::name() const {
     return mFrom->outputName(mFromIndex);
 }
+const Tensor* Variable::getTensor() const {
+    auto inside      = mFrom->inside();
+    auto inputTensor = inside->mOutputTensors[mFromIndex];
+    if (nullptr != inside->mCache) {
+        inputTensor = inside->mCache->getSession()->getTensor(inside->mCacheOffset + mFromIndex);
+    }
+    return inputTensor;
+}
 bool Variable::input(VARP src) {
-    if (nullptr != mFrom->get() || VARP::CONSTANT == mFrom->mType) {
+    if (nullptr != mFrom->get()) {
         MNN_ERROR("Can't input to no-input op\n");
         return false;
     }
@@ -563,12 +750,11 @@ bool Variable::resize(INTS dims) {
     info.syncSize();
     Utils::copyInfoToTensor(mFrom->inside()->mOutputTensors[0], mFrom->inside()->mOutputInfos.data());
     Utils::releaseMemoryForHostTensor(mFrom->inside()->mOutputTensors[0]);
-    if (0 >= info.size) {
-        return false;
-    }
-    bool res = Utils::allocMemoryForHostTensor(mFrom->inside()->mOutputTensors[0]);
-    if (!res) {
-        return false;
+    if (0 < info.size) {
+        bool res = Utils::allocMemoryForHostTensor(mFrom->inside()->mOutputTensors[0]);
+        if (!res) {
+            return false;
+        }
     }
 
     mFrom->mValid = true;
@@ -600,7 +786,7 @@ void* Variable::readInternal(bool forShape) {
         }
         //MNN_ASSERT(nullptr != mFrom->inside()->mOutputTensors[0]->buffer().host);
         auto inside = mFrom->inside();
-        auto originTensor = inside->mOutputTensors[0];
+        auto originTensor = inside->mOutputTensors[mFromIndex];
         auto des = TensorUtils::getDescribe(originTensor);
         if (WrapExecution::needWrap(originTensor, nullptr) || (des->quantAttr != nullptr && des->type == DataType_DT_INT8)) {
             // For StaticModule will other-device runtime, we may create Variable with other-device's memory
@@ -632,11 +818,12 @@ void* Variable::readInternal(bool forShape) {
     if (nullptr == cache) {
         return nullptr;
     }
-    if (NO_ERROR != ExecutorScope::Current()->runCache(cache)) {
+    if (NO_ERROR != cache->compute()) {
         return nullptr;
     }
-    return Executor::mapOutput(cache.get(), mFrom->mInside->mCacheOffset + mFromIndex, mFrom->mInside->mOutputTensors[mFromIndex]);
+    return cache->mapOutput(mFrom->mInside->mCacheOffset + mFromIndex, mFrom->mInside->mOutputTensors[mFromIndex]);
 }
+
 
 void Variable::informDirty() {
     std::vector<Expr*> visited;
@@ -657,7 +844,7 @@ void Variable::informDirty() {
         }
         if (expr->inside()->mReq.contentNeedContent[index]) {
             if (expr->inside()->mCache != nullptr) {
-                Executor::setContentDirty(expr->inside()->mCache.get());
+                expr->inside()->mCache->setContentDirty();
             }
             return true;
         }
@@ -692,23 +879,7 @@ void Variable::compute(const std::vector<VARP>& vars, bool forceCPU) {
         if (nullptr != v && nullptr != v->mFrom->get()) {
             auto inside = v->mFrom->inside();
             if (nullptr != inside && nullptr != inside->mCache) {
-                ExecutorScope::Current()->runCache(inside->mCache);
-            }
-        }
-    }
-    for (auto& v : vars) {
-        if (nullptr != v && nullptr != v->mFrom->get()) {
-            auto inside = v->mFrom->inside();
-            if (nullptr != inside && nullptr != inside->mCache) {
-                auto backends = Executor::getBackends(inside->mCache.get());
-                auto newExpr = Expr::create(Tensor::clone(Executor::getOutput(inside->mCache.get(), inside->mCacheOffset)), true);
-                v->mFrom = newExpr;
-                v->mFromIndex = 0;
-                if (backends.first.get() == TensorUtils::getDescribe(newExpr->inside()->mOutputTensors[0])->backend) {
-                    newExpr->inside()->mHoldBackend = backends.first;
-                } else if(backends.second.get() == TensorUtils::getDescribe(newExpr->inside()->mOutputTensors[0])->backend) {
-                    newExpr->inside()->mHoldBackend = backends.second;
-                }
+                inside->mCache->compute();
             }
         }
     }
@@ -724,6 +895,18 @@ void* Variable::writeInternal(bool inform) {
     MNN_ASSERT(TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->quantAttr == nullptr || TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->type == DataType_DT_FLOAT);
     mFrom->mInside->mContentDirty = false;
     return mFrom->inside()->mOutputTensors[0]->host<void>();
+}
+
+void Variable::writeScaleInternal(float scaleValue, float zeroPoint, bool inform) {
+    MNN_ASSERT(TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->quantAttr == nullptr || TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->type == DataType_DT_FLOAT);
+    if (inform) {
+       informDirty();
+    }
+    mFrom->mInside->mContentDirty = true;
+    TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->quantAttr.reset(new QuantAttr);
+    auto quant = TensorUtils::getDescribe(mFrom->inside()->mOutputTensors[0])->quantAttr.get();
+    quant->scale = scaleValue;
+    quant->zero = zeroPoint;
 }
 
 void Variable::unMap() {
@@ -763,7 +946,7 @@ bool Expr::setInfoDirty() {
     mInside->mContentDirty = true;
     mValid = true;
     if (mInside->mCache != nullptr) {
-        Executor::setShapeDirty(mInside->mCache.get());
+        mInside->mCache->setShapeDirty();
     }
     for (auto o : mInside->mOutputTensors) {
         Utils::releaseMemoryForHostTensor(o);
@@ -774,7 +957,7 @@ bool Expr::setInfoDirty() {
 std::vector<VARP> Variable::load(const char* fileName) {
     AutoStorage<uint8_t> buffer;
     {
-        FileLoader loader(fileName);
+        FileLoader loader(fileName, true);
         if (!loader.valid()) {
             MNN_ERROR("Error for open %s\n", fileName);
             return {};
@@ -815,6 +998,12 @@ std::vector<VARP> Variable::load(const uint8_t* buffer, size_t length) {
     std::vector<VARP> variable;
     variable.reserve(tensorCount);
     std::map<int, VARP> variableMap;
+    bool isStatic = source->usage == Usage_INFERENCE_STATIC;
+    std::vector<std::shared_ptr<Tensor>> allTensors;
+    if (isStatic) {
+        allTensors.resize(source->tensorName.size());
+        initTensors(allTensors, flatbuffers::GetRoot<MNN::Net>(buffer));
+    }
 
     // Generate All Exprs by order of net
     for (int i = 0; i < opSize; ++i) {
@@ -830,6 +1019,16 @@ std::vector<VARP> Variable::load(const uint8_t* buffer, size_t length) {
         }
         EXPRP expr = Expr::create(source->oplists[i].get(), inputs, (int)op->outputIndexes.size());
         expr->setName(source->oplists[i]->name);
+        if (isStatic && nullptr != expr->get()) {
+            // Set tensor shape from net
+            expr->mCanDecompose = false;
+            for (int index = 0; index < op->outputIndexes.size(); ++index) {
+                auto outputIndex = op->outputIndexes[index];
+                delete expr->inside()->mOutputTensors[index];
+                expr->inside()->mOutputTensors[index] = Tensor::clone(allTensors[outputIndex].get());
+                Utils::copyTensorToInfo(expr->inside()->mOutputInfos.data() + index, expr->inside()->mOutputTensors[index]);
+            }
+        }
 
         for (int index = 0; index < op->outputIndexes.size(); ++index) {
             auto outputIndex = op->outputIndexes[index];
@@ -874,8 +1073,45 @@ std::vector<VARP> Variable::mapToSequence(const std::map<std::string, VARP>& sou
     }
     return outputs;
 }
+#define SET_TYPE(TYPE, type) \
+if (tensor->getType() == halide_type_of<type##_t>()) {\
+blob->dataType = DataType_DT_##TYPE;
+
 void Variable::save(const std::vector<VARP>& vars, NetT* dest) {
     auto executeOrder = getExecuteOrder(vars);
+    // Search subgraphs
+    std::map<std::string, std::shared_ptr<Executor::SubGraph>> subgraphs;
+    auto exe = ExecutorScope::Current();
+    for (int index = 0; index < executeOrder.size(); ++index) {
+        auto expr = executeOrder[index];
+        auto op = expr->get();
+        if (nullptr == op || op->type() != OpType_While) {
+            continue;
+        }
+        if (op->main_type() != OpParameter_WhileParam) {
+            continue;
+        }
+        auto whileParam = op->main_as_WhileParam();
+        auto name = whileParam->body_graph()->str();
+        auto subgraph = exe->findSubGraph(name);
+        if (nullptr == subgraph) {
+#ifdef MNN_EXPRESS_ERROR_REPORT
+            MNN_ERROR("Variable::save: Invalid subgraph name: %s\n", name.c_str());
+#endif
+            continue;
+        }
+        MNN_ASSERT(subgraph->depends.size() == 0);
+        subgraphs.insert(std::make_pair(name, subgraph));
+    }
+    // Save Subgraphs
+    dest->subgraphs.clear();
+    for (auto& graphIter : subgraphs) {
+        // Copy Subgraph info
+        flatbuffers::FlatBufferBuilder builder;
+        builder.Finish(MNN::SubGraphProto::Pack(builder, graphIter.second->info.get()));
+        std::unique_ptr<MNN::SubGraphProtoT> subgraph(flatbuffers::GetRoot<MNN::SubGraphProto>(builder.GetBufferPointer())->UnPack());
+        dest->subgraphs.emplace_back(std::move(subgraph));
+    }
 
     // Get Expr - TensorOffset Map
     std::map<EXPRP, int> varIndexInfo;
@@ -927,6 +1163,10 @@ void Variable::save(const std::vector<VARP>& vars, NetT* dest) {
                     blob->dataType = DataType_DT_UINT8;
                     blob->uint8s.resize(info.size);
                     ::memcpy(blob->uint8s.data(), ptr, info.size * sizeof(uint8_t));
+                } else if (info.type.code == halide_type_bfloat && info.type.bits == 16) {
+                    blob->dataType = DataType_DT_BFLOAT16;
+                    blob->uint8s.resize(info.size * 2);
+                    ::memcpy(blob->uint8s.data(), ptr, info.size * sizeof(int16_t));
                 }
                 op->type       = OpType_Const;
                 if (expr->mType == VARP::TRAINABLE) {
@@ -944,7 +1184,9 @@ void Variable::save(const std::vector<VARP>& vars, NetT* dest) {
                 op->main.AsInput()->dformat = (MNN_DATA_FORMAT)Utils::convertFormat(info.order);
             }
         }
-        op->name = expr->name();
+        if (!expr->name().empty()) {
+            op->name = expr->name();
+        }
         op->inputIndexes.resize(expr->inputs().size());
         for (int i = 0; i < op->inputIndexes.size(); ++i) {
             if (expr->inputs()[i] == nullptr) {
@@ -965,6 +1207,7 @@ void Variable::save(const std::vector<VARP>& vars, NetT* dest) {
         }
         dest->oplists.emplace_back(std::move(op));
     }
+    bool staticModel = ExecutorScope::Current()->getLazyMode() == Executor::LAZY_CONTENT;
 
     // Fill Empty Tensor Name With Default Op Name
     for (int index = 0; index < executeOrder.size(); ++index) {
@@ -980,7 +1223,57 @@ void Variable::save(const std::vector<VARP>& vars, NetT* dest) {
                     dest->tensorName[subindex] = op->name + numberToString(v);
                 }
             }
+            auto tensor = expr->inside()->mOutputTensors[v];
+
+            if (staticModel || TensorUtils::getDescribe(tensor)->quantAttr) {
+                auto des = TensorUtils::getDescribe(tensor);
+                auto describe = std::unique_ptr<MNN::TensorDescribeT>(new MNN::TensorDescribeT);
+                describe->index = varIndexInfo[expr] + v;
+                describe->name = dest->tensorName[subindex];
+
+                auto tensorDes = TensorUtils::getDescribe(tensor);
+                if (nullptr != tensorDes->quantAttr) {
+                    describe->quantInfo.reset(new TensorQuantInfoT);
+                    describe->quantInfo->max = tensorDes->quantAttr->max;
+                    describe->quantInfo->min = tensorDes->quantAttr->min;
+                    describe->quantInfo->zero = tensorDes->quantAttr->zero;
+                    describe->quantInfo->scale = tensorDes->quantAttr->scale;
+                }
+                if (staticModel) {
+                    describe->blob = std::unique_ptr<MNN::BlobT>(new MNN::BlobT);
+                    auto& blob = describe->blob;
+                    blob->dataFormat = des->dimensionFormat;
+                    if (tensor->getType() == halide_type_of<float>()) {
+                    blob->dataType = DataType_DT_FLOAT;
+                    } else {
+                        SET_TYPE(INT8, int8)}
+                        SET_TYPE(UINT8, uint8)}
+                        SET_TYPE(INT32, int32)}
+                        SET_TYPE(INT64, int64)}
+                    }
+                    for (int d = 0; d < tensor->dimensions();d++) {
+                        describe->blob->dims.push_back(tensor->buffer().dim[d].extent);
+                    }
+                    for (auto& reg : des->regions) {
+                        auto regionT = std::unique_ptr<MNN::RegionT>(new MNN::RegionT);
+                        regionT->src = std::unique_ptr<MNN::ViewT>(new MNN::ViewT);
+                        regionT->dst = std::unique_ptr<MNN::ViewT>(new MNN::ViewT);
+                        regionT->src->offset = reg.src.offset;
+                        regionT->dst->offset = reg.dst.offset;
+                        for (int s = 0; s < 3; s++) {
+                            regionT->src->stride.push_back(reg.src.stride[s]);
+                            regionT->dst->stride.push_back(reg.dst.stride[s]);
+                            regionT->size.push_back(reg.size[s]);
+                        }
+                        describe->regions.emplace_back(std::move(regionT));
+                    }
+                }
+                dest->extraTensorDescribe.emplace_back(std::move(describe));
+            }
         }
+    }
+    if (staticModel) {
+        dest->usage = Usage_INFERENCE_STATIC;
     }
     // add version number
     dest->extraInfo.reset(new ExtraInfoT);

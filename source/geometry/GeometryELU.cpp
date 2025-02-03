@@ -13,8 +13,7 @@
 namespace MNN {
 
 static void initTensor(std::shared_ptr<Tensor> tensor, Tensor* input) {
-    tensor->buffer().type = input->getType();
-    TensorUtils::copyShape(input, tensor.get(), true);
+    TensorUtils::copyShape(input, tensor.get(), true, true);
 }
 
 class GeometryELU : public GeometryComputer {
@@ -30,18 +29,8 @@ public:
         std::shared_ptr<Tensor> expValue(new Tensor);
         {
             initTensor(expValue, input);
-            auto cmd = GeometryComputerUtils::makeUnary(UnaryOpOperation_EXP, input, expValue.get());
+            auto cmd = GeometryComputerUtils::makeUnary(UnaryOpOperation_EXPM1, input, expValue.get());
             res.extras.emplace_back(expValue);
-            res.command.emplace_back(std::move(cmd));
-        }
-        // sub
-        std::shared_ptr<Tensor> subValue(new Tensor);
-        {
-            auto oneConst = context.allocConst(op, {}, halide_type_of<float>());
-            oneConst->host<float>()[0] = 1.0;
-            initTensor(subValue, input);
-            auto cmd = GeometryComputerUtils::makeBinary(BinaryOpOperation_SUB, expValue.get(), oneConst.get(), subValue.get());
-            res.extras.emplace_back(subValue);
             res.command.emplace_back(std::move(cmd));
         }
         // mul
@@ -52,12 +41,11 @@ public:
             if (op->type() == OpType_ELU) {
                 alpha = op->main_as_ELU()->alpha();
             } else if (op->type() == OpType_Selu){
-                alpha = op->main_as_Selu()->alpha() *
-                        op->main_as_Selu()->scale();
+                alpha = op->main_as_Selu()->scale() * op->main_as_Selu()->alpha();
             }
             alphaConst->host<float>()[0] = alpha;
             initTensor(mulValue, input);
-            auto cmd = GeometryComputerUtils::makeBinary(BinaryOpOperation_MUL, subValue.get(), alphaConst.get(), mulValue.get());
+            auto cmd = GeometryComputerUtils::makeBinary(BinaryOpOperation_MUL, expValue.get(), alphaConst.get(), mulValue.get());
             res.extras.emplace_back(mulValue);
             res.command.emplace_back(std::move(cmd));
         }
@@ -67,23 +55,22 @@ public:
         {
             auto zeroConst = context.allocConst(op, {}, halide_type_of<float>());
             zeroConst->host<float>()[0] = 0;
-            compValue->buffer().type = halide_type_of<int>();
-            TensorUtils::copyShape(input, compValue.get(), true);
+            TensorUtils::copyShape(input, compValue.get(), true, true);
+            compValue->buffer().type = halide_type_of<int32_t>();
             auto cmd = GeometryComputerUtils::makeBinary(BinaryOpOperation_GREATER, input, zeroConst.get(), compValue.get());
             res.extras.emplace_back(compValue);
             res.command.emplace_back(std::move(cmd));
         }
-        std::shared_ptr<Tensor> scaleValue(new Tensor);
-        {
-            if (op->type() == OpType_Selu) {
-                auto scaleConst = context.allocConst(op, {}, halide_type_of<float>());
-                float scale = op->main_as_Selu()->scale();
-                scaleConst->host<float>()[0] = scale;
-                initTensor(scaleValue, input);
-                auto cmd = GeometryComputerUtils::makeBinary(BinaryOpOperation_MUL, input, scaleConst.get(), scaleValue.get());
-                res.extras.emplace_back(scaleValue);
-                res.command.emplace_back(std::move(cmd));
-            }
+        std::shared_ptr<Tensor> scaleValue;
+        if (op->type() == OpType_Selu) {
+            scaleValue.reset(new Tensor);
+            auto scaleConst = context.allocConst(op, {}, halide_type_of<float>());
+            float scale = op->main_as_Selu()->scale();
+            scaleConst->host<float>()[0] = scale;
+            initTensor(scaleValue, input);
+            auto cmd = GeometryComputerUtils::makeBinary(BinaryOpOperation_MUL, input, scaleConst.get(), scaleValue.get());
+            res.extras.emplace_back(scaleValue);
+            res.command.emplace_back(std::move(cmd));
         }
         // select
         {

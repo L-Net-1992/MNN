@@ -19,6 +19,10 @@
 #include "Arm82OptFunc.hpp"
 #include "MNN_generated.h"
 #include <arm_neon.h>
+
+extern "C" {
+    void MNNGeluFP16(FLOAT16* dst, const FLOAT16* src, size_t size, float* parameters);
+}
 namespace MNN {
 
 struct VecSquare {
@@ -110,8 +114,10 @@ struct _Exp {
     void operator()(void* outRaw, const void* inpRaw, int realSize) const {
         auto out = (float*)outRaw;
         auto inp = (const float*)inpRaw;
-        float offset[2] = {
+        float offset[4] = {
             1.0f,
+            0.0f,
+            0.0f,
             0.0f
         };
         MNNExp(out, inp, offset, realSize);
@@ -121,9 +127,11 @@ struct _ExpM1 {
     void operator()(void* outRaw, const void* inpRaw, int realSize) const {
         auto out = (float*)outRaw;
         auto inp = (const float*)inpRaw;
-        float offset[2] = {
+        float offset[4] = {
             1.0f,
-            -1.0f
+            -1.0f,
+            0.0f,
+            0.0f
         };
         MNNExp(out, inp, offset, realSize);
     }
@@ -143,6 +151,44 @@ struct _Sigmoid {
         MNNSigmoidLowp(out, inp, realSize);
     }
 };
+struct _SiLu {
+    void operator()(void* outRaw, const void* inpRaw, int realSize) const {
+        auto out = (float*)outRaw;
+        auto inp = (const float*)inpRaw;
+        MNNSiLuLowp(out, inp, realSize);
+    }
+};
+
+void FP16GELU(void* outRaw, const void* inpRaw, int realSize) {
+    int sizeQuad = realSize / 8;
+    int start = 0;
+    auto out = (FLOAT16*)outRaw;
+    auto inp = (const FLOAT16*)inpRaw;
+
+    if (sizeQuad > 0) {
+        constexpr float half_scale = 64.f;
+        float parameters[9] = {0.044715f, 0.79788458f, 135135.f/half_scale, 17325.f/half_scale, 378.f/half_scale, 62370.f/half_scale, 3150.f/half_scale, 28.f/half_scale, 1.f/half_scale};
+        MNNGeluFP16(out, inp, sizeQuad, parameters);
+        start = sizeQuad * 8;
+    }
+    auto tanhf_poly = [](float value) -> float {
+        if (value > 5.0f) {
+            return 1.0f;
+        } else if (value <= -5.0f) {
+            return -1.0f;
+        } else {
+            float x2 = value * value;
+            float a  = value * (135135.0f + x2 * (17325.0f + x2 * (378.0f + x2)));
+            float b  = 135135.0f + x2 * (62370.0f + x2 * (3150.0f + x2 * 28.0f));
+            return a / b;
+        }
+    };
+    for (int i = start; i < realSize; i++) {
+        float temp = 0.044715f * inp[i] * inp[i] * inp[i];
+        temp = 0.79788458f * (temp + inp[i]);
+        out[i] = static_cast<FLOAT16>(1.0f + tanhf_poly(temp)) * inp[i] * 0.5f;
+    }
+}
 
 void FP16HardSwish(void* outRaw, const void* inpRaw, int realSize) {
     auto out = (FLOAT16*)outRaw;
@@ -206,6 +252,8 @@ MNNUnaryExecute Arm82Unary::select(int type, int precision) {
             return _Wrap<_Unary<UnarySin<float>, float>>;
         case UnaryOpOperation_SIGMOID:
             return _Wrap<_Sigmoid>;
+        case UnaryOpOperation_SILU:
+            return _Wrap<_SiLu>;
         case UnaryOpOperation_TANH:
             return _Wrap<_Tanh>;
         case UnaryOpOperation_TAN:
@@ -259,8 +307,11 @@ MNNUnaryExecute Arm82Unary::select(int type, int precision) {
             return _Wrap<_Unary<UnaryAcos<float>, float>>;
         case UnaryOpOperation_HARDSWISH:
             return FP16HardSwish;
+        case UnaryOpOperation_GELU:
+        case UnaryOpOperation_GELU_STANDARD:
+            return FP16GELU;
         default:
-            MNN_ASSERT(false);
+            MNN_ERROR("Don't support %d for arm82 unary\n", type);
             break;
     }
     return nullptr;

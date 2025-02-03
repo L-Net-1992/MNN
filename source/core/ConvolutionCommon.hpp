@@ -19,11 +19,16 @@ public:
         AutoStorage<float> alpha;
         AutoStorage<float> weightFloat;
         const IDSTQuan* quan;
+        bool asymmetric;
+        std::vector<int8_t> weightMap;
+        bool canUseInt4 = false;
+        Backend* backend = nullptr;
+        int originBits = 8;
     };
-    static std::shared_ptr<Int8Common> load(const IDSTQuan* quan, bool forceFloat = false, bool forceInt8 = false);
-    static void getConvParameters(std::shared_ptr<ConvolutionCommon::Int8Common> *quanCommon, const MNN::Convolution2D *conv2d, const float** originWeight, int* originWeightSize);
-    static bool getConvInt8Parameters(const MNN::Convolution2D* conv2d, std::shared_ptr<Int8Common>& quanCommon,
-                                      const int8_t*& weight, int& weightSize, float*& scale, int32_t*& bias, float inputScale, float outputScale, int inputZeroPoint, int outputZeroPoint);
+    static std::shared_ptr<Int8Common> load(const Op* op, Backend* backend = nullptr, bool forceFloat = false, bool forceInt8 = false);
+    static void getConvParameters(std::shared_ptr<ConvolutionCommon::Int8Common> *quanCommon, Backend* backend, const MNN::Op *op, const float** originWeight, int* originWeightSize);
+    static bool getConvInt8Parameters(const MNN::Op* op, std::shared_ptr<Int8Common>& quanCommon, Backend* backend,
+                                      const int8_t*& weight, int& weightSize, float*& scale, int32_t*& bias, int32_t*& weightQuantZero);
 
     // Return padX, padY
     static std::pair<int, int> convolutionPad(const Tensor* input, const Tensor* output,
@@ -52,6 +57,8 @@ public:
         int32_t srcYStep;
         int32_t packCUnit;
         int32_t destICStride;
+        int32_t ic; // ic packed by LP, used by im2col dst data.
+        int32_t icup4; // ic packed by LP, used by im2col src data.
     };
 };
 } // namespace MNN

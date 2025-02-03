@@ -7,7 +7,8 @@
 //
 
 #include "backend/opencl/core/runtime/OpenCLWrapper.hpp"
-#ifdef WIN32
+#ifdef _WIN32
+#include <windows.h>
 #include <libloaderapi.h>
 #else
 #include <dlfcn.h>
@@ -20,60 +21,68 @@
 #ifdef MNN_USE_LIB_WRAPPER
 
 namespace MNN {
-static const std::vector<std::string> gOpencl_library_paths = {
-
-#if defined(__APPLE__) || defined(__MACOSX)
-    "libOpenCL.so", "/System/Library/Frameworks/OpenCL.framework/OpenCL"
-#elif defined(__ANDROID__)
-    "libOpenCL.so",
-    "libGLES_mali.so",
-    "libmali.so",
-#if defined(__aarch64__)
-    // Qualcomm Adreno
-    "/system/vendor/lib64/libOpenCL.so",
-    "/system/lib64/libOpenCL.so",
-    // Mali
-    "/system/vendor/lib64/egl/libGLES_mali.so",
-    "/system/lib64/egl/libGLES_mali.so",
-#else
-    // Qualcomm Adreno
-    "/system/vendor/lib/libOpenCL.so", "/system/lib/libOpenCL.so",
-    // Mali
-    "/system/vendor/lib/egl/libGLES_mali.so", "/system/lib/egl/libGLES_mali.so",
-    // other
-    "/system/vendor/lib/libPVROCL.so", "/data/data/org.pocl.libs/files/lib/libpocl.so"
-#endif
-#elif defined(__linux__)
-    "/usr/lib/libOpenCL.so",
-    "/usr/local/lib/libOpenCL.so",
-    "/usr/local/lib/libpocl.so",
-    "/usr/lib64/libOpenCL.so",
-    "/usr/lib32/libOpenCL.so",
-    "libOpenCL.so"
-/*
- *  0: System32, 1: SysWOW64
- *  --------------------------------------
- *  | Real CPU /          |  x64  |  x86  |
- *  |        / Target CPU |       |       |
- *  --------------------------------------
- *  |         x64         | 0 / 1 |   1   |
- *  --------------------------------------
- *  |         x86         | Error |   0   |
- *  --------------------------------------
- *  0 / 1: 0 if OpenCL.dll (System32, 64bit on x64), otherwise 1 (SysWOW64, 32bit compatible on 64bit OS)
- */
-#elif defined(_WIN64)
-    "C:/Windows/System32/OpenCL.dll",
-    "C:/Windows/SysWOW64/OpenCL.dll"
-#elif defined(_WIN32)
-    "C:/Windows/SysWOW64/OpenCL.dll",
-    "C:/Windows/System32/OpenCL.dll"
-#endif
-};
 bool OpenCLSymbols::LoadOpenCLLibrary() {
     if (handle_ != nullptr) {
         return true;
     }
+    static const std::vector<std::string> gOpencl_library_paths = {
+
+    #if defined(__APPLE__) || defined(__MACOSX)
+        "libOpenCL.so", "/System/Library/Frameworks/OpenCL.framework/OpenCL"
+    #elif defined(__OHOS__)
+        "/vendor/lib64/chipsetsdk/libhvgr_v200.so",
+        "/vendor/lib64/chipsetsdk/libGLES_mali.so",
+        "/system/lib64/libGLES_mali.so",
+        "libGLES_mali.so",
+        "/vendor/lib64/chipsetsdk/libEGI_imp1.so",
+    #elif defined(__ANDROID__)
+        "libOpenCL.so",
+        "libGLES_mali.so",
+        "libmali.so",
+        "libOpenCL-pixel.so",
+    #if defined(__aarch64__)
+        // Qualcomm Adreno
+        "/system/vendor/lib64/libOpenCL.so",
+        "/system/lib64/libOpenCL.so",
+        // Mali
+        "/system/vendor/lib64/egl/libGLES_mali.so",
+        "/system/lib64/egl/libGLES_mali.so",
+    #else
+        // Qualcomm Adreno
+        "/system/vendor/lib/libOpenCL.so", "/system/lib/libOpenCL.so",
+        // Mali
+        "/system/vendor/lib/egl/libGLES_mali.so", "/system/lib/egl/libGLES_mali.so",
+        // other
+        "/system/vendor/lib/libPVROCL.so", "/data/data/org.pocl.libs/files/lib/libpocl.so"
+    #endif
+    #elif defined(__linux__)
+        "/usr/lib/libOpenCL.so",
+        "/usr/local/lib/libOpenCL.so",
+        "/usr/local/lib/libpocl.so",
+        "/usr/lib64/libOpenCL.so",
+        "/usr/lib32/libOpenCL.so",
+        "libOpenCL.so"
+    /*
+     *  0: System32, 1: SysWOW64
+     *  --------------------------------------
+     *  | Real CPU /          |  x64  |  x86  |
+     *  |        / Target CPU |       |       |
+     *  --------------------------------------
+     *  |         x64         | 0 / 1 |   1   |
+     *  --------------------------------------
+     *  |         x86         | Error |   0   |
+     *  --------------------------------------
+     *  0 / 1: 0 if OpenCL.dll (System32, 64bit on x64), otherwise 1 (SysWOW64, 32bit compatible on 64bit OS)
+     */
+    #elif defined(_WIN64)
+        "C:/Windows/System32/OpenCL.dll",
+        "C:/Windows/SysWOW64/OpenCL.dll"
+    #elif defined(_WIN32)
+        "C:/Windows/SysWOW64/OpenCL.dll",
+        "C:/Windows/System32/OpenCL.dll"
+    #endif
+    };
+
     for (const auto &opencl_lib : gOpencl_library_paths) {
         if (LoadLibraryFromPath(opencl_lib)) {
             return true;
@@ -84,7 +93,7 @@ bool OpenCLSymbols::LoadOpenCLLibrary() {
 
 bool OpenCLSymbols::UnLoadOpenCLLibrary() {
     if (handle_ != nullptr) {
-#if defined(WIN32)
+#if defined(_WIN32)
         if (FreeLibrary(handle_) == 0) {
 #else
         if (dlclose(handle_) != 0) {
@@ -104,9 +113,34 @@ bool OpenCLSymbols::isError() {
 bool OpenCLSymbols::isSvmError() {
     return mSvmError;
 }
+
+bool OpenCLSymbols::isPropError() {
+    return mPropError;
+}
+
+bool OpenCLSymbols::isQcomError() {
+    return mQcomError;
+}
     
+bool OpenCLSymbols::getFuncAddress(cl_platform_id platform, const char *func_name){
+    if(clGetExtensionFunctionAddressForPlatform != nullptr){
+        clImportMemoryARM = reinterpret_cast<clImportMemoryARMFunc>(clGetExtensionFunctionAddressForPlatform(platform, "clImportMemoryARM"));
+        if(clImportMemoryARM == nullptr){
+            return false;
+        }
+    }else if(clGetExtensionFunctionAddress != nullptr){
+        clImportMemoryARM = reinterpret_cast<clImportMemoryARMFunc>(clGetExtensionFunctionAddress("clImportMemoryARM"));
+        if(clImportMemoryARM == nullptr){
+            return false;
+        }
+    } else{
+        return false;
+    }
+    return true;
+}
+
 bool OpenCLSymbols::LoadLibraryFromPath(const std::string &library_path) {
-#if defined(WIN32)
+#if defined(_WIN32)
     handle_ = LoadLibraryA(library_path.c_str());
     if (handle_ == nullptr) {
         return false;
@@ -115,25 +149,71 @@ bool OpenCLSymbols::LoadLibraryFromPath(const std::string &library_path) {
     if(func_name == nullptr){ \
         mIsError = true; \
     }
-    
+
 #define MNN_LOAD_SVM_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(GetProcAddress(handle_, #func_name)); \
     if(func_name == nullptr){ \
         mSvmError = true; \
     }
-    
+
+#define MNN_LOAD_PROP_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(GetProcAddress(handle_, #func_name)); \
+    if(func_name == nullptr){ \
+        mPropError = true; \
+    }
+
+#define MNN_LOAD_QCOM_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(GetProcAddress(handle_, #func_name)); \
+    if(func_name == nullptr){ \
+        mQcomError = true; \
+    }
+
+#define MNN_LOAD_GL_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(GetProcAddress(handle_, #func_name)); \
+    if(func_name == nullptr){ \
+        mGlError = true; \
+    }
+
 #else
     handle_ = dlopen(library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle_ == nullptr) {
         return false;
     }
+
+    typedef void* (*loadOpenCLPointerFunc)(const char* name);
+    typedef void (*enableOpenCLFunc)();
+    loadOpenCLPointerFunc loadOpenCLPointer = nullptr;
+    enableOpenCLFunc enableOpenCL = reinterpret_cast<enableOpenCLFunc>(dlsym(handle_, "enableOpenCL"));
+    if(enableOpenCL != nullptr){
+        enableOpenCL();
+        loadOpenCLPointer = reinterpret_cast<loadOpenCLPointerFunc>(dlsym(handle_, "loadOpenCLPointer"));
+    }
 #define MNN_LOAD_FUNCTION_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(dlsym(handle_, #func_name)); \
+    if(func_name == nullptr && loadOpenCLPointer != nullptr){ \
+        func_name = reinterpret_cast<func_name##Func>(loadOpenCLPointer(#func_name)); \
+    } \
     if(func_name == nullptr){ \
         mIsError = true; \
     }
-    
+
 #define MNN_LOAD_SVM_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(dlsym(handle_, #func_name)); \
+    if(func_name == nullptr && loadOpenCLPointer != nullptr){ \
+        func_name = reinterpret_cast<func_name##Func>(loadOpenCLPointer(#func_name)); \
+    } \
     if(func_name == nullptr){ \
         mSvmError = true; \
+    }
+
+#define MNN_LOAD_PROP_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(dlsym(handle_, #func_name)); \
+    if(func_name == nullptr && loadOpenCLPointer != nullptr){ \
+        func_name = reinterpret_cast<func_name##Func>(loadOpenCLPointer(#func_name)); \
+    } \
+    if(func_name == nullptr){ \
+        mPropError = true; \
+    }
+
+#define MNN_LOAD_QCOM_PTR(func_name) func_name = reinterpret_cast<func_name##Func>(dlsym(handle_, #func_name)); \
+    if(func_name == nullptr && loadOpenCLPointer != nullptr){ \
+        func_name = reinterpret_cast<func_name##Func>(loadOpenCLPointer(#func_name)); \
+    } \
+    if(func_name == nullptr){ \
+        mQcomError = true; \
     }
     
 #endif
@@ -164,6 +244,7 @@ bool OpenCLSymbols::LoadLibraryFromPath(const std::string &library_path) {
     MNN_LOAD_FUNCTION_PTR(clGetProgramBuildInfo);
     MNN_LOAD_FUNCTION_PTR(clEnqueueReadBuffer);
     MNN_LOAD_FUNCTION_PTR(clEnqueueWriteBuffer);
+    MNN_LOAD_FUNCTION_PTR(clEnqueueCopyBuffer);
     MNN_LOAD_FUNCTION_PTR(clWaitForEvents);
     MNN_LOAD_FUNCTION_PTR(clReleaseEvent);
     MNN_LOAD_FUNCTION_PTR(clCreateContext);
@@ -184,23 +265,30 @@ bool OpenCLSymbols::LoadLibraryFromPath(const std::string &library_path) {
     MNN_LOAD_FUNCTION_PTR(clEnqueueCopyImage);
     MNN_LOAD_FUNCTION_PTR(clEnqueueReadImage);
     MNN_LOAD_FUNCTION_PTR(clEnqueueWriteImage);
-    
-#if 1//CL_TARGET_OPENCL_VERSION >= 200
-    //MNN_LOAD_FUNCTION_PTR(clCreateCommandQueueWithProperties);
+    MNN_LOAD_FUNCTION_PTR(clGetExtensionFunctionAddress);
+    MNN_LOAD_FUNCTION_PTR(clGetExtensionFunctionAddressForPlatform);
+
+    MNN_LOAD_PROP_PTR(clCreateCommandQueueWithProperties);
     MNN_LOAD_SVM_PTR(clSVMAlloc);
     MNN_LOAD_SVM_PTR(clSVMFree);
     MNN_LOAD_SVM_PTR(clEnqueueSVMMap);
     MNN_LOAD_SVM_PTR(clEnqueueSVMUnmap);
     MNN_LOAD_SVM_PTR(clSetKernelArgSVMPointer);
-#endif
+
+    MNN_LOAD_QCOM_PTR(clNewRecordingQCOM);
+    MNN_LOAD_QCOM_PTR(clEndRecordingQCOM);
+    MNN_LOAD_QCOM_PTR(clReleaseRecordingQCOM);
+    MNN_LOAD_QCOM_PTR(clRetainRecordingQCOM);
+    MNN_LOAD_QCOM_PTR(clEnqueueRecordingQCOM);
+    MNN_LOAD_QCOM_PTR(clEnqueueRecordingSVMQCOM);
 #undef MNN_LOAD_FUNCTION_PTR
 
     return true;
 }
 
-static OpenCLSymbolsOperator* gInstance = nullptr;
-static std::once_flag sFlagInitSymbols;
 OpenCLSymbolsOperator* OpenCLSymbolsOperator::createOpenCLSymbolsOperatorSingleInstance() {
+    static std::once_flag sFlagInitSymbols;
+    static OpenCLSymbolsOperator* gInstance = nullptr;
     std::call_once(sFlagInitSymbols, [&]() {
         gInstance = new OpenCLSymbolsOperator;
     });
@@ -425,6 +513,21 @@ cl_int CL_API_CALL clEnqueueReadBuffer(cl_command_queue command_queue, cl_mem bu
                 event);
 }
 
+cl_int CL_API_CALL
+clEnqueueCopyBuffer(cl_command_queue    command_queue,
+                    cl_mem              src_buffer,
+                    cl_mem              dst_buffer,
+                    size_t              src_offset,
+                    size_t              dst_offset,
+                    size_t              size,
+                    cl_uint             num_events_in_wait_list,
+                    const cl_event *    event_wait_list,
+                    cl_event *          event) {
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEnqueueCopyBuffer;
+    MNN_CHECK_NOTNULL(func);
+    return func(command_queue, src_buffer, dst_buffer, src_offset, dst_offset, size, num_events_in_wait_list, event_wait_list, event);
+}
+
 cl_int CL_API_CALL clEnqueueWriteBuffer(cl_command_queue command_queue, cl_mem buffer, cl_bool blocking_write, size_t offset,
                             size_t size, const void *ptr, cl_uint num_events_in_wait_list,
                             const cl_event *event_wait_list, cl_event *event) {
@@ -570,13 +673,12 @@ cl_int CL_API_CALL clEnqueueCopyImage(cl_command_queue queue,
     return func(queue, src_image, dst_image, src_origin, dst_origin, region, num_events_in_wait_list, event_wait_list, event);
 }
 
-#if 1//CL_TARGET_OPENCL_VERSION >= 200
 // clCreateCommandQueueWithProperties wrapper
-//cl_command_queue CL_API_CALL clCreateCommandQueueWithProperties(cl_context context, cl_device_id device, const cl_queue_properties *properties, cl_int *errcode_ret) {
-//    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clCreateCommandQueueWithProperties;
-//    MNN_CHECK_NOTNULL(func);
-//    return func(context, device, properties, errcode_ret);
-//}
+cl_command_queue CL_API_CALL clCreateCommandQueueWithProperties(cl_context context, cl_device_id device, const cl_queue_properties *properties, cl_int *errcode_ret) {
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clCreateCommandQueueWithProperties;
+    MNN_CHECK_NOTNULL(func);
+    return func(context, device, properties, errcode_ret);
+}
 
 // clSVMAlloc wrapper, use OpenCLWrapper function.
 void* CL_API_CALL clSVMAlloc(cl_context context, cl_mem_flags flags, size_t size, cl_uint align) {
@@ -614,6 +716,64 @@ cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel, cl_uint index, con
     MNN_CHECK_NOTNULL(func);
     return func(kernel, index, host_ptr);
 }
-#endif
+
+cl_recording_qcom CL_API_CALL clNewRecordingQCOM(cl_command_queue command_queue, cl_int *errcode_ret){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clNewRecordingQCOM;
+    MNN_CHECK_NOTNULL(func);
+    return func(command_queue, errcode_ret);
+}
+cl_int CL_API_CALL clEndRecordingQCOM(cl_recording_qcom recording){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEndRecordingQCOM;
+    MNN_CHECK_NOTNULL(func);
+    return func(recording);
+}
+cl_int CL_API_CALL clReleaseRecordingQCOM(cl_recording_qcom recording){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clReleaseRecordingQCOM;
+    MNN_CHECK_NOTNULL(func);
+    return func(recording);
+}
+cl_int CL_API_CALL clRetainRecordingQCOM(cl_recording_qcom recording){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clRetainRecordingQCOM;
+    MNN_CHECK_NOTNULL(func);
+    return func(recording);
+}
+
+cl_int CL_API_CALL clEnqueueRecordingQCOM(cl_command_queue command_queue, cl_recording_qcom recording, size_t num_args,
+                       const cl_array_arg_qcom *arg_array, size_t num_global_offsets, const cl_offset_qcom *global_offset_array,
+                       size_t num_global_workgroups, const cl_workgroup_qcom *global_workgroup_array, size_t num_local_workgroups,
+                       const cl_workgroup_qcom * local_workgroups_array, cl_uint num_events_in_wait_list, const cl_event *event_wait_list, cl_event *event){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEnqueueRecordingQCOM;
+    MNN_CHECK_NOTNULL(func);
+    return func(command_queue, recording, num_args, arg_array, num_global_offsets, global_offset_array, num_global_workgroups, global_workgroup_array, num_local_workgroups, local_workgroups_array, num_events_in_wait_list, event_wait_list, event);
+}
+
+cl_int CL_API_CALL
+clEnqueueRecordingSVMQCOM(cl_command_queue command_queue, cl_recording_qcom recording, size_t num_args, const cl_array_arg_qcom *arg_array, size_t num_svm_args,
+                          const cl_array_arg_qcom *arg_svm_array, size_t num_global_offsets, const cl_offset_qcom *global_offset_array, size_t num_global_workgroups,
+                          const cl_workgroup_qcom *global_workgroup_array, size_t num_local_workgroups, const cl_workgroup_qcom *local_workgroups_array,
+                          size_t num_non_arg_objs, const cl_array_kernel_exec_info_qcom *non_arg_obj_array, cl_uint num_events_in_wait_list,
+                          const cl_event *event_wait_list, cl_event *event){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clEnqueueRecordingSVMQCOM;
+    MNN_CHECK_NOTNULL(func);
+    return func(command_queue, recording, num_args, arg_array, num_svm_args, arg_svm_array, num_global_offsets, global_offset_array, num_global_workgroups, global_workgroup_array, num_local_workgroups, local_workgroups_array, num_non_arg_objs, non_arg_obj_array, num_events_in_wait_list, event_wait_list, event);
+}
+
+void * CL_API_CALL clGetExtensionFunctionAddress(const char *func_name){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clGetExtensionFunctionAddress;
+    MNN_CHECK_NOTNULL(func);
+    return func(func_name);
+}
+
+void * CL_API_CALL clGetExtensionFunctionAddressForPlatform(cl_platform_id platform, const char *func_name){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clGetExtensionFunctionAddressForPlatform;
+    MNN_CHECK_NOTNULL(func);
+    return func(platform, func_name);
+}
+
+cl_mem CL_API_CALL clImportMemoryARM(cl_context context, cl_mem_flags flags, const cl_import_properties_arm *properties, void *memory, size_t size, cl_int *errcode_ret){
+    auto func = MNN::OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clImportMemoryARM;
+    MNN_CHECK_NOTNULL(func);
+    return func(context, flags, properties, memory, size, errcode_ret);
+}
 
 #endif //MNN_USE_LIB_WRAPPER

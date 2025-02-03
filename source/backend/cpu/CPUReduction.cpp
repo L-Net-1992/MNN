@@ -126,6 +126,7 @@ public:
 protected:
     virtual void onReduce(const float* src, float* dst, int inside, int outside, int axisSize) const override {
         auto numberThread = ((CPUBackend*)backend())->threadNumber();
+        auto core = static_cast<CPUBackend*>(backend())->functions();
         MNN_CONCURRENCY_BEGIN(tId, numberThread) {
             for (int oi = tId; oi < outside; oi+=numberThread) {
                 auto srcOutSide = src + oi * axisSize * inside;
@@ -141,8 +142,12 @@ protected:
                         auto srcInside = srcOutSide + ii;
                         auto dstInside = dstOutSide + ii;
                         float summer   = 0.0f;
-                        for (int a = 0; a < axisSize; ++a) {
-                            summer += srcInside[a * inside];
+                        if (inside == 1) {
+                            core->MNNAccumulateSequenceNumber(&summer, srcInside, axisSize);
+                        } else {
+                            for (int a = 0; a < axisSize; ++a) {
+                                summer += srcInside[a * inside];
+                            }
                         }
                         *dstInside = summer;
                     }
@@ -244,7 +249,7 @@ protected:
                 auto srcInside = srcOutSide + ii;
                 auto dstInside = dstOutSide + ii;
                 float Max      = srcInside[0];
-                if (1 == inside) {
+                if (1 == inside && axisSize > UNIT * 2) {
                     int32_t inputCountUnit = axisSize / (UNIT * 2);
                     int32_t remain         = axisSize - (inputCountUnit * UNIT * 2);
                     float maxArray[UNIT]   = UNIT_DUP(Max);

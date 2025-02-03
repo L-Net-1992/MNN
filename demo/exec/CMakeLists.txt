@@ -7,6 +7,8 @@ add_executable(pictureRecognition_module.out ${CMAKE_CURRENT_LIST_DIR}/pictureRe
 list(APPEND MNN_EXEC_DEMOS pictureRecognition_module.out)
 add_executable(multithread_imgrecog.out ${CMAKE_CURRENT_LIST_DIR}/multithread_imgrecog.cpp)
 list(APPEND MNN_EXEC_DEMOS multithread_imgrecog.out)
+add_executable(pictureRecognition_batch.out ${CMAKE_CURRENT_LIST_DIR}/pictureRecognition_batch.cpp)
+list(APPEND MNN_EXEC_DEMOS pictureRecognition_batch.out)
 
 add_executable(pictureRotate.out ${CMAKE_CURRENT_LIST_DIR}/pictureRotate.cpp)
 list(APPEND MNN_EXEC_DEMOS pictureRotate.out)
@@ -25,9 +27,6 @@ list(APPEND MNN_EXEC_DEMOS expressMakeModel.out)
 
 add_executable(transformerDemo.out ${CMAKE_CURRENT_LIST_DIR}/transformerDemo.cpp)
 list(APPEND MNN_EXEC_DEMOS transformerDemo.out)
-
-add_executable(rasterDemo.out ${CMAKE_CURRENT_LIST_DIR}/rasterDemo.cpp)
-list(APPEND MNN_EXEC_DEMOS rasterDemo.out)
 
 add_executable(nluDemo.out ${CMAKE_CURRENT_LIST_DIR}/nluDemo.cpp)
 list(APPEND MNN_EXEC_DEMOS nluDemo.out)

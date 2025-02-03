@@ -7,13 +7,13 @@ import _mnncengine._nn as _nn
 def load_module_from_file(file_name, input_names, output_names, **kwargs):
     runtime_manager = kwargs.get('runtime_manager', None)
     dynamic = kwargs.get('dynamic', False)
-    shape_mutable = kwargs.get('shape_mutable', False)
+    shape_mutable = kwargs.get('shape_mutable', True)
     rearrange = kwargs.get('rearrange', False)
     backend = kwargs.get('backend', _F.Backend.CPU)
     memory_mode = kwargs.get('memory_mode', _F.MemoryMode.Normal)
     power_mode = kwargs.get('power_mode', _F.PowerMode.Normal)
     precision_mode = kwargs.get('precision_mode', _F.PrecisionMode.Normal)
-    thread_num = kwargs.get('thread_num', 4)
+    thread_num = kwargs.get('thread_num', 1)
 
     module = _nn.load_module_from_file(runtime_manager, input_names, output_names, file_name, dynamic, shape_mutable, rearrange,
                                        backend, memory_mode, power_mode, precision_mode, thread_num)
@@ -52,3 +52,11 @@ class Module(_nn._Module):
             else:
                 self._vars[name] = value
                 self._add_parameter(value)
+
+
+class EmptyModule(_nn._Module):
+    def __init(self):
+        super(EmptyModule, self).__init__()
+    def forward(self):
+        return None
+dummy = EmptyModule()

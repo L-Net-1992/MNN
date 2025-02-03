@@ -153,12 +153,14 @@ class OnnxInstanceNormalTransform : public OnnxExtraManager::Transform {
             }
         }
         bool needScale = true;
+        bool scaleConst = false;
         do {
             auto biasPtr = inputs[2]->readMap<float>();
             auto scalePtr = inputs[1]->readMap<float>();
             if (nullptr == biasPtr || nullptr == scalePtr) {
                 break;
             }
+            scaleConst = true;
             auto oneVar = _Scalar<float>(1.0f);
             auto scaleOff = inputs[1] - oneVar;
             auto scaleSum = _ReduceSum(scaleOff * scaleOff);
@@ -181,21 +183,28 @@ class OnnxInstanceNormalTransform : public OnnxExtraManager::Transform {
         layerNormOp->main.type = OpParameter_LayerNorm;
         {
             auto param = layerNormOp->main.AsLayerNorm();
-            param->axis = {2}; // Layernorm only need axis's size as 1
+            param->axis = {-1}; // Layernorm only need axis's size as 1
             param->epsilon = epsilon;
-//                param->beta.resize(inputs[2]->getInfo()->size);
-//                ::memcpy(param->beta.data(), biasPtr, param->beta.size() * sizeof(float));
-//                param->gamma.resize(inputs[1]->getInfo()->size);
-//                ::memcpy(param->gamma.data(), scalePtr, param->beta.size() * sizeof(float));
             param->group = 1;
         }
         auto res = Variable::create(Expr::create(layerNormOp.get(), {inputDim3}));
         res = _ReshapeF(res, originShape, MNN_DATA_FORMAT_NCHW);
         if (needScale) {
-            auto compatShape = _Concat({_Shape(inputs[1], true), _Fill(_Unsqueeze(_Size(_Shape(input, true)) - _Scalar<int>(2), {0}), _Scalar<int>(1))}, 0);
-            auto scale      = _OnnxReshape(inputs[1], compatShape);
-            auto bias       = _OnnxReshape(inputs[2], compatShape);
-            res = res * scale + bias;
+            if (scaleConst) {
+                auto biasPtr = inputs[2]->readMap<float>();
+                auto scalePtr = inputs[1]->readMap<float>();
+                int channels = inputs[1]->getInfo()->size;
+                std::vector<float> scales(channels);
+                std::vector<float> bias(channels);
+                ::memcpy(bias.data(), biasPtr, channels * sizeof(float));
+                ::memcpy(scales.data(), scalePtr, channels * sizeof(float));
+                res = _Scale(res, channels, std::move(scales), std::move(bias));
+            } else {
+                auto compatShape = _Concat({_Shape(inputs[1], true), _Fill(_Unsqueeze(_Size(_Shape(input, true)) - _Scalar<int>(2), {0}), _Scalar<int>(1))}, 0);
+                auto scale      = _OnnxReshape(inputs[1], compatShape);
+                auto bias       = _OnnxReshape(inputs[2], compatShape);
+                res = res * scale + bias;
+            }
         }
         res->setName(expr->name());
         return res->expr().first;
@@ -256,6 +265,95 @@ class OnnxLpNormTransform : public OnnxExtraManager::Transform {
     }
 };
 
+class OnnxLayerNormTransform : public OnnxExtraManager::Transform {
+    virtual EXPRP onExecute(EXPRP expr) const override {
+        auto inputs = expr->inputs();
+        auto input = expr->inputs()[0];
+        int axis = -1;
+        float eps = 1e-05;
+        auto attrs = expr->get()->main_as_Extra()->attr();
+        if (attrs != nullptr) {
+            for (const auto& attr : *attrs) {
+                auto attrName = attr->key()->str();
+                if (attrName == "axis") {
+                    axis = attr->i();
+                }
+                if (attrName == "epsilon") {
+                    eps = attr->f();
+                }
+            }
+        }
+        if (expr->outputSize() > 1) {
+            auto axisVar = _Scalar<int>(axis);
+            // Add negative protect, may decrease performance
+            auto rankVar = _Rank(inputs[0]);
+            axisVar = _Mod(axisVar + rankVar, rankVar);
+            auto reduceAxis = _Range(axisVar, rankVar, _Scalar<int>(1));
+            auto mean = _ReduceMeanMutable(input, reduceAxis, true);
+            auto sub = input - mean;
+            auto normal = _Rsqrt(_ReduceMeanMutable(_Square(sub), reduceAxis, true) + _Scalar<float>(eps));
+            auto y = sub * normal * inputs[1];
+            if (inputs.size() > 2) {
+                y = y + inputs[2];
+            }
+            std::vector<VARP> identityOutputs = {y};
+            if (expr->outputSize() > 1) {
+                identityOutputs.emplace_back(mean);
+            }
+            if (expr->outputSize() > 2) {
+                identityOutputs.emplace_back(normal);
+            }
+            std::unique_ptr<OpT> copyOp(new OpT);
+            copyOp->type = OpType_Identity;
+            auto resultExpr = Expr::create(copyOp.get(), identityOutputs, identityOutputs.size());
+            resultExpr->setName(expr->name());
+            for (int i=0; i<expr->outputSize(); ++i) {
+                auto var = MNN::Express::Variable::create(resultExpr, i);
+                var->setName(expr->outputName(i));
+            }
+            return resultExpr;
+        }
+        std::shared_ptr<MNN::OpT> layernorm(new MNN::OpT);
+        layernorm->type = OpType_LayerNorm;
+        layernorm->main.value = new LayerNormT;
+        layernorm->main.type = OpParameter_LayerNorm;
+        auto param = layernorm->main.AsLayerNorm();
+        param->axis = {axis};
+        param->epsilon = eps;
+        const float* scalePtr = nullptr;
+        const float* biasPtr = nullptr;
+        if (inputs.size() > 1) {
+            scalePtr = inputs[1]->readMap<float>();
+        }
+        if (nullptr != scalePtr) {
+            param->gamma.resize(inputs[1]->getInfo()->size);
+            ::memcpy(param->gamma.data(), scalePtr, param->gamma.size() * sizeof(float));
+            param->beta.resize(inputs[1]->getInfo()->size);
+            ::memset(param->beta.data(), 0, param->gamma.size() * sizeof(float));
+        }
+        if (inputs.size() > 2 && nullptr != scalePtr) {
+            biasPtr = inputs[2]->readMap<float>();
+        }
+        if (nullptr != biasPtr) {
+            ::memcpy(param->beta.data(), biasPtr, param->gamma.size() * sizeof(float));
+        }
+        auto layerexpr = Expr::create(layernorm.get(), {input});
+        auto output = Variable::create(layerexpr);
+        if (scalePtr == nullptr) {
+            if (inputs.size() > 1) {
+                output = output * inputs[1];
+            }
+        }
+        if (biasPtr == nullptr) {
+            if (inputs.size() > 2) {
+                output = output + inputs[2];
+            }
+        }
+        output->setName(expr->name());
+        return output->expr().first;
+    }
+};
+
 static auto gRegister = []() {
     OnnxExtraManager::get()->insert("BatchNormalization",
                                     std::shared_ptr<OnnxExtraManager::Transform>(new OnnxBatchNormTransform));
@@ -265,6 +363,8 @@ static auto gRegister = []() {
                                     std::shared_ptr<OnnxExtraManager::Transform>(new OnnxMeanVarianceNormTransform));
     OnnxExtraManager::get()->insert("LpNormalization",
                                     std::shared_ptr<OnnxExtraManager::Transform>(new OnnxLpNormTransform));
+    OnnxExtraManager::get()->insert("LayerNormalization",
+                                    std::shared_ptr<OnnxExtraManager::Transform>(new OnnxLayerNormTransform));
     return true;
 }();
 

@@ -18,8 +18,7 @@
 namespace MNN {
 class VulkanDevice : public NonCopyable {
 public:
-    explicit VulkanDevice(std::shared_ptr<VulkanInstance> instance,
-                          const std::vector<const char*>& device_extensions = {});
+    explicit VulkanDevice(std::shared_ptr<VulkanInstance> instance);
     explicit VulkanDevice(std::shared_ptr<VulkanInstance> instance, VkPhysicalDevice physicalDevice, VkDevice device,
                           uint32_t queueFamilyIndex, VkQueue queue);
     virtual ~VulkanDevice();
@@ -78,7 +77,7 @@ public:
 
     // VkImage/VkSampler
     const VkResult createImage(VkImage& image, const VkImageType imageType, const uint32_t width, const uint32_t height,
-                               const uint32_t depth, const VkFormat format,
+                               const uint32_t depth, const VkFormat format, VkImageUsageFlags usage,
                                const VkAllocationCallbacks* allocator = nullptr) const;
     const void destroyImage(const VkImage& image, const VkAllocationCallbacks* allocator = nullptr) const;
 
@@ -155,6 +154,26 @@ public:
     const bool success() const {
         return (VK_NULL_HANDLE != mDevice);
     }
+    
+    const float getTimestampPeriod() const {
+        return mDeviceProty.limits.timestampPeriod;
+    }
+    
+    const int getMaxComputeWorkGroupInvocations() const {
+        return mDeviceProty.limits.maxComputeWorkGroupInvocations;
+    }
+    
+    const void getMaxComputeWorkGroupSize(std::vector<int> &groups) const{
+        if(groups.size() == 3){
+            groups[0] = mDeviceProty.limits.maxComputeWorkGroupSize[0];
+            groups[1] = mDeviceProty.limits.maxComputeWorkGroupSize[1];
+            groups[2] = mDeviceProty.limits.maxComputeWorkGroupSize[2];
+        }
+    }
+
+    uint32_t getSubgroupSize() const {
+        return mSubgroupSize;
+    }
 
 private:
     const VkResult enumerateDeviceExtensionProperties(const VkPhysicalDevice& dev,
@@ -169,6 +188,7 @@ private:
     VkPhysicalDeviceProperties mDeviceProty;
     VkQueue mQueue;
     VkPhysicalDeviceMemoryProperties mMemoryProty;
+    uint32_t mSubgroupSize;
 };
 } // namespace MNN
 #endif /* VulkanDevice_hpp */

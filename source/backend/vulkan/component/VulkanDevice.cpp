@@ -10,14 +10,13 @@
 #include <string.h>
 //#define MNN_VULKAN_PRINT_EXT
 namespace MNN {
-VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, const std::vector<const char*>& device_extensions)
+VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance)
     : mOwner(true),
       mInstance(instance),
       mQueueFamilyIndex(0),
       mPhysicalDevice(VK_NULL_HANDLE),
       mDevice(VK_NULL_HANDLE),
       mQueue(VK_NULL_HANDLE) {
-    MNN_ASSERT(mInstance->success());
     // Find one GPU to use:
     // On Android, every GPU device is equal -- supporting
     // graphics/compute/present
@@ -25,9 +24,8 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, const std::
     uint32_t gpuCount = 0;
     CALL_VK(mInstance->enumeratePhysicalDevices(gpuCount, nullptr));
     MNN_ASSERT(0 != gpuCount);
-    VkPhysicalDevice tmpGpus[1] = {nullptr};
-    gpuCount = 1;
-    CALL_VK(mInstance->enumeratePhysicalDevices(gpuCount, tmpGpus));
+    std::vector<VkPhysicalDevice> tmpGpus(gpuCount);
+    CALL_VK(mInstance->enumeratePhysicalDevices(gpuCount, tmpGpus.data()));
     MNN_ASSERT(nullptr != tmpGpus[0]);
     mPhysicalDevice = tmpGpus[0];
 
@@ -44,6 +42,9 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, const std::
     for (queueFamilyIndex = 0; queueFamilyIndex < queueFamilyCount; queueFamilyIndex++) {
         if (queueFamilyProperties[queueFamilyIndex].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             break;
+        }
+        if (!(queueFamilyProperties[queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            MNN_PRINT("The queue can't support graphic render\n");
         }
     }
     MNN_ASSERT(queueFamilyIndex < queueFamilyCount);
@@ -66,6 +67,23 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, const std::
     mDeviceFeature.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     //vkGetPhysicalDeviceFeatures(mPhysicalDevice, &mDeviceFeature);
 
+    // Set device extensions.
+    std::vector<const char*> deviceExtensions;
+    std::vector<const char*> deviceExtensionsToCheck = {
+        "VK_KHR_portability_subset"
+    };
+    uint32_t availableDeviceExtensionCount = 0;
+    CALL_VK(vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &availableDeviceExtensionCount, nullptr));
+    std::vector<VkExtensionProperties> availableDeviceExtensions(availableDeviceExtensionCount);
+    CALL_VK(vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &availableDeviceExtensionCount, availableDeviceExtensions.data()));
+    for (uint32_t i = 0; i < availableDeviceExtensionCount; i++) {
+        for (uint32_t j = 0; j < deviceExtensionsToCheck.size(); j++) {
+            if (strcmp(availableDeviceExtensions[i].extensionName, deviceExtensionsToCheck[j]) == 0) {
+                deviceExtensions.push_back(deviceExtensionsToCheck[j]);
+            }
+        }
+    }
+
     VkDeviceCreateInfo deviceCreateInfo{
         /* .sType                   = */ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         /* .pNext                   = */ nullptr,
@@ -74,14 +92,33 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, const std::
         /* .pQueueCreateInfos       = */ &queueCreateInfo,
         /* .enabledLayerCount       = */ 0,
         /* .ppEnabledLayerNames     = */ nullptr,
-        /* .enabledExtensionCount   = */ static_cast<uint32_t>(device_extensions.size()),
-        /* .ppEnabledExtensionNames = */ device_extensions.data(),
+        /* .enabledExtensionCount   = */ static_cast<uint32_t>(deviceExtensions.size()),
+        /* .ppEnabledExtensionNames = */ deviceExtensions.data(),
         /* .pEnabledFeatures        = */ &mDeviceFeature,
     };
+    mDevice = VK_NULL_HANDLE;
     CALL_VK(vkCreateDevice(mPhysicalDevice, &deviceCreateInfo, nullptr, &mDevice));
+    if (VK_NULL_HANDLE == mDevice) {
+        MNN_ERROR("Can't create vk device\n");
+        return;
+    }
     vkGetPhysicalDeviceProperties(mPhysicalDevice, &mDeviceProty);
     vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProty);
     getDeviceQueue(mQueueFamilyIndex, 0, mQueue);
+
+    // query subgroupSize
+    {
+        VkPhysicalDeviceProperties2 deviceProperties2 = {};
+        deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+
+        VkPhysicalDeviceSubgroupProperties subgroupProperties = {};
+        subgroupProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+
+        deviceProperties2.pNext = &subgroupProperties;
+        vkGetPhysicalDeviceProperties2(mPhysicalDevice, &deviceProperties2);
+        mSubgroupSize = subgroupProperties.subgroupSize;
+    }
+
 #ifdef MNN_VULKAN_PRINT_EXT
     uint32_t pPropertyCount;
     vkEnumerateInstanceExtensionProperties(nullptr, &pPropertyCount, nullptr);
@@ -91,6 +128,10 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, const std::
       auto& p = properties[i];
       FUNC_PRINT_ALL(p.extensionName, s);
     }
+    FUNC_PRINT(mDeviceProty.limits.maxComputeWorkGroupSize[0]);
+    FUNC_PRINT(mDeviceProty.limits.maxComputeWorkGroupCount[0]);
+    FUNC_PRINT(mDeviceProty.limits.maxComputeWorkGroupInvocations);
+    FUNC_PRINT(mDeviceProty.limits.maxComputeSharedMemorySize);
 #endif
 }
 
@@ -295,7 +336,7 @@ const void VulkanDevice::destroySemaphore(const VkSemaphore& semaphore, const Vk
 }
 
 const VkResult VulkanDevice::createImage(VkImage& image, const VkImageType imageType, const uint32_t width,
-                                         const uint32_t height, const uint32_t depth, const VkFormat format,
+                                         const uint32_t height, const uint32_t depth, const VkFormat format, VkImageUsageFlags usage,
                                          const VkAllocationCallbacks* allocator) const {
     VkImageCreateInfo info = {};
     info.sType             = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -308,7 +349,7 @@ const VkResult VulkanDevice::createImage(VkImage& image, const VkImageType image
     info.format            = format;
     info.tiling            = VK_IMAGE_TILING_OPTIMAL;
     info.initialLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
-    info.usage             = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.usage             = usage;
     info.samples           = VK_SAMPLE_COUNT_1_BIT;
     info.sharingMode       = VK_SHARING_MODE_EXCLUSIVE;
     info.pNext             = nullptr;

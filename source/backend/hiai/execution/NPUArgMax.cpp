@@ -26,9 +26,9 @@ ErrorCode NPUArgMax::onResize(const std::vector<Tensor *> &inputs, const std::ve
     auto argMaxParam = mOp->main_as_ArgMax();
 
     // om input weight const op
-    mConst_axis = ge::op::Const(opName + "_w_const");
+    mConst_axis = hiai::op::Const(opName + "_w_const");
     {
-        auto aixs = axisFormat(inputs[0], argMaxParam->axis());
+        auto aixs = argMaxParam->axis();
         ge::TensorDesc fdesc(ge::Shape({1}),ge::DT_INT32); 
         ge::TensorPtr axis = std::make_shared<ge::Tensor>();
         axis->SetTensorDesc(fdesc);

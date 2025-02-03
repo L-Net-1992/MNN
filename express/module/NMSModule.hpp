@@ -2,9 +2,10 @@
 //  NMSModule.hpp
 //  MNN
 //
-//  Created by MNN on b'2020/09/10'.
+//  Created by MNN on 2020/09/10.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
+
 #ifndef NMSModule_hpp
 #define NMSModule_hpp
 #include <MNN/expr/Module.hpp>
@@ -17,14 +18,12 @@ public:
         // Do nothing
     }
     virtual std::vector<Express::VARP> onForward(const std::vector<Express::VARP>& inputs) override;
-    MNN_PUBLIC static NMSModule* create(const Op* op, std::shared_ptr<Schedule::ScheduleInfo> sharedConst);
+    static NMSModule* create(const Op* op);
 
 private:
     NMSModule(){}
 
     Module* clone(CloneContext* ctx) const override;
-    
-    std::shared_ptr<Schedule::ScheduleInfo> mSharedConst;
 };
 }
 }

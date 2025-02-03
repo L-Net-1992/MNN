@@ -8,7 +8,7 @@
 
 #include "TensorConvertGrad.hpp"
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 
 class TensorConvertGrad : public OpGrad {
@@ -17,12 +17,17 @@ public:
                                               const std::vector<Express::VARP>& backwardOutput) override {
         std::vector<Express::VARP> result{nullptr};
         auto originInput = expr->inputs()[0];
-        result[0]        = _Convert(backwardOutput[0], originInput->getInfo()->order);
+        auto originInfo = originInput->getInfo();
+        result[0]        = _Convert(backwardOutput[0], originInfo->order);
         return result;
     }
 };
-static const auto gRegister = []() {
+static void _create() {
     static TensorConvertGrad _c;
     OpGrad::insert(OpType_ConvertTensor, &_c);
-    return true;
-}();
+
+}
+
+REGISTER_GRAD(TensorConvertGrad_cpp, _create);
+};
+

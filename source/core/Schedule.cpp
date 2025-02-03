@@ -15,6 +15,7 @@
 #include "core/Macro.h"
 #include "core/RuntimeFactory.hpp"
 #include "core/TensorUtils.hpp"
+#include "core/FileLoader.hpp"
 #ifndef MNN_BUILD_MINI
 #include "shape/SizeComputer.hpp"
 #include "geometry/GeometryComputerUtils.hpp"
@@ -26,6 +27,87 @@
 using namespace std;
 //#define MNN_AUTO_CHECK_COST
 namespace MNN {
+void Schedule::OpResizeCache::close(bool pass) {
+    mCanCache = false;
+    mInputInfos.clear();
+    mPass = pass;
+}
+void Schedule::OpResizeCache::addContentIndex(int index) {
+    mNeedCompareContent.emplace_back(index);
+}
+
+bool Schedule::OpResizeCache::match(const std::vector<Tensor*>& inputs, bool& compared) {
+    if (!mCanCache) {
+        return mPass;
+    }
+    if (!mComputed) {
+        return false;
+    }
+    if (mInputInfos.size() != inputs.size()) {
+        return false;
+    }
+    compared = true;
+    for (int u=0; u<mInputInfos.size(); ++u) {
+        auto des = TensorUtils::getDescribe(inputs[u]);
+        if (mInputInfos[u].order != des->dimensionFormat) {
+            return false;
+        }
+        if (mInputInfos[u].type.code != inputs[u]->getType().code || mInputInfos[u].type.bits != inputs[u]->getType().bits) {
+            return false;
+        }
+        if (mInputInfos[u].dim.size() != inputs[u]->dimensions()) {
+            return false;
+        }
+        for (int v=0; v<mInputInfos[u].dim.size(); ++v) {
+            if (mInputInfos[u].dim[v] != inputs[u]->length(v)) {
+                return false;
+            }
+        }
+        if (des->memoryType == Tensor::InsideDescribe::MEMORY_VIRTUAL && (des->stageMask & Tensor::InsideDescribe::COMPUTE_SHAPE_STAGE)) {
+            return false;
+        }
+    }
+    for (auto dim : mNeedCompareContent) {
+        auto t = inputs[dim];
+        auto& s = mInputInfos[dim];
+        if (0 != ::memcmp(s.buffer.data(), t->host<void>(), s.buffer.size())) {
+            return false;
+        }
+    }
+    return true;
+}
+void Schedule::OpResizeCache::open() {
+    mCanCache = true;
+}
+void Schedule::OpResizeCache::copyImmutable(const OpResizeCache& cache) {
+    mNeedCompareContent = cache.mNeedCompareContent;
+}
+
+void Schedule::OpResizeCache::insert(const std::vector<Tensor*>& inputs) {
+    if (!mCanCache) {
+        return;
+    }
+    mComputed = true;
+    mInputInfos.resize(inputs.size());
+    for (int u=0; u<inputs.size(); ++u) {
+        mInputInfos[u].dim = inputs[u]->shape();
+        mInputInfos[u].order = TensorUtils::getDescribe(inputs[u])->dimensionFormat;
+        mInputInfos[u].type = inputs[u]->getType();
+    }
+    for (auto dim : mNeedCompareContent) {
+        const int limit = 10000;
+        auto t = inputs[dim];
+        auto& s = mInputInfos[dim];
+        auto size = t->usize();
+        if (size > limit) {
+            close();
+            return;
+        }
+        s.buffer.resize(size);
+        ::memcpy(s.buffer.data(), t->host<void>(), size);
+    }
+}
+
 
 MNNForwardType Schedule::getApprociateType(const ScheduleConfig& config) {
     MNNForwardType type = config.type;
@@ -39,6 +121,7 @@ MNNForwardType Schedule::getApprociateType(const ScheduleConfig& config) {
         priorityList.push_back(MNN_FORWARD_CUDA);   //CUDA
         priorityList.push_back(MNN_FORWARD_OPENCL); //OpenCL
         priorityList.push_back(MNN_FORWARD_METAL);  //METAL
+        priorityList.push_back(MNN_FORWARD_VULKAN); //Vulkan
         priorityList.push_back(MNN_FORWARD_CPU);    //CPU
 
         for (auto bn : priorityList) {
@@ -52,66 +135,38 @@ MNNForwardType Schedule::getApprociateType(const ScheduleConfig& config) {
     if (nullptr == creator) {
         MNN_PRINT("Can't Find type=%d backend, use %d instead\n", type, config.backupType);
         type = config.backupType;
-    }
-    return type;
-}
-
-static bool _setUpTensorInfo(std::vector<std::shared_ptr<Tensor>>& tensors, const Net* net) {
-    auto valid = initTensors(tensors, net);
-    if (net->usage() != Usage_INFERENCE_STATIC) {
-        return valid;
-    }
-    // static model will set all tensors' shape
-    auto describes = net->extraTensorDescribe();
-    std::vector<const TensorDescribe*> des(tensors.size());
-    for (int i = 0; i < describes->size(); i++) {
-        int index  = describes->GetAs<TensorDescribe>(i)->index();
-        des[index] = describes->GetAs<TensorDescribe>(i);
-    }
-    for (int i = 0; i < tensors.size(); ++i) {
-        if (TensorUtils::getDescribe(tensors[i].get())->usage != Tensor::InsideDescribe::NORMAL) {
-            // Const / Trainable Shape has been inited
-            continue;
-        }
-        auto blob = des[i]->blob();
-        auto& tb = tensors[i]->buffer();
-        if (auto idims = blob->dims()) {
-            for (int d = 0; d < idims->size(); d++) {
-                tb.dim[d].extent = idims->Get(d);
-            }
-            tb.dimensions = idims->size();
-        } else {
-            tb.dimensions = 0;
-        }
-        tensors[i]->setType(blob->dataType());
-    }
-    for (int i = 0; i < tensors.size(); ++i) {
-        auto blob                                                   = des[i]->blob();
-        TensorUtils::getDescribe(tensors[i].get())->dimensionFormat = blob->dataFormat();
-        if (auto regions = des[i]->regions()) {
-            auto& regs = TensorUtils::getDescribe(tensors[i].get())->regions;
-            TensorUtils::getDescribe(tensors[i].get())->memoryType = Tensor::InsideDescribe::MEMORY_BACKEND;
-            regs.reserve(regions->size());
-            for (int r = 0; r < regions->size(); r++) {
-                auto region = regions->GetAs<Region>(r);
-                Tensor::InsideDescribe::Region reg;
-                reg.origin     = tensors[region->origin()].get();
-                reg.src.offset = region->src()->offset();
-                reg.dst.offset = region->dst()->offset();
-                for (int d = 0; d < 3; d++) {
-                    reg.size[d]       = region->size()->data()[d];
-                    reg.src.stride[d] = region->src()->stride()->data()[d];
-                    reg.dst.stride[d] = region->dst()->stride()->data()[d];
+    } else {
+        // TODO : Not Limited to opencl
+        if(type == MNN_FORWARD_OPENCL && config.backendConfig != nullptr) {
+            if(config.backendConfig->power == BackendConfig::Power_Low) {
+                Backend::Info info;
+                info.type = type;
+                std::shared_ptr<Runtime> bn(creator->onCreate(info));
+                if (nullptr != bn.get()) {
+                    bool isSupportLowPower = bn->onGetRuntimeStatus(RuntimeStatus::STATUS_SUPPORT_POWER_LOW);
+                    if(!isSupportLowPower) {
+                        MNN_PRINT("type=%d backend don't Support Low Power, use %d instead\n", type, config.backupType);
+                        type = config.backupType;
+                    }
+                } else{
+                    type = config.backupType;
                 }
-                regs.emplace_back(std::move(reg));
             }
         }
     }
-    return valid;
+    
+
+    return type;
 }
 
 static void generateScheduleGraph(vector<const Op*>& ops, const Net* net, const ScheduleConfig& configs,
                                   const vector<shared_ptr<Tensor>>& allTensors) {
+
+        // for (int i = 0; i < net->oplists()->size(); ++i) {
+        //     auto op       = net->oplists()->Get(i);
+        //     MNN_PRINT("generateScheduleGraph, op type:%s, op name:%s\n", EnumNameOpType(op->type()), op->name()->c_str());
+        // }
+
     if (configs.path.inputs.empty() && configs.path.outputs.empty()) {
         // Use Default Linear schedule
         ops.clear();
@@ -129,7 +184,7 @@ static void generateScheduleGraph(vector<const Op*>& ops, const Net* net, const 
     // 0: use, 1: no use
     std::vector<int> opMask(net->oplists()->size());
     ::memset(opMask.data(), 0, opMask.size() * sizeof(int));
-    
+
     // Set Initial Status
     std::set<std::string> inputNames;
     std::set<std::string> outputNames;
@@ -224,9 +279,9 @@ static void generateScheduleGraph(vector<const Op*>& ops, const Net* net, const 
     }
 }
 
-static vector<Schedule::PipelineInfo> _scheduleUnit(const Net* net, const ScheduleConfig& configs,
+static vector<Schedule::OpCacheInfo> _scheduleUnit(const Net* net, const ScheduleConfig& configs,
                                                     const vector<shared_ptr<Tensor>>& allTensors) {
-    vector<Schedule::PipelineInfo> oplists;
+    vector<Schedule::OpCacheInfo> oplists;
     vector<const Op*> ops;
     generateScheduleGraph(ops, net, configs, allTensors);
     initPipelineInfosFromOps(oplists, ops, allTensors);
@@ -244,16 +299,17 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
         defaultConfig.flags = 4;
         scheduleInfo.defaultBackend.reset(runtimeInfo.second->onCreate(&defaultConfig));
         ErrorCode code = NO_ERROR;
-        initConstTensors(scheduleInfo.allTensors, net, scheduleInfo.defaultBackend.get(), code);
+        FileLoader loader(scheduleInfo.externalWeightPath.c_str());
+        initConstTensors(scheduleInfo.allTensors, net, scheduleInfo.defaultBackend.get(), code, &loader);
         if (NO_ERROR != code) {
             MNN_ERROR("Schedule Const init errorcode = %d\n", code);
             return false;
         }
     }
-    bool valid = _setUpTensorInfo(scheduleInfo.allTensors, net);
+    bool valid = initTensors(scheduleInfo.allTensors, net);
     scheduleInfo.validForResize = valid;
     std::vector<std::shared_ptr<Tensor>>& allTensors = scheduleInfo.allTensors;
-    std::vector<std::pair<Backend::Info, std::vector<Schedule::PipelineInfo>>> result;
+    std::vector<std::pair<Schedule::BackendCache, std::vector<Schedule::OpCacheInfo>>> result;
 
     for (auto& config : configs) {
         Backend::Info compute;
@@ -267,7 +323,9 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
         }
         compute.user      = config.backendConfig;
         auto oplists      = _scheduleUnit(net, config, allTensors);
-        result.emplace_back(std::make_pair(compute, std::move(oplists)));
+        Schedule::BackendCache cache;
+        cache.info = std::move(compute);
+        result.emplace_back(std::make_pair(cache, std::move(oplists)));
     }
 
     scheduleInfo.pipelineInfo = std::move(result);
@@ -275,7 +333,7 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
     // get all used op's output, drop unused op, won't change op order. always insert all Input Ops
     std::vector<const Op*> oplists;
     {
-        for (std::pair<Backend::Info, vector<Schedule::PipelineInfo>>& pipeline : scheduleInfo.pipelineInfo) {
+        for (std::pair<Schedule::BackendCache, vector<Schedule::OpCacheInfo>>& pipeline : scheduleInfo.pipelineInfo) {
             for (auto& info : pipeline.second) {
                 oplists.push_back(info.op);
             }
@@ -336,8 +394,20 @@ bool Schedule::schedule(ScheduleInfo& scheduleInfo, const Net* net, const std::v
                        std::make_pair(net->tensorName()->GetAsString(index)->c_str(), t));
         }
     }
+    if (net->usage() == Usage_INFERENCE_STATIC) {
+        for (auto& pipInfo : scheduleInfo.pipelineInfo) {
+            pipInfo.first.needComputeGeometry = false;
+            pipInfo.first.needComputeShape = false;
+        }
+    }
+
 #ifndef MNN_BUILD_MINI
     for (auto iter = scheduleInfo.pipelineInfo.begin(); iter != scheduleInfo.pipelineInfo.end();) {
+        if (!iter->first.needComputeGeometry) {
+            // For static model don't need check const
+            iter++;
+            continue;
+        }
         auto breakIndex = GeometryComputerUtils::buildConstantTensors(iter->second);
         if (breakIndex >= 0) {
             scheduleInfo.needInputContentForShape = true;

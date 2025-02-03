@@ -24,6 +24,23 @@ void MNNSamplerC4NearestOpt(const unsigned char* source, unsigned char* dest, fl
 void MNNSamplerC1NearestOpt(const unsigned char* source, unsigned char* dest, float* points, size_t count, size_t iw, size_t ih, size_t yStride);
 void MNNBlitC1ToFloatRGBA(const unsigned char* source, float* dest, const float* mean, const float* normal, size_t count);
 void MNNBlitC3ToFloatRGBA(const unsigned char* source, float* dest, const float* mean, const float* normal, size_t count);
+void MNNRGBToBGRC8(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNBGRAToBGRC8(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNGRAYToC4Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNGRAYToC3Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNC3ToC4Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNBGRAToGRAYFast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNRGBToGRAYFast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNRGBAToGRAYFast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNBGRToGRAYFast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNC3ToYUVFast(const unsigned char* source, unsigned char* dest, size_t count, int32_t* c);
+void MNNC3ToXYZFast(const unsigned char* source, unsigned char* dest, size_t count, int32_t* c);
+void MNNRGBToBGR555Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNBGRToBGR555Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNBGRToBGR565Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNRGBToBGR565Fast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNRGBAToBGRAFast(const unsigned char* source, unsigned char* dest, size_t count);
+void MNNRGBAToBGRFast(const unsigned char* source, unsigned char* dest, size_t count);
 }
 
 void MNNGRAYToC4(const unsigned char* source, unsigned char* dest, size_t count) {
@@ -31,16 +48,7 @@ void MNNGRAYToC4(const unsigned char* source, unsigned char* dest, size_t count)
 #ifdef MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            auto gray = vld1_u8(source + 8 * i);
-
-            uint8x8x4_t rgba;
-            rgba.val[0] = gray;
-            rgba.val[1] = gray;
-            rgba.val[2] = gray;
-            rgba.val[3] = vdup_n_u8(255);
-            vst4_u8(dest + 32 * i, rgba);
-        }
+        MNNGRAYToC4Fast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -57,15 +65,7 @@ void MNNGRAYToC3(const unsigned char* source, unsigned char* dest, size_t count)
 #ifdef MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            auto gray = vld1_u8(source + 8 * i);
-
-            uint8x8x3_t rgba;
-            rgba.val[0] = gray;
-            rgba.val[1] = gray;
-            rgba.val[2] = gray;
-            vst3_u8(dest + 24 * i, rgba);
-        }
+        MNNGRAYToC3Fast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -81,16 +81,7 @@ void MNNC3ToC4(const unsigned char* source, unsigned char* dest, size_t count) {
 #ifdef MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            uint8x8x3_t c3 = vld3_u8(source + 24 * i);
-
-            uint8x8x4_t c4;
-            c4.val[0] = c3.val[0];
-            c4.val[1] = c3.val[1];
-            c4.val[2] = c3.val[2];
-            c4.val[3] = vdup_n_u8(255);
-            vst4_u8(dest + 32 * i, c4);
-        }
+        MNNC3ToC4Fast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -105,15 +96,9 @@ void MNNC3ToC4(const unsigned char* source, unsigned char* dest, size_t count) {
 void MNNRGBAToBGRA(const unsigned char* source, unsigned char* dest, size_t count) {
     int sta = 0;
 #ifdef MNN_USE_NEON
-    int countD8 = (int)count / 8;
+    auto countD8 = count / 8;
     if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            uint8x8x4_t rgba = vld4_u8(source + 32 * i);
-            auto t           = rgba.val[0];
-            rgba.val[0]      = rgba.val[2];
-            rgba.val[2]      = t;
-            vst4_u8(dest + 32 * i, rgba);
-        }
+        MNNRGBAToBGRAFast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -128,17 +113,9 @@ void MNNRGBAToBGRA(const unsigned char* source, unsigned char* dest, size_t coun
 void MNNRGBAToBGR(const unsigned char* source, unsigned char* dest, size_t count) {
     int sta = 0;
 #ifdef MNN_USE_NEON
-    int countD8 = (int)count / 8;
+    auto countD8 = count / 8;
     if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            uint8x8x4_t rgba = vld4_u8(source + 32 * i);
-
-            uint8x8x3_t bgr;
-            bgr.val[0] = rgba.val[2];
-            bgr.val[1] = rgba.val[1];
-            bgr.val[2] = rgba.val[0];
-            vst3_u8(dest + 24 * i, bgr);
-        }
+        MNNRGBAToBGRFast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -152,18 +129,11 @@ void MNNRGBAToBGR(const unsigned char* source, unsigned char* dest, size_t count
 void MNNRGBToBGR(const unsigned char* source, unsigned char* dest, size_t count) {
     int sta = 0;
 #ifdef MNN_USE_NEON
-    int countD8 = (int)count / 8;
-    if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            uint8x8x3_t rgba = vld3_u8(source + 24 * i);
-            uint8x8x3_t bgr;
-            bgr.val[0] = rgba.val[2];
-            bgr.val[1] = rgba.val[1];
-            bgr.val[2] = rgba.val[0];
-            vst3_u8(dest + 24 * i, bgr);
-        }
+   int countD8 = (int)count / 8;
+   if (countD8 > 0) {
+        MNNRGBToBGRC8(source, dest, countD8);
         sta = countD8 * 8;
-    }
+   }
 #endif
     for (int i = sta; i < count; ++i) {
         dest[3 * i + 0] = source[3 * i + 2];
@@ -177,15 +147,7 @@ void MNNBGRAToBGR(const unsigned char* source, unsigned char* dest, size_t count
 #ifdef MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        for (int i = 0; i < countD8; ++i) {
-            uint8x8x4_t bgra = vld4_u8(source + 32 * i);
-
-            uint8x8x3_t bgr;
-            bgr.val[0] = bgra.val[0];
-            bgr.val[1] = bgra.val[1];
-            bgr.val[2] = bgra.val[2];
-            vst3_u8(dest + 24 * i, bgr);
-        }
+        MNNBGRAToBGRC8(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -198,23 +160,13 @@ void MNNBGRAToBGR(const unsigned char* source, unsigned char* dest, size_t count
 
 void MNNBGRAToGRAY(const unsigned char* source, unsigned char* dest, size_t count) {
     int sta = 0;
-    /*
-#ifdef MNN_USE_NEON
-    int countD8 = (int)count / 8;
-    if (countD8 > 0) {
-        auto rC = vdup_n_u8(19);
-        auto gC = vdup_n_u8(38);
-        auto bC = vdup_n_u8(7);
-        for (int i = 0; i < countD8; ++i) {
-            auto rgb   = vld4_u8(source + 32 * i);
-            auto res   = vmull_u8(rC, rgb.val[2]) + vmull_u8(gC, rgb.val[1]) + vmull_u8(bC, rgb.val[0]);
-            auto resU8 = vshrn_n_u16(res, 6);
-            vst1_u8(dest + 8 * i, resU8);
-        }
+ #if defined MNN_USE_NEON
+     int countD8 = (int)count / 8;
+     if (countD8 > 0) {
+        MNNBGRAToGRAYFast(source, dest, countD8);
         sta = countD8 * 8;
-    }
-#endif
-    */
+     }
+ #endif
     for (int i = sta; i < count; ++i) {
         int r = source[4 * i + 2];
         int g = source[4 * i + 1];
@@ -228,23 +180,15 @@ void MNNBGRAToGRAY(const unsigned char* source, unsigned char* dest, size_t coun
 
 void MNNRGBAToGRAY(const unsigned char* source, unsigned char* dest, size_t count) {
     int sta = 0;
-    /*
-#ifdef MNN_USE_NEON
+
+#if defined MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        auto rC = vdup_n_u8(19);
-        auto gC = vdup_n_u8(38);
-        auto bC = vdup_n_u8(7);
-        for (int i = 0; i < countD8; ++i) {
-            auto rgb   = vld4_u8(source + 32 * i);
-            auto res   = vmull_u8(rC, rgb.val[0]) + vmull_u8(gC, rgb.val[1]) + vmull_u8(bC, rgb.val[2]);
-            auto resU8 = vshrn_n_u16(res, 6);
-            vst1_u8(dest + 8 * i, resU8);
-        }
+        MNNRGBAToGRAYFast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
-    */
+
     for (int i = sta; i < count; ++i) {
         int r = source[4 * i + 0];
         int g = source[4 * i + 1];
@@ -290,28 +234,15 @@ void MNNC3ToYUV(const unsigned char* source, unsigned char* dest, size_t count, 
         C3 = coeffs[r1], C4 = coeffs[g1], C5 = coeffs[b1],
         C6 = coeffs[r2], C7 = coeffs[g2], C8 = coeffs[b2];
     int sta = 0;
-    /*
-#ifdef MNN_USE_NEON
+
+#if defined MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        auto rC0 = vdup_n_u8(C0), rC1 = vdup_n_u8(C1), rC2 = vdup_n_u8(C2),
-             rC3 = vdup_n_u8(C3), rC4 = vdup_n_u8(C4), rC5 = vdup_n_u8(C5),
-             rC6 = vdup_n_u8(C6), rC7 = vdup_n_u8(C7), rC8 = vdup_n_u8(C8);
-        auto delta = vdup_n_u8(128);
-        for (int i = 0; i < countD8; ++i) {
-            auto rgb   = vld4_u8(source + 24 * i);
-            uint8x8x3_t yuv;
-            yuv.val[0] = CV_MUL_SHIFT(rC0, rC1, rC2, 14);
-            yuv.val[1] = CV_MUL_SHIFT(rC3, rC4, rC5, 14);
-            yuv.val[2] = CV_MUL_SHIFT(rC6, rC7, rC8, 14);
-            yuv.val[1] = vadd_u8(yuv.val[1], delta);
-            yuv.val[2] = vadd_u8(yuv.val[2], delta);
-            vst3_u8(dest + 24 * i, yuv);
-        }
+        int32_t c[] = {C0, C1, C2, C3, C4, C5, C6, C7, C8};
+        MNNC3ToYUVFast(source, dest, countD8, c);
         sta = countD8 * 8;
     }
 #endif
-     */
     for (int i = sta; i < count; ++i) {
         int r = source[3 * i + 0];
         int g = source[3 * i + 1];
@@ -341,25 +272,16 @@ void MNNC3ToXYZ(const unsigned char* source, unsigned char* dest, size_t count, 
         C3 = coeffs[r1], C4 = coeffs[4], C5 = coeffs[b1],
         C6 = coeffs[r2], C7 = coeffs[7], C8 = coeffs[b2];
     int sta = 0;
-    /*
-#ifdef MNN_USE_NEON
+    
+#if defined MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        auto rC0 = vdup_n_u8(C0), rC1 = vdup_n_u8(C1), rC2 = vdup_n_u8(C2),
-             rC3 = vdup_n_u8(C3), rC4 = vdup_n_u8(C4), rC5 = vdup_n_u8(C5),
-             rC6 = vdup_n_u8(C6), rC7 = vdup_n_u8(C7), rC8 = vdup_n_u8(C8);
-        for (int i = 0; i < countD8; ++i) {
-            auto rgb   = vld4_u8(source + 24 * i);
-            uint8x8x3_t xyz;
-            xyz.val[0] = CV_MUL_SHIFT(rC0, rC1, rC2, 12);
-            xyz.val[1] = CV_MUL_SHIFT(rC3, rC4, rC5, 12);
-            xyz.val[2] = CV_MUL_SHIFT(rC6, rC7, rC8, 12);
-            vst3_u8(dest + 24 * i, xyz);
-        }
+        int32_t c[] = {C0, C1, C2, C3, C4, C5, C6, C7, C8};
+        MNNC3ToXYZFast(source, dest, countD8, c);
         sta = countD8 * 8;
     }
 #endif
-    */
+    
     for (int i = sta; i < count; ++i) {
         int r = source[3 * i + 0];
         int g = source[3 * i + 1];
@@ -402,6 +324,18 @@ void MNNC3ToHSV(const unsigned char* source, unsigned char* dest, size_t count, 
 
 void MNNC3ToBGR555(const unsigned char* source, unsigned char* dest, size_t count, bool bgr) {
     int i = 0;
+    int countD8 = (int)count / 8;
+#if defined MNN_USE_NEON
+    if (countD8 > 0) {
+        if (bgr) {
+            MNNBGRToBGR555Fast(source, dest, countD8);
+        } else {
+            MNNRGBToBGR555Fast(source, dest, countD8);
+        }
+        
+        i = countD8 * 8;
+    }
+#endif
     for (; i < count; ++i) {
         int r = source[3 * i + 0];
         int g = source[3 * i + 1];
@@ -413,6 +347,17 @@ void MNNC3ToBGR555(const unsigned char* source, unsigned char* dest, size_t coun
 
 void MNNC3ToBGR565(const unsigned char* source, unsigned char* dest, size_t count, bool bgr) {
     int i = 0;
+#if defined MNN_USE_NEON
+    auto countD8 = count / 8;
+    if (countD8 > 0) {
+        if (bgr) {
+            MNNBGRToBGR565Fast(source, dest, countD8);
+        } else {
+            MNNRGBToBGR565Fast(source, dest, countD8);
+        }
+        i = countD8 * 8;
+    }
+#endif
     for (; i < count; ++i) {
         int r = source[3 * i + 0];
         int g = source[3 * i + 1];
@@ -427,15 +372,7 @@ void MNNRGBToGRAY(const unsigned char* source, unsigned char* dest, size_t count
 #ifdef MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        auto rC = vdup_n_u8(19);
-        auto gC = vdup_n_u8(38);
-        auto bC = vdup_n_u8(7);
-        for (int i = 0; i < countD8; ++i) {
-            auto rgb   = vld3_u8(source + 24 * i);
-            auto res   = vmull_u8(rC, rgb.val[0]) + vmull_u8(gC, rgb.val[1]) + vmull_u8(bC, rgb.val[2]);
-            auto resU8 = vshrn_n_u16(res, 6);
-            vst1_u8(dest + 8 * i, resU8);
-        }
+        MNNRGBToGRAYFast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -456,15 +393,7 @@ void MNNBRGToGRAY(const unsigned char* source, unsigned char* dest, size_t count
 #ifdef MNN_USE_NEON
     int countD8 = (int)count / 8;
     if (countD8 > 0) {
-        auto rC = vdup_n_u8(19);
-        auto gC = vdup_n_u8(38);
-        auto bC = vdup_n_u8(7);
-        for (int i = 0; i < countD8; ++i) {
-            auto rgb   = vld3_u8(source + 24 * i);
-            auto res   = vmull_u8(rC, rgb.val[2]) + vmull_u8(gC, rgb.val[1]) + vmull_u8(bC, rgb.val[0]);
-            auto resU8 = vshrn_n_u16(res, 6);
-            vst1_u8(dest + 8 * i, resU8);
-        }
+        MNNBGRToGRAYFast(source, dest, countD8);
         sta = countD8 * 8;
     }
 #endif
@@ -838,7 +767,7 @@ static void _sampleBilinearCommon(const unsigned char* source, unsigned char* de
             float v =
                 (1.0f - xF) * (1.0f - yF) * c00 + xF * (1.0f - yF) * c01 + yF * (1.0 - xF) * c10 + xF * yF * (c11);
             v                 = std::min(std::max(v, 0.0f), 255.0f);
-            dest[bpp * i + b] = (unsigned char)v;
+            dest[bpp * i + b] = (unsigned char)roundf(v);
         }
         curPoints.fY += dy;
         curPoints.fX += dx;
@@ -875,7 +804,6 @@ void MNNSamplerNearest(const unsigned char* source, unsigned char* dest, MNN::CV
     float dx     = points[1].fX;
     float xMax   = iw - 1;
     float yMax   = ih - 1;
-
     for (int i = 0; i < count; ++i) {
         int y = (int)roundf(__clamp(curPoints.fY, 0, yMax));
         int x = (int)roundf(__clamp(curPoints.fX, 0, xMax));
@@ -962,8 +890,8 @@ void MNNSamplerI420Nearest(const unsigned char* source, unsigned char* dest, MNN
     MNN::CV::Point uvPoints[2];
     uvPoints[0].fX = (points[0].fX - 0.01f) / 2.0f;
     uvPoints[0].fY = (points[0].fY - 0.01f) / 2.0f;
-    uvPoints[1].fX = points[1].fX;
-    uvPoints[1].fY = points[1].fY;
+    uvPoints[1].fX = points[1].fX / 2.0f;
+    uvPoints[1].fY = points[1].fY / 2.0f;
     if (yStride == 0) {
         stride =  ((iw + 1) / 2);
     }
@@ -975,8 +903,8 @@ void MNNSamplerI420Nearest(const unsigned char* source, unsigned char* dest, MNN
         curPoints.fY = uvPoints[0].fY;
         float dy     = uvPoints[1].fY;
         float dx     = uvPoints[1].fX;
-        float xMax   = (iw + 1 / 2) - 1;
-        float yMax   = (ih + 1 / 2) - 1;
+        float xMax   = ((iw + 1) / 2) - 1;
+        float yMax   = ((ih + 1) / 2) - 1;
 
         for (int i = 0; i < uvCount; ++i) {
             int y = (int)roundf(__clamp(curPoints.fY, 0, yMax));
@@ -999,8 +927,15 @@ void MNNSamplerNV21Copy(const unsigned char* source, unsigned char* dest, MNN::C
     float yMax      = ih - 1;
     int y           = (int)roundf(__clamp(curPoints.fY, 0, yMax));
     int x           = (int)roundf(__clamp(curPoints.fX, 0, xMax));
-    int sourcePosY  = y * (int)iw + x;
-    int sourcePosUV = (int)iw * (int)ih + (y / 2) * (((int)iw + 1) / 2) * 2 + (x / 2) * 2;
+    int stride = (int)yStride;
+    int hstride = (int)yStride;
+    if (yStride == 0) {
+        stride = (int)iw;
+        hstride = (((int)iw + 1) / 2) * 2;
+    }
+
+    int sourcePosY  = y * stride + x;
+    int sourcePosUV = (int)stride * (int)ih + (y / 2) * hstride + (x / 2) * 2;
 
     ::memcpy(dest + sta, source + sourcePosY, count);
     ::memcpy(dest + (capacity) + (sta / 2) * 2, source + sourcePosUV, ((count + 1) / 2) * 2);

@@ -11,16 +11,21 @@
 #include <vector>
 #include "backend/cuda/core/CUDABackend.hpp"
 #include "core/Execution.hpp"
+#ifdef ENABLE_CUDA_QUANT
+#include "int8/BinaryInt8Execution.hpp"
+#endif
+
 namespace MNN {
 namespace CUDA {
 class BinaryExecution : public Execution {
 public:
-    BinaryExecution(int opType, Backend *backend);
+    BinaryExecution(int opType, Backend *backend, int activationType = 0);
     virtual ~BinaryExecution();
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
 private:
     int mType;
+    int mActivationType;
 };
 } // namespace CUDA
 } // namespace MNN

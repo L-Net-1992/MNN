@@ -2,7 +2,7 @@
 //  NMSModule.cpp
 //  MNN
 //
-//  Created by MNN on b'2020/09/10'.
+//  Created by MNN on 2020/09/10.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
@@ -17,10 +17,9 @@
 namespace MNN {
 namespace Express {
 
-NMSModule* NMSModule::create(const Op* op, std::shared_ptr<Schedule::ScheduleInfo> sharedConst) {
+NMSModule* NMSModule::create(const Op* op) {
     auto module = new NMSModule;
     module->setType("NMSModule");
-    module->mSharedConst = sharedConst;
     if (nullptr != op->name()) {
         module->setName(op->name()->str());
     }
@@ -155,7 +154,6 @@ std::vector<Express::VARP> NMSModule::onForward(const std::vector<Express::VARP>
 
 Module* NMSModule::clone(CloneContext* ctx) const {
     NMSModule* module(new NMSModule);
-    module->mSharedConst = mSharedConst;
     return this->cloneBaseTo(ctx, module);
 }
 

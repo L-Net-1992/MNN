@@ -7,6 +7,7 @@
 //
 
 #include "MNN_generated.h"
+#include <MNN/expr/ExecutorScope.hpp>
 #include <MNN/expr/Expr.hpp>
 #include <MNN/expr/Module.hpp>
 #include <MNN/expr/ExprCreator.hpp>
@@ -103,6 +104,9 @@ int main(int argc, char *argv[]) {
         MNN_PRINT("Model Version: < 2.0.0\n");
     } else {
         MNN_PRINT("Model Version: %s \n", info->version.c_str());
+    }
+    if (!info->bizCode.empty()) {
+        MNN_PRINT("Model bizCode: %s\n", info->bizCode.c_str());
     }
     return 0;
 }

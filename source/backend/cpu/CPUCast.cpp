@@ -14,32 +14,31 @@
 #include <cmath>
 
 namespace MNN {
-ErrorCode CPUCastCreator::cast(void* const inputRaw, void* outputRaw, ConvertType type,
+ErrorCode CPUCastCreator::cast(const void* inputRaw, void* outputRaw, ConvertType type,
                                int number, float scale, float zero, float min, float max, const CPUBackend* bn) {
     auto pack = bn->functions()->pack;
     int c4Size = number / pack;
     int remain = number % pack;
     if (type == FlOAT_TO_INT8) {
         scale = (scale == 0.f ? 0.f : 1.f / scale);
-        std::vector<float> scales(pack, scale);
-        bn->int8Functions()->MNNFloat2Int8(static_cast<float*>(inputRaw), static_cast<int8_t*>(outputRaw), c4Size, scales.data(), min, max, zero);
+        bn->int8Functions()->MNNFloat2Int8((float*)(inputRaw), (int8_t*)(outputRaw), c4Size, &scale, min, max, &zero, 0);
         if (remain > 0) {
             std::vector<float> tempSrc(pack);
             std::vector<int8_t> tempDst(pack);
-            ::memcpy(tempSrc.data(), static_cast<float* const>(inputRaw) + c4Size * pack, remain * sizeof(float));
-            bn->int8Functions()->MNNFloat2Int8(tempSrc.data(), tempDst.data(), 1, scales.data(), min, max, zero);
+            ::memcpy(tempSrc.data(), (float*)(inputRaw) + c4Size * pack, remain * sizeof(float));
+            bn->int8Functions()->MNNFloat2Int8(tempSrc.data(), tempDst.data(), 1, &scale, min, max, &zero, 0);
             ::memcpy(static_cast<int8_t*>(outputRaw) + c4Size * pack, tempDst.data(), remain * sizeof(int8_t));
         }
         return NO_ERROR;
     }
     if (type == INT8_TO_FlOAT) {
         std::vector<float> scales(pack, scale);
-        bn->int8Functions()->MNNInt8ScaleToFloat(static_cast<float*>(outputRaw), static_cast<int8_t*>(inputRaw), scales.data(), c4Size, zero);
+        bn->int8Functions()->MNNInt8ScaleToFloat((float*)(outputRaw), (int8_t*)(inputRaw), &scale, c4Size, &zero, 0);
         if (remain > 0) {
             std::vector<float> tempDst(pack);
             std::vector<int8_t> tempSrc(pack);
-            ::memcpy(tempSrc.data(), static_cast<int8_t* const>(inputRaw) + c4Size * pack, remain * sizeof(int8_t));
-            bn->int8Functions()->MNNInt8ScaleToFloat(tempDst.data(), tempSrc.data(), scales.data(), 1, zero);
+            ::memcpy(tempSrc.data(), (int8_t*)(inputRaw) + c4Size * pack, remain * sizeof(int8_t));
+            bn->int8Functions()->MNNInt8ScaleToFloat(tempDst.data(), tempSrc.data(), &scale, 1, &zero, 0);
             ::memcpy(static_cast<float*>(outputRaw) + c4Size * pack, tempDst.data(), remain * sizeof(float));
         }
         return NO_ERROR;
@@ -107,6 +106,27 @@ public:
         return NO_ERROR;
     }
 };
+class BF16ToFP32 : public Execution {
+public:
+    BF16ToFP32(Backend *b) : Execution(b) {
+        // nothing to do
+    }
+    virtual ~BF16ToFP32() = default;
+
+    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
+        auto input                = inputs[0];
+        auto output               = outputs[0];
+        auto srcData              = input->host<int16_t>();
+        auto dstData              = output->host<int16_t>();
+        const auto inputDataSize  = input->elementSize();
+        MNN_ASSERT(inputDataSize == output->elementSize());
+        for (int i = 0; i < inputDataSize; i++) {
+            dstData[i * 2] = 0;
+            dstData[i * 2 + 1] = srcData[i];
+        }
+        return NO_ERROR;
+    }
+};
 class CopyExecution : public Execution {
 public:
     CopyExecution(Backend *b) : Execution(b) {
@@ -168,8 +188,14 @@ Execution *CPUCastCreator::onCreate(const std::vector<Tensor *> &inputs, const s
     if (dstT == MNN::DataType_DT_FLOAT && halide_type_of<int8_t>() == inputDataType) {
         return new CastDataType<int8_t, float>(backend);
     }
+    if (dstT == MNN::DataType_DT_FLOAT && halide_type_t(halide_type_bfloat, 16) == inputDataType) {
+        return new BF16ToFP32(backend);
+    }
     if (dstT == MNN::DataType_DT_INT8 && halide_type_of<float>() == inputDataType) {
         return new CastDataType<float, int8_t>(backend);
+    }
+    if (dstT == MNN::DataType_DT_INT8 && halide_type_of<int32_t>() == inputDataType) {
+        return new CastDataType<int32_t, int8_t>(backend);
     }
     if (dstT == MNN::DataType_DT_UINT8 && halide_type_of<float>() == inputDataType) {
         return new CastDataType<float, uint8_t>(backend);
@@ -177,13 +203,16 @@ Execution *CPUCastCreator::onCreate(const std::vector<Tensor *> &inputs, const s
     if (dstT == MNN::DataType_DT_UINT8 && halide_type_of<int32_t>() == inputDataType) {
         return new CastDataType<int32_t, uint8_t>(backend);
     }
+    if (dstT == MNN::DataType_DT_UINT8 && halide_type_of<int8_t>() == inputDataType) {
+        return new CastDataType<int8_t, uint8_t>(backend);
+    }
     if (dstT == MNN::DataType_DT_INT32 && halide_type_of<uint8_t>() == inputDataType) {
         return new CastDataType<uint8_t, int32_t>(backend);
     }
     if (dstT == MNN::DataType_DT_INT32 && halide_type_of<int8_t>() == inputDataType) {
         return new CastDataType<int8_t, int32_t>(backend);
     }
-    MNN_PRINT("Don't support cast form %d to %d\n", cast->srcT(), cast->dstT());
+    MNN_PRINT("Don't support cast form %d, %d to %d\n", inputDataType.code, inputDataType.bits, cast->dstT());
     return nullptr;
 }
 

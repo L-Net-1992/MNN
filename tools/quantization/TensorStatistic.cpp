@@ -12,6 +12,7 @@
 #include <cmath>
 #include <MNN/MNNDefine.h>
 #include "logkit.h"
+#include "core/TensorUtils.hpp"
 
 // Given distribution P and Q, KL-Divergence is
 // Sum(P[i] * log(P[i] / Q[i]))
@@ -53,30 +54,27 @@ void TensorStatistic::updateRange() {
         return;
     }
     mUpdatedRangeFlags = true;
-    mOriginTensor->copyToHostTensor(mHostTensor.get());
-    int batch   = mHostTensor->batch();
-    int channel = mHostTensor->channel();
-    int width   = mHostTensor->width();
-    int height  = mHostTensor->height();
-    auto area   = width * height;
-    if (area == 0) {
-        area = 1;
+    auto tmpTensor = mOriginTensor;
+    bool res = mOriginTensor->copyToHostTensor(mHostTensor.get());
+    if (res) {
+        tmpTensor = mHostTensor.get();
     }
-
-    for (int n = 0; n < batch; ++n) {
-        auto dataBatch = mHostTensor->host<float>() + n * mHostTensor->stride(0);
-        for (int c = 0; c < channel; ++c) {
-            auto minValue    = mRange.first;
-            auto maxValue    = mRange.second;
-            auto dataChannel = dataBatch + c * mHostTensor->stride(1);
-            for (int v = 0; v < area; ++v) {
-                minValue = std::min(minValue, dataChannel[v]);
-                maxValue = std::max(maxValue, dataChannel[v]);
-            }
-            mRange.first  = minValue;
-            mRange.second = maxValue;
-        }
+    int size = tmpTensor->elementSize();
+    float* dataPtr = tmpTensor->host<float>();
+    auto minValue = mRange.first;
+    auto maxValue = mRange.second;
+    for (int i = 0; i < size; ++i) {
+        minValue = std::min(minValue, dataPtr[i]);
+        maxValue = std::max(maxValue, dataPtr[i]);
     }
+    mRange.first = minValue;
+    mRange.second = maxValue;
+//    if (mRange.first > 0.0f) {
+//        mRange.first = 0.0f;
+//    }
+//    if (mRange.second < 0.0f) {
+//        mRange.second = 0.0f;
+//    }
     mVisited = true;
 }
 
@@ -96,35 +94,22 @@ void TensorStatistic::updateDistribution() {
         return;
     }
     mUpdatedDistributionFlag = true;
-    mOriginTensor->copyToHostTensor(mHostTensor.get());
-    int batch   = mHostTensor->batch();
-    int channel = mHostTensor->channel();
-    int width   = mHostTensor->width();
-    int height  = mHostTensor->height();
-    auto area   = width * height;
-    if (area == 0) {
-        area = 1;
+    auto tmpTensor = mOriginTensor;
+    bool res = mOriginTensor->copyToHostTensor(mHostTensor.get());
+    if (res) {
+        tmpTensor = mHostTensor.get();
     }
-
-    for (int n = 0; n < batch; ++n) {
-        auto dataBatch = mHostTensor->host<float>() + n * mHostTensor->stride(0);
-        for (int c = 0; c < channel; ++c) {
-            if (!mValid) {
-                continue;
-            }
-            auto multi       = mInterval;
-            auto target      = mDistribution.data();
-            auto dataChannel = dataBatch + c * mHostTensor->stride(1);
-            for (int v = 0; v < area; ++v) {
-                auto data = dataChannel[v];
-                if (data == 0) {
-                    continue;
-                }
-                int index = static_cast<int>(fabs(data) * multi);
-                index     = std::min(index, mBinNumber - 1);
-                target[index] += 1.0f;
-            }
+//    float midValue = (mRange.second + mRange.first) / 2.0f;
+    float midValue = 0.f;
+    auto ptr = tmpTensor->host<float>();
+    for (int i = 0; i < tmpTensor->elementSize(); ++i) {
+        auto data = ptr[i] - midValue;
+        if (abs(data) <= 1e-6) {
+            continue;
         }
+        int index = static_cast<int>(fabs(data) * mInterval);
+        index = std::min(index, mBinNumber - 1);
+        mDistribution[index] += 1.0f;
     }
 }
 
@@ -230,9 +215,9 @@ int TensorStatistic::_computeThreshold(const std::vector<float>& distribution) {
     return threshold;
 }
 
-float TensorStatistic::finishAndCompute() {
+std::pair<float, int8_t> TensorStatistic::finishAndCompute() {
     if (!mValid) {
-        return 0.f;
+        return std::make_pair(0.f, 0);
     }
     float sum          = 0.0f;
     std::for_each(mDistribution.begin(), mDistribution.end(), [&](float n) { sum += n; });
@@ -241,10 +226,14 @@ float TensorStatistic::finishAndCompute() {
     auto threshold = _computeThreshold(mDistribution);
     mScale     = ((float)threshold + 0.5) / mInterval / mFeatureClampValue;
     // MNN_PRINT("==> %s == %d, %f, %f\n", mName.c_str(),threshold, 1.0f / mIntervals[0], mScale * mFeatureClampValue);
-    return mScale;
+    float midValue = (mRange.second + mRange.first) / 2.0f;
+//    mZeroPoint = fmaxf(fminf(-midValue / mScale, 127.0f), -127.0f);
+    mZeroPoint = 0;
+
+    return std::make_pair(mScale, mZeroPoint);
 }
 
-float TensorStatistic::computeScaleADMM() {
+std::pair<float, int8_t> TensorStatistic::computeScaleADMM() {
     const int count         = mOriginTensor->elementSize();
     float max               = 0;
     const float bound       = mFeatureClampValue;
@@ -283,7 +272,8 @@ float TensorStatistic::computeScaleADMM() {
     // DLOG(INFO) << "alpha final: " << alpha;
     mScale = alpha;
     mVisited = true;
-    return mScale;
+    mZeroPoint = 0;
+    return std::make_pair(mScale, mZeroPoint);
 }
 
 std::pair<std::vector<float>, float> TensorStatistic::fakeQuantFeature() {
@@ -295,9 +285,9 @@ std::pair<std::vector<float>, float> TensorStatistic::fakeQuantFeature() {
     int overflowCount = 0;
 
     for (int i = 0; i < count; i++) {
-        float dataQuant = std::roundf(originData[i] / scale);
+        float dataQuant = std::roundf(originData[i] / scale) + mZeroPoint;
         dataQuant      = std::fmin(bound, std::fmax(-bound, dataQuant));
-        float dataDequant = dataQuant * scale;
+        float dataDequant = (dataQuant - mZeroPoint) * scale;
 
         originData[i] = dataDequant;
         fakeQuantedFeature.emplace_back(dataDequant);
